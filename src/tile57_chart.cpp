@@ -1,6 +1,7 @@
 // tile57_chart.cpp — see tile57_chart.h.
 #include "tile57_chart.h"
 #include "gl.h"
+#include <wx/fileconf.h>
 #include <wx/filename.h>
 #include <wx/image.h>
 #include <wx/log.h>
@@ -135,10 +136,64 @@ void ChartTile57::GetValidCanvasRegion(const PlugIn_ViewPort& vp, wxRegion* pVal
     if (pValidRegion) *pValidRegion = wxRegion(0, 0, vp.pix_width, vp.pix_height);
 }
 
+void ChartTile57::refresh_mariner() {
+    // PI_GetPLIBStateHash changes whenever an S52/vector-chart option changes;
+    // between changes this is a single int compare per render.
+    int hash = PI_GetPLIBStateHash();
+    if (hash == plib_hash_) return;
+    plib_hash_ = hash;
+
+    mariner_.safety_contour = PI_GetPLIBMarinerSafetyContour();
+    // PI_GetPLIBSymbolStyle/BoundaryStyle return S52 LUP table names:
+    // 'L' simplified / 'R' paper-chart points; 'N' plain / 'O' symbolized.
+    mariner_.simplified_points = (PI_GetPLIBSymbolStyle() == 'L');
+    mariner_.boundary_style = (PI_GetPLIBBoundaryStyle() == 'N')
+                                  ? TILE57_BOUNDARY_PLAIN : TILE57_BOUNDARY_SYMBOLIZED;
+    mariner_.depth_unit = (PI_GetPLIBDepthUnitInt() == 0) ? TILE57_DEPTH_FEET
+                                                          : TILE57_DEPTH_METERS;
+
+    // The remaining vector-chart options aren't exposed through PI getters;
+    // OpenCPN's live config object carries them (the options dialog writes
+    // them there, and the PLIB state hash bumps at the same time).
+    if (wxFileConfig* cfg = GetOCPNConfigObject()) {
+        wxString path = cfg->GetPath();
+        cfg->SetPath("/Settings/GlobalState");
+
+        bool soundings = true, text = true, ldis = false, imp_only = false;
+        cfg->Read("bShowSoundg", &soundings, true);
+        cfg->Read("bShowS57Text", &text, true);
+        cfg->Read("bShowLdisText", &ldis, false);
+        cfg->Read("bShowS57ImportantTextOnly", &imp_only, false);
+        mariner_.text_names = text;
+        mariner_.text_other = text && !imp_only;
+        mariner_.show_light_descriptions = ldis;
+
+        // nDisplayCategory holds an S52 _DisCat: 'D' base, 'S' standard,
+        // 'O' other/all, 'M' mariner's standard.
+        long cat = 'O';
+        cfg->Read("nDisplayCategory", &cat, (long)'O');
+        mariner_.display_base = true;
+        mariner_.display_standard = (cat != 'D');
+        // tile57 has no dedicated soundings switch; soundings are OTHER
+        // category, so honour OpenCPN's explicit soundings toggle here.
+        mariner_.display_other = (cat == 'O') || soundings;
+
+        double v;
+        if (cfg->Read("S52_MAR_SHALLOW_CONTOUR", &v)) mariner_.shallow_contour = v;
+        if (cfg->Read("S52_MAR_DEEP_CONTOUR", &v)) mariner_.deep_contour = v;
+        if (cfg->Read("S52_MAR_SAFETY_DEPTH", &v)) mariner_.safety_depth = v;
+        long two_shades = 0;
+        if (cfg->Read("S52_MAR_TWO_SHADES", &two_shades)) mariner_.four_shade_water = !two_shades;
+
+        cfg->SetPath(path);
+    }
+}
+
 int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
                              bool stencil_clip, const char* tag) {
     if (!vp.bValid) return false;
     if (!renderer_.ensure_gl()) return false;
+    refresh_mariner();
 
     // Render into the CURRENT GL viewport — that is what NDC maps to, and it is
     // OpenCPN's choice of target (canvas FBO, or a sub-rect of it). Do NOT size

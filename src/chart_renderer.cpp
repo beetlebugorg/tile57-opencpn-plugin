@@ -157,14 +157,14 @@ bool ChartRenderer::get_info(tile57_chart_info& out) const {
 }
 
 static const char* VS = R"(
-attribute vec2 aPx;
+attribute vec2 aPx;      // camera pixel space
 attribute vec4 aCol;
-uniform vec2 uVp;
-uniform vec2 uCenter;   // overzoom pivot (viewport centre, px)
-uniform float uScale;   // overzoom factor (1.0 = none)
+uniform vec2 uVp;        // view size (px)
+uniform vec2 uOffset;    // camera -> view affine: view_px = uOffset + uScale*aPx
+uniform float uScale;
 varying vec4 vCol;
 void main(){
-  vec2 px = uCenter + (aPx - uCenter) * uScale;
+  vec2 px = uOffset + aPx * uScale;
   vec2 ndc = vec2(px.x/uVp.x*2.0-1.0, 1.0 - px.y/uVp.y*2.0);
   gl_Position = vec4(ndc, 0.0, 1.0); vCol = aCol;
 }
@@ -194,21 +194,21 @@ bool ChartRenderer::ensure_gl() {
     glLinkProgram(prog_);
     u_vp_ = glGetUniformLocation(prog_, "uVp");
     u_scale_ = glGetUniformLocation(prog_, "uScale");
-    u_center_ = glGetUniformLocation(prog_, "uCenter");
+    u_offset_ = glGetUniformLocation(prog_, "uOffset");
     glGenBuffers(1, &vbo_base_);
     glGenBuffers(1, &vbo_text_);
     gl_ready_ = true;
     return true;
 }
 
-void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uint32_t h,
-                            const tile57_mariner& m) {
+void ChartRenderer::rebuild(const tile57_mariner& m) {
     base_tris.clear(); text_tris.clear();
     tile57_canvas_cb cb{};
     cb.ctx = this;
     cb.fill_path = tr_fill; cb.stroke_path = tr_stroke;
     cb.fill_pattern = tr_pattern; cb.draw_glyphs = tr_glyphs;
-    int rc = tile57_chart_render_view_cb(chart_, lon, lat, zoom, w, h, &m, &cb);
+    int rc = tile57_chart_render_view_cb(chart_, cam_lon_, cam_lat_, cam_zoom_,
+                                         cam_w_, cam_h_, &m, &cb);
     if (rc != 0) { std::fprintf(stderr, "t57 render_view_cb rc=%d\n", rc); return; }
 
     // No VAO in GL 2.1 — just upload; attribute pointers are set at draw time.
@@ -232,34 +232,71 @@ void ChartRenderer::draw_buffer(uint32_t vbo, uint32_t count) {
     glDisableVertexAttribArray(1);
 }
 
+// Global web-mercator pixel coordinates of a lon/lat at a zoom.
+static void world_px(double lon, double lat, double zoom, double& X, double& Y) {
+    const double kPI = 3.14159265358979323846;
+    double n = 256.0 * std::pow(2.0, zoom);
+    X = (lon + 180.0) / 360.0 * n;
+    double s = std::sin(lat * kPI / 180.0);
+    Y = (0.5 - std::log((1.0 + s) / (1.0 - s)) / (4.0 * kPI)) * n;
+}
+
 void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                            const tile57_mariner& m, Pass pass, bool stencil_clip) {
     if (!chart_ || !ensure_gl()) return;
-
-    // tile57 only portrays within the chart's baked [min_zoom, max_zoom]; beyond
-    // it, it paints the flat S-52 NODTA fill. So render at the range-clamped zoom
-    // and, when the view is outside it, scale the (vector) geometry to the real
-    // view about its centre — crisp overzoom instead of a grey no-data plate.
     if (!have_range_) {
         tile57_chart_info info{};
         tile57_chart_get_info(chart_, &info);
         min_zoom_ = info.min_zoom; max_zoom_ = info.max_zoom; have_range_ = true;
     }
-    double zr = zoom;
-    if (zr < min_zoom_) zr = min_zoom_;
-    if (zr > max_zoom_) zr = max_zoom_;
-    double oscale = std::pow(2.0, zoom - zr);   // 1.0 when in range
 
-    // Rebuild geometry only when the view or (clamped) render zoom changed.
-    // Both passes of one frame share a single rebuild.
+    // Portrayal camera zoom: the view zoom snapped to half levels — so panning
+    // and fractional zoom replay cached geometry — and clamped to the baked
+    // band, which also implements overzoom (past max_zoom the affine below
+    // magnifies real vectors instead of tile57 painting its flat NODTA fill).
+    double cz = 0.5 * std::round(zoom * 2.0);
+    if (cz < min_zoom_) cz = min_zoom_;
+    if (cz > max_zoom_) cz = max_zoom_;
+    double s = std::pow(2.0, zoom - cz);        // view px per camera px
+
+    // Camera extent: the view plus a pan margin, in camera pixels (capped: far
+    // below min_zoom the view outgrows any camera; the cell is tiny there).
+    auto cam_dim = [&](uint32_t view_px) {
+        double d = std::ceil(view_px / s * 1.5);
+        return (uint32_t)std::min(d, 4096.0);
+    };
+
     uint64_t mh = mariner_hash(m);
-    bool changed = !have_last_ || lon != last_lon_ || lat != last_lat_ || zr != last_zoom_
-                || w != last_w_ || h != last_h_ || mh != last_mhash_;
-    if (changed) {
-        rebuild(lon, lat, zr, w, h, m);
-        have_last_ = true; last_lon_ = lon; last_lat_ = lat; last_zoom_ = zr;
-        last_w_ = w; last_h_ = h; last_mhash_ = mh;
+    bool rebuild_needed = !have_cam_ || cz != cam_zoom_ || mh != cam_mhash_
+                       || cam_w_ < cam_dim(w) / 2 || cam_h_ < cam_dim(h) / 2;
+
+    // Does the view still fit inside the cached camera's margin?
+    if (!rebuild_needed) {
+        double ccx, ccy, vcx, vcy;
+        world_px(cam_lon_, cam_lat_, cam_zoom_, ccx, ccy);
+        world_px(lon, lat, cam_zoom_, vcx, vcy);
+        double cx = cam_w_ / 2.0 + (vcx - ccx);   // view centre in camera px
+        double cy = cam_h_ / 2.0 + (vcy - ccy);
+        double hw = w / (2.0 * s), hh = h / (2.0 * s);
+        if (cx - hw < 0 || cy - hh < 0 || cx + hw > cam_w_ || cy + hh > cam_h_)
+            rebuild_needed = true;
     }
+
+    if (rebuild_needed) {
+        cam_lon_ = lon; cam_lat_ = lat; cam_zoom_ = cz;
+        cam_w_ = cam_dim(w); cam_h_ = cam_dim(h);
+        cam_mhash_ = mh;
+        rebuild(m);
+        have_cam_ = true;
+    }
+
+    // Camera -> view affine: view_px = uOffset + s * cam_px.
+    double ccx, ccy, vcx, vcy;
+    world_px(cam_lon_, cam_lat_, cam_zoom_, ccx, ccy);
+    world_px(lon, lat, cam_zoom_, vcx, vcy);
+    double cx = cam_w_ / 2.0 + (vcx - ccx);
+    double cy = cam_h_ / 2.0 + (vcy - ccy);
+    float off[2] = { float(w / 2.0 - cx * s), float(h / 2.0 - cy * s) };
 
     glUseProgram(prog_);
     glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA); glDisable(GL_DEPTH_TEST);
@@ -272,9 +309,8 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     }
     float vp[2] = { float(w), float(h) };
     glUniform2fv(u_vp_, 1, vp);
-    float center[2] = { w * 0.5f, h * 0.5f };
-    glUniform2fv(u_center_, 1, center);
-    glUniform1f(u_scale_, float(oscale));
+    glUniform2fv(u_offset_, 1, off);
+    glUniform1f(u_scale_, float(s));
 
     if (pass != Pass::kText) draw_buffer(vbo_base_, base_count_);
     if (pass != Pass::kBase) draw_buffer(vbo_text_, text_count_);
@@ -289,7 +325,7 @@ void ChartRenderer::shutdown() {
     // here crashes. Drop the chart and force a fresh GL setup on re-enable; the
     // tiny leaked program/VBO are reclaimed when the GL context is destroyed.
     gl_ready_ = false; prog_ = 0; vbo_base_ = 0; vbo_text_ = 0;
-    base_count_ = 0; text_count_ = 0; have_last_ = false;
+    base_count_ = 0; text_count_ = 0; have_cam_ = false;
     have_range_ = false;
     if (chart_) { tile57_chart_close(chart_); chart_ = nullptr; }
 }
