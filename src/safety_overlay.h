@@ -18,7 +18,7 @@ public:
     void shutdown();
 
 private:
-    uint32_t prog_ = 0, vao_ = 0, vbo_ = 0;
+    uint32_t prog_ = 0, vbo_ = 0;
     int u_vp_ = -1, u_color_ = -1;
     void draw_quads(const float* xy, int vert_count,
                     float r, float g, float b, float a, uint32_t w, uint32_t h);

@@ -2,7 +2,6 @@
 #include "safety_overlay.h"
 #include "gl.h"
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -32,7 +31,7 @@ static const Glyph* find_glyph(char c) {
 static const char* BANNER = "NOT FOR NAVIGATION";
 
 static const char* VS = R"(
-layout(location=0) in vec2 aPx;      // screen px, top-left origin (y down)
+attribute vec2 aPx;      // screen px, top-left origin (y down)
 uniform vec2 uVp;
 void main(){
   vec2 ndc = vec2(aPx.x / uVp.x * 2.0 - 1.0, 1.0 - aPx.y / uVp.y * 2.0);
@@ -41,8 +40,7 @@ void main(){
 )";
 static const char* FS = R"(
 uniform vec4 uColor;
-out vec4 o;
-void main(){ o = vec4(uColor.rgb * uColor.a, uColor.a); }
+void main(){ gl_FragColor = vec4(uColor.rgb * uColor.a, uColor.a); }
 )";
 
 static uint32_t compile(GLenum t, const char* body) {
@@ -50,24 +48,25 @@ static uint32_t compile(GLenum t, const char* body) {
     const char* s = full.c_str();
     uint32_t sh = glCreateShader(t); glShaderSource(sh,1,&s,nullptr); glCompileShader(sh);
     GLint ok=0; glGetShaderiv(sh,GL_COMPILE_STATUS,&ok);
-    if(!ok){char l[512];glGetShaderInfoLog(sh,512,nullptr,l);std::fprintf(stderr,"safety shader: %s\n",l);std::exit(2);}
+    if(!ok){char l[512];glGetShaderInfoLog(sh,512,nullptr,l);std::fprintf(stderr,"safety shader: %s\n",l);}
     return sh;
 }
 
 bool SafetyOverlay::init() {
     prog_ = glCreateProgram();
     uint32_t v = compile(GL_VERTEX_SHADER, VS), f = compile(GL_FRAGMENT_SHADER, FS);
-    glAttachShader(prog_,v); glAttachShader(prog_,f); glLinkProgram(prog_);
+    glAttachShader(prog_,v); glAttachShader(prog_,f);
+    glBindAttribLocation(prog_, 0, "aPx");   // GLSL 1.20: no layout(location=…)
+    glLinkProgram(prog_);
     glDeleteShader(v); glDeleteShader(f);
     u_vp_ = glGetUniformLocation(prog_, "uVp");
     u_color_ = glGetUniformLocation(prog_, "uColor");
-    glGenVertexArrays(1,&vao_); glGenBuffers(1,&vbo_);
+    glGenBuffers(1,&vbo_);
     return true;
 }
 
 void SafetyOverlay::draw_quads(const float* xy, int vert_count,
                                float r,float g,float b,float a, uint32_t w, uint32_t h) {
-    glBindVertexArray(vao_);
     glBindBuffer(GL_ARRAY_BUFFER, vbo_);
     glBufferData(GL_ARRAY_BUFFER, vert_count * 2 * sizeof(float), xy, GL_STREAM_DRAW);
     glEnableVertexAttribArray(0);
@@ -112,11 +111,15 @@ void SafetyOverlay::render(uint32_t w, uint32_t h) {
     }
     if (!text.empty())
         draw_quads(text.data(), (int)(text.size()/2), 1.f, 1.f, 1.f, 1.f, w, h); // white
-    glBindVertexArray(0);
+    // Restore state for OpenCPN's fixed-function (legacy) drawing.
+    glDisableVertexAttribArray(0);
+    glUseProgram(0);
 }
 
 void SafetyOverlay::shutdown() {
-    glDeleteProgram(prog_); glDeleteBuffers(1,&vbo_); glDeleteVertexArrays(1,&vao_);
+    // DeInit() runs without a current GL context; deleting GL objects here would
+    // crash. Leave them to be reclaimed with the context.
+    prog_ = 0; vbo_ = 0;
 }
 
 } // namespace t57

@@ -82,15 +82,15 @@ bool ChartRenderer::open_chart(const std::string& path) {
 }
 
 static const char* VS = R"(
-layout(location=0) in vec2 aPx;
-layout(location=1) in vec4 aCol;
+attribute vec2 aPx;
+attribute vec4 aCol;
 uniform vec2 uVp;
-out vec4 vCol;
+varying vec4 vCol;
 void main(){ vec2 ndc = vec2(aPx.x/uVp.x*2.0-1.0, 1.0 - aPx.y/uVp.y*2.0); gl_Position=vec4(ndc,0.0,1.0); vCol=aCol; }
 )";
 static const char* FS = R"(
-in vec4 vCol; out vec4 o;
-void main(){ o = vec4(vCol.rgb*vCol.a, vCol.a); }
+varying vec4 vCol;
+void main(){ gl_FragColor = vec4(vCol.rgb*vCol.a, vCol.a); }
 )";
 static uint32_t compile(GLenum t, const char* body) {
     std::string src = std::string(T57_GLSL_VERSION) + body;
@@ -107,9 +107,12 @@ bool ChartRenderer::ensure_gl() {
     prog_ = glCreateProgram();
     glAttachShader(prog_, compile(GL_VERTEX_SHADER, VS));
     glAttachShader(prog_, compile(GL_FRAGMENT_SHADER, FS));
+    // GLSL 1.20 has no layout(location=…); bind generic attribute slots before link.
+    glBindAttribLocation(prog_, 0, "aPx");
+    glBindAttribLocation(prog_, 1, "aCol");
     glLinkProgram(prog_);
     u_vp_ = glGetUniformLocation(prog_, "uVp");
-    glGenVertexArrays(1, &vao_); glGenBuffers(1, &vbo_);
+    glGenBuffers(1, &vbo_);
     gl_ready_ = true;
     return true;
 }
@@ -124,15 +127,10 @@ void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uin
     int rc = tile57_chart_render_view_cb(chart_, lon, lat, zoom, w, h, &m, &cb);
     if (rc != 0) { std::fprintf(stderr, "t57 render_view_cb rc=%d\n", rc); return; }
 
-    glBindVertexArray(vao_);
+    // No VAO in GL 2.1 — just upload; attribute pointers are set at draw time.
     glBindBuffer(GL_ARRAY_BUFFER, vbo_);
     glBufferData(GL_ARRAY_BUFFER, tris.size() * sizeof(Vtx), tris.data(), GL_DYNAMIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vtx), (void*)offsetof(Vtx, r));
     vbo_count_ = static_cast<uint32_t>(tris.size());
-    glBindVertexArray(0);
 }
 
 void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
@@ -155,13 +153,23 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA); glDisable(GL_DEPTH_TEST);
     float vp[2] = { float(w), float(h) };
     glUniform2fv(u_vp_, 1, vp);
-    glBindVertexArray(vao_);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vtx), (void*)offsetof(Vtx, r));
     glDrawArrays(GL_TRIANGLES, 0, (GLsizei)vbo_count_);
-    glBindVertexArray(0);
+    // Restore state so OpenCPN's fixed-function (legacy) drawing isn't disturbed.
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
+    glUseProgram(0);
 }
 
 void ChartRenderer::shutdown() {
-    if (gl_ready_) { glDeleteProgram(prog_); glDeleteBuffers(1, &vbo_); glDeleteVertexArrays(1, &vao_); gl_ready_ = false; }
+    // OpenCPN calls DeInit() without a current GL context, so deleting GL objects
+    // here crashes. Drop the chart and force a fresh GL setup on re-enable; the
+    // tiny leaked program/VBO are reclaimed when the GL context is destroyed.
+    gl_ready_ = false; prog_ = 0; vbo_ = 0; vbo_count_ = 0; have_last_ = false;
     if (chart_) { tile57_chart_close(chart_); chart_ = nullptr; }
 }
 

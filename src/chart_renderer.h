@@ -37,7 +37,7 @@ private:
                  const tile57_mariner& m);
 
     tile57_chart* chart_ = nullptr;
-    uint32_t prog_ = 0, vao_ = 0, vbo_ = 0;
+    uint32_t prog_ = 0, vbo_ = 0;
     int u_vp_ = -1;
     bool gl_ready_ = false;
     uint32_t vbo_count_ = 0;
