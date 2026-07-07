@@ -103,6 +103,7 @@ private:
     bool have_cam_ = false;
     double cam_lon_ = 0, cam_lat_ = 0, cam_zoom_ = 0;
     double last_zoom_ = -1;   // previous frame's view zoom (settle detection)
+    double last_lon_ = 1e9, last_lat_ = 1e9, last_zoom_r_ = 1e9;  // last render view
     bool last_rebuilt_ = false;   // TEMP diagnostic
     uint32_t cam_w_ = 0, cam_h_ = 0;
     uint64_t cam_mhash_ = 0;

@@ -731,7 +731,14 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     glGetIntegerv(GL_VIEWPORT, prev_vp);
     glGetIntegerv(GL_SCISSOR_BOX, prev_sc);
     GLboolean sc_on = glIsEnabled(GL_SCISSOR_TEST);
-    bool ss = ensure_ss((int)w, (int)h);
+    // Antialias (offscreen supersample) only when the view is SETTLED. During
+    // pan/zoom motion render DIRECT into OpenCPN's cache so accelerated panning's
+    // partial strip updates align (offscreen compositing tore); AA pops in when
+    // motion stops. Text (a light, separate pass) always supersamples.
+    bool moving = (std::fabs(lon - last_lon_) > 1e-9 || std::fabs(lat - last_lat_) > 1e-9
+                   || std::fabs(zoom - last_zoom_r_) > 1e-4);
+    last_lon_ = lon; last_lat_ = lat; last_zoom_r_ = zoom;
+    bool ss = ensure_ss((int)w, (int)h) && !(moving && pass != Pass::kText);
     if (ss) {
         glBindFramebuffer(GL_FRAMEBUFFER, g_ss.fbo);
         glViewport(0, 0, (GLsizei)(w * kSS), (GLsizei)(h * kSS));
