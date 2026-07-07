@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 // wxWidgets can create ChartTile57 by class name; OpenCPN uses this to
@@ -263,6 +264,7 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     double csf = OCPN_GetDisplayContentScaleFactor();
     if (csf > 1.0 && fbw == (uint32_t)std::lround(vp.pix_width * csf)) ppm *= csf;
     double zoom = zoom_for_ppm(ppm);
+    last_zoom_ = zoom;   // remembered for the object-query pick tolerance / SCAMIN
     renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip);
     return true;
 }
@@ -320,10 +322,14 @@ void json_rows(const std::string& j, wxString& out) {
     }
 }
 
-// Feature blocks — the plugin wraps the concatenation in <html><body>.
+// Feature blocks — the plugin wraps the concatenation in <html><body>. Identical
+// features (same class + attributes + cell) are collapsed: one S-57 feature can be
+// split across several MVT features, and a zoomed-out pick spans many like ones.
 wxString build_query_html(const std::vector<QueryHit>& hits) {
     wxString h;
+    std::unordered_set<std::string> seen;
     for (const auto& f : hits) {
+        if (!seen.insert(f.cls + '\0' + f.s57 + '\0' + f.cell).second) continue;
         h += "<font size=+1><b>" + wxString::FromUTF8(f.cls.c_str()) + "</b></font>";
         if (!f.cell.empty())
             h += "  <font size=-1 color=#808080>" + wxString::FromUTF8(f.cell.c_str()) + "</font>";
@@ -342,7 +348,7 @@ wxString ChartTile57::QueryDescription(double lon, double lat) const {
     if (!ch) return wxEmptyString;
     std::vector<QueryHit> hits;
     tile57_query_cb cb{ &hits, collect_hit };
-    tile57_chart_query(ch, lon, lat, &cb);
+    tile57_chart_query(ch, lon, lat, last_zoom_, &cb);
     if (hits.empty()) return wxEmptyString;
     return build_query_html(hits);
 }

@@ -92,6 +92,7 @@ private:
 
     t57::ChartRenderer renderer_;
     tile57_mariner mariner_{};
+    double last_zoom_ = 0;   // last rendered view zoom, for the object-query pick
 
     double center_lat_ = 0.0;
     double bounds_west_ = 0.0, bounds_south_ = 0.0, bounds_east_ = 0.0, bounds_north_ = 0.0;
