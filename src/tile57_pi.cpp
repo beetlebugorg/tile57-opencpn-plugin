@@ -5,6 +5,7 @@
 // asks tile57 to paint the view through a callback canvas, and renders the
 // resulting geometry on the GPU (see chart_renderer). A persistent
 // "NOT FOR NAVIGATION" banner is drawn over everything (see safety_overlay).
+#include <cstdint>  // ocpn_plugin.h (api-18) references uint8_t before including it
 #include "ocpn_plugin.h"
 #include "chart_renderer.h"
 #include "safety_overlay.h"
