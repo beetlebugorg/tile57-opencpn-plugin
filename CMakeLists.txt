@@ -57,4 +57,16 @@ if(APPLE)
   # (GetOCPNCanvasWindow, …) live in the OpenCPN executable, not the plugin —
   # defer them to load-time resolution instead of failing the link.
   target_link_options(tile57_pi PRIVATE -undefined dynamic_lookup)
+
+  # Retarget wxWidgets to OpenCPN.app's bundled copy so only ONE wxWidgets loads
+  # at runtime — otherwise the build-time wx (e.g. Homebrew) loads alongside the
+  # app's, duplicating Obj-C classes and crashing. Mirrors the OpenCPN plugin
+  # framework's cmake/fix-macos-libs.sh (see THIRD_PARTY_LICENSES.md).
+  set(OCPN_APP "/Applications/OpenCPN.app"
+      CACHE PATH "OpenCPN.app whose bundled wxWidgets the plugin binds to")
+  add_custom_command(TARGET tile57_pi POST_BUILD
+    COMMAND /bin/sh ${CMAKE_SOURCE_DIR}/cmake/fix-macos-libs.sh
+            $<TARGET_FILE:tile57_pi> ${OCPN_APP}/Contents/Frameworks
+    COMMENT "Retargeting wxWidgets to ${OCPN_APP}/Contents/Frameworks"
+    VERBATIM)
 endif()
