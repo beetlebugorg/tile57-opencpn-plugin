@@ -554,32 +554,45 @@ bool ChartRenderer::ensure_gl() {
     return true;
 }
 
-// (Re)create the supersample colour FBO at kSS× the viewport.
-bool ChartRenderer::ensure_ss(uint32_t w, uint32_t h) {
-    if (w == 0 || h == 0) return false;
-    uint32_t sw = w * kSS, sh = h * kSS;
-    if (ss_fbo_ && ss_w_ == sw && ss_h_ == sh) return ss_ok_;
-    if (!ss_fbo_) { glGenFramebuffers(1, &ss_fbo_); glGenTextures(1, &ss_tex_); }
-    glBindTexture(GL_TEXTURE_2D, ss_tex_);
+namespace {
+// One supersample colour texture FBO shared by every chart (they render
+// sequentially into the same GL context). Rendering into it at kSS× the
+// viewport then compositing back down-sampled antialiases tessellated edges.
+// One shared FBO (not one per chart) keeps it cheap; a plain texture target
+// (no multisample resolve blit) avoids the scroll-compose glitch that a
+// resolve introduced.
+constexpr int kSS = 2;
+struct SsTarget {
+    uint32_t fbo = 0, tex = 0; int w = 0, h = 0; bool ok = false;
+};
+SsTarget g_ss;
+
+bool ensure_ss(int w, int h) {
+    if (w <= 0 || h <= 0) return false;
+    int sw = w * kSS, sh = h * kSS;
+    if (g_ss.fbo && g_ss.w == sw && g_ss.h == sh) return g_ss.ok;
+    if (!g_ss.fbo) { glGenFramebuffers(1, &g_ss.fbo); glGenTextures(1, &g_ss.tex); }
+    glBindTexture(GL_TEXTURE_2D, g_ss.tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sw, sh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glBindFramebuffer(GL_FRAMEBUFFER, ss_fbo_);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ss_tex_, 0);
-    ss_ok_ = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    glBindFramebuffer(GL_FRAMEBUFFER, g_ss.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_ss.tex, 0);
+    bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
-    ss_w_ = sw; ss_h_ = sh;
-    return ss_ok_;
+    g_ss.w = sw; g_ss.h = sh; g_ss.ok = ok;
+    return ok;
 }
+}  // namespace
 
 void ChartRenderer::composite_ss() {
     glUseProgram(prog_blit_);
     glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, ss_tex_);
+    glBindTexture(GL_TEXTURE_2D, g_ss.tex);
     glUniform1i(bu_tex_, 0);
     glBindBuffer(GL_ARRAY_BUFFER, vbo_quad_);
     glEnableVertexAttribArray(0);
@@ -718,9 +731,9 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     glGetIntegerv(GL_VIEWPORT, prev_vp);
     glGetIntegerv(GL_SCISSOR_BOX, prev_sc);
     GLboolean sc_on = glIsEnabled(GL_SCISSOR_TEST);
-    bool ss = ensure_ss(w, h);
+    bool ss = ensure_ss((int)w, (int)h);
     if (ss) {
-        glBindFramebuffer(GL_FRAMEBUFFER, ss_fbo_);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_ss.fbo);
         glViewport(0, 0, (GLsizei)(w * kSS), (GLsizei)(h * kSS));
         if (sc_on) glScissor(prev_sc[0]*kSS, prev_sc[1]*kSS, prev_sc[2]*kSS, prev_sc[3]*kSS);
         glClearColor(0, 0, 0, 0);
@@ -792,8 +805,8 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     if (pass != Pass::kBase) draw_range(vbo_text_, n_text_);
 
     if (ss) {
-        // Composite the supersampled result over OpenCPN's framebuffer, clipped
-        // to the same patch scissor.
+        // Composite the supersampled texture over OpenCPN's FBO, down-sampled by
+        // the sampler's linear filter, clipped to the same patch scissor.
         glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
         glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
         if (sc_on) glScissor(prev_sc[0], prev_sc[1], prev_sc[2], prev_sc[3]);
@@ -806,7 +819,6 @@ void ChartRenderer::shutdown() {
     gl_ready_ = false; prog_ = prog_sprite_ = prog_pat_ = prog_blit_ = 0;
     vbo_area_ = vbo_line_ = vbo_symbol_ = vbo_text_ = vbo_sprite_ = vbo_pat_ = vbo_quad_ = 0;
     n_area_ = n_line_ = n_symbol_ = n_text_ = n_sprite_ = n_pat_ = 0;
-    ss_fbo_ = ss_tex_ = 0; ss_w_ = ss_h_ = 0; ss_ok_ = false;
     have_cam_ = false; have_range_ = false;
     if (chart_) { tile57_chart_close(chart_); chart_ = nullptr; }
 }
