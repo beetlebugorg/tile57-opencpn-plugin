@@ -91,8 +91,14 @@ static const char* VS = R"(
 attribute vec2 aPx;
 attribute vec4 aCol;
 uniform vec2 uVp;
+uniform vec2 uCenter;   // overzoom pivot (viewport centre, px)
+uniform float uScale;   // overzoom factor (1.0 = none)
 varying vec4 vCol;
-void main(){ vec2 ndc = vec2(aPx.x/uVp.x*2.0-1.0, 1.0 - aPx.y/uVp.y*2.0); gl_Position=vec4(ndc,0.0,1.0); vCol=aCol; }
+void main(){
+  vec2 px = uCenter + (aPx - uCenter) * uScale;
+  vec2 ndc = vec2(px.x/uVp.x*2.0-1.0, 1.0 - px.y/uVp.y*2.0);
+  gl_Position = vec4(ndc, 0.0, 1.0); vCol = aCol;
+}
 )";
 static const char* FS = R"(
 varying vec4 vCol;
@@ -118,6 +124,8 @@ bool ChartRenderer::ensure_gl() {
     glBindAttribLocation(prog_, 1, "aCol");
     glLinkProgram(prog_);
     u_vp_ = glGetUniformLocation(prog_, "uVp");
+    u_scale_ = glGetUniformLocation(prog_, "uScale");
+    u_center_ = glGetUniformLocation(prog_, "uCenter");
     glGenBuffers(1, &vbo_);
     gl_ready_ = true;
     return true;
@@ -144,13 +152,27 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     if (!chart_ || !ensure_gl()) return;
     skip_text = !draw_text;
 
-    // Rebuild geometry only when the view or mariner changed; otherwise replay.
+    // tile57 only portrays within the chart's baked [min_zoom, max_zoom]; beyond
+    // it, it paints the flat S-52 NODTA fill. So render at the range-clamped zoom
+    // and, when the view is over/under it, scale the (vector) geometry to the real
+    // view about its centre — crisp overzoom instead of a grey no-data plate.
+    if (!have_range_) {
+        tile57_chart_info info{};
+        tile57_chart_get_info(chart_, &info);
+        min_zoom_ = info.min_zoom; max_zoom_ = info.max_zoom; have_range_ = true;
+    }
+    double zr = zoom;
+    if (zr < min_zoom_) zr = min_zoom_;
+    if (zr > max_zoom_) zr = max_zoom_;
+    double oscale = std::pow(2.0, zoom - zr);   // 1.0 when in range
+
+    // Rebuild geometry only when the view or (clamped) render zoom changed.
     uint64_t mh = mariner_hash(m);
-    bool changed = !have_last_ || lon != last_lon_ || lat != last_lat_ || zoom != last_zoom_
+    bool changed = !have_last_ || lon != last_lon_ || lat != last_lat_ || zr != last_zoom_
                 || w != last_w_ || h != last_h_ || mh != last_mhash_ || draw_text != last_text_;
     if (changed) {
-        rebuild(lon, lat, zoom, w, h, m);
-        have_last_ = true; last_lon_ = lon; last_lat_ = lat; last_zoom_ = zoom;
+        rebuild(lon, lat, zr, w, h, m);
+        have_last_ = true; last_lon_ = lon; last_lat_ = lat; last_zoom_ = zr;
         last_w_ = w; last_h_ = h; last_mhash_ = mh; last_text_ = draw_text;
     }
     if (!vbo_count_) return;
@@ -159,6 +181,9 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA); glDisable(GL_DEPTH_TEST);
     float vp[2] = { float(w), float(h) };
     glUniform2fv(u_vp_, 1, vp);
+    float center[2] = { w * 0.5f, h * 0.5f };
+    glUniform2fv(u_center_, 1, center);
+    glUniform1f(u_scale_, float(oscale));
     glBindBuffer(GL_ARRAY_BUFFER, vbo_);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)0);
@@ -176,6 +201,7 @@ void ChartRenderer::shutdown() {
     // here crashes. Drop the chart and force a fresh GL setup on re-enable; the
     // tiny leaked program/VBO are reclaimed when the GL context is destroyed.
     gl_ready_ = false; prog_ = 0; vbo_ = 0; vbo_count_ = 0; have_last_ = false;
+    have_range_ = false;
     if (chart_) { tile57_chart_close(chart_); chart_ = nullptr; }
 }
 

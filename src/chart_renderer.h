@@ -40,11 +40,17 @@ private:
 
     tile57_chart* chart_ = nullptr;
     uint32_t prog_ = 0, vbo_ = 0;
-    int u_vp_ = -1;
+    int u_vp_ = -1, u_scale_ = -1, u_center_ = -1;
     bool gl_ready_ = false;
     uint32_t vbo_count_ = 0;
 
-    // Cache key: the last view/mariner we built geometry for.
+    // Baked zoom range of the chart (portrayal is only available within it).
+    bool have_range_ = false;
+    double min_zoom_ = 0, max_zoom_ = 0;
+
+    // Cache key: the last view/mariner we built geometry for. last_zoom_ is the
+    // (range-clamped) render zoom, so overzoomed views that share a render zoom
+    // reuse the cached geometry and only differ by the draw-time scale.
     bool have_last_ = false;
     double last_lon_ = 0, last_lat_ = 0, last_zoom_ = 0;
     uint32_t last_w_ = 0, last_h_ = 0;
