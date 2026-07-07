@@ -18,16 +18,24 @@ constexpr double kPi = 3.14159265358979323846;
 // an OpenCPN "1:N" scale denominator.
 constexpr double kPxPerMetre = 96.0 / 0.0254;
 
+// OpenCPN's Mercator scale constant: toSM easting = dLon_rad * a * k0 and
+// screen px = easting * view_scale_ppm, so ppm counts PROJECTED metres.
+constexpr double kMercatorK0 = 0.9996;
+
 // Web-mercator ground resolution (metres/pixel) at a zoom and latitude.
 double resolution_m_per_px(double zoom, double lat_deg) {
     double world_m = std::cos(lat_deg * kPi / 180.0) * 2.0 * kPi * kEarthR;
     return world_m / (256.0 * std::pow(2.0, zoom));
 }
 
-// Continuous web-mercator zoom for a ground resolution — inverse of the above.
-double zoom_for_resolution(double mpp, double lat_deg) {
-    double world_m = std::cos(lat_deg * kPi / 180.0) * 2.0 * kPi * kEarthR;
-    return std::log2(world_m / (256.0 * mpp));
+// tile57 web-mercator zoom for an OpenCPN view_scale_ppm. Both sides live in
+// PROJECTED mercator metres — OpenCPN maps dLon_rad*a*k0 metres to pixels via
+// ppm; tile57's world is 256*2^z px for 2*pi*R projected metres — so latitude
+// plays no part. (Converting via ground resolution at the view latitude, as
+// this plugin first did, rendered cos(lat) zoomed out: a NODTA inset ring
+// around the cell, and content sliding against the quilt clip when panning.)
+double zoom_for_ppm(double ppm) {
+    return std::log2(2.0 * kPi * kEarthR * kMercatorK0 * ppm / 256.0);
 }
 
 // The chart's "1:N" scale denominator at a zoom (native S-52 scale sense).
@@ -151,17 +159,16 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     double ppm = (vp.view_scale_ppm > 0) ? vp.view_scale_ppm : 0.01;
     double csf = OCPN_GetDisplayContentScaleFactor();
     if (csf > 1.0 && fbw == (uint32_t)std::lround(vp.pix_width * csf)) ppm *= csf;
-    double mpp = 1.0 / ppm;
-    double zoom = zoom_for_resolution(mpp, vp.clat);
+    double zoom = zoom_for_ppm(ppm);
 
     // TEMP diagnostic (throttled to view changes) — remove once macOS is confirmed.
     if (vp.clat != dbg_lat_ || vp.clon != dbg_lon_ || zoom != dbg_zoom_) {
         dbg_lat_ = vp.clat; dbg_lon_ = vp.clon; dbg_zoom_ = zoom;
         wxLogMessage("tile57 GL[%s]: clat=%.4f clon=%.4f ppm=%.6g rot=%.3f pix=%dx%d "
-                     "glVp=[%d,%d %dx%d] csf=%.2f stencil=%d -> mpp=%.4f zoom=%.4f",
+                     "glVp=[%d,%d %dx%d] csf=%.2f stencil=%d -> zoom=%.4f",
                      tag, vp.clat, vp.clon, vp.view_scale_ppm, vp.rotation,
                      vp.pix_width, vp.pix_height, gvp[0], gvp[1], gvp[2], gvp[3],
-                     csf, (int)stencil_clip, mpp, zoom);
+                     csf, (int)stencil_clip, zoom);
     }
 
     renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip);
