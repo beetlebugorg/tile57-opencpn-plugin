@@ -5,6 +5,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <wx/image.h>
+#include <wx/mstream.h>
 #include "earcut.hpp"
 
 namespace t57 {
@@ -35,20 +41,28 @@ uint64_t mariner_hash(const tile57_mariner& m) {
 
 // ---- tessellation ----------------------------------------------------------
 // World area fill: earcut the rings (outer + holes) directly in world space.
+// Rings are decimated to the portrayal's pixel grid first — dropping sub-half-
+// pixel detail cuts the triangle count hugely on dense coastlines/depth areas
+// (the per-frame draw cost, hence the zoom framerate) with no visible change.
 void ChartRenderer::on_fill_area(const tile57_world_rings* p, tile57_rgba c, float thresh) {
     if (!p || p->n < 3) return;
     using Pt = std::array<double, 2>;
+    const double eps2 = decimate_eps_ * decimate_eps_;
     std::vector<std::vector<Pt>> poly;
-    std::vector<Pt> flat;
     for (uint32_t r = 0; r < p->ring_count; ++r) {
         uint32_t s = p->ring_starts[r];
         uint32_t e = (r + 1 < p->ring_count) ? p->ring_starts[r + 1] : p->n;
         if (e <= s + 2) continue;
-        std::vector<Pt> ring;
-        for (uint32_t i = s; i < e; ++i) { ring.push_back({p->pts[i].x, p->pts[i].y}); flat.push_back({p->pts[i].x, p->pts[i].y}); }
-        poly.push_back(std::move(ring));
+        std::vector<Pt> ring{{p->pts[s].x, p->pts[s].y}};
+        for (uint32_t i = s + 1; i < e; ++i) {
+            double dx = p->pts[i].x - ring.back()[0], dy = p->pts[i].y - ring.back()[1];
+            if (i == e - 1 || dx * dx + dy * dy >= eps2) ring.push_back({p->pts[i].x, p->pts[i].y});
+        }
+        if (ring.size() >= 3) poly.push_back(std::move(ring));
     }
     if (poly.empty()) return;
+    std::vector<Pt> flat;
+    for (const auto& ring : poly) flat.insert(flat.end(), ring.begin(), ring.end());
     std::vector<uint32_t> idx = mapbox::earcut<uint32_t>(poly);
     for (size_t i = 0; i + 2 < idx.size(); i += 3)
         for (int k = 0; k < 3; ++k) {
@@ -63,12 +77,19 @@ void ChartRenderer::on_fill_area(const tile57_world_rings* p, tile57_rgba c, flo
 void ChartRenderer::on_stroke_line(const tile57_world_rings* p, float width_px, tile57_rgba c, float thresh) {
     if (!p || p->n < 2) return;
     float hw = std::max(0.5f, width_px * 0.5f);
+    const double eps2 = decimate_eps_ * decimate_eps_;
     for (uint32_t r = 0; r < p->ring_count; ++r) {
         uint32_t s = p->ring_starts[r];
         uint32_t e = (r + 1 < p->ring_count) ? p->ring_starts[r + 1] : p->n;
-        for (uint32_t i = s; i + 1 < e; ++i) {
-            double ax = p->pts[i].x - ref_wx_, ay = p->pts[i].y - ref_wy_;
-            double bx = p->pts[i + 1].x - ref_wx_, by = p->pts[i + 1].y - ref_wy_;
+        // Decimate to the pixel grid before expanding (see on_fill_area).
+        std::vector<std::array<double, 2>> kept{{p->pts[s].x, p->pts[s].y}};
+        for (uint32_t i = s + 1; i < e; ++i) {
+            double dx = p->pts[i].x - kept.back()[0], dy = p->pts[i].y - kept.back()[1];
+            if (i == e - 1 || dx * dx + dy * dy >= eps2) kept.push_back({p->pts[i].x, p->pts[i].y});
+        }
+        for (size_t i = 0; i + 1 < kept.size(); ++i) {
+            double ax = kept[i][0] - ref_wx_, ay = kept[i][1] - ref_wy_;
+            double bx = kept[i + 1][0] - ref_wx_, by = kept[i + 1][1] - ref_wy_;
             double dx = bx - ax, dy = by - ay, len = std::sqrt(dx * dx + dy * dy);
             if (len < 1e-12) continue;
             float nx = (float)(-dy / len) * hw, ny = (float)(dx / len) * hw;  // px offset
@@ -174,6 +195,102 @@ void ChartRenderer::on_draw_text(tile57_world_point anchor, const tile57_local_r
     tess_local_even_odd(g, anchor.x - ref_wx_, anchor.y - ref_wy_, c, thresh, text_);
 }
 
+// ---- sprite atlas (shared; loaded once in a GL context) --------------------
+namespace {
+struct SpriteAtlas {
+    uint32_t tex = 0;
+    std::unordered_map<std::string, std::array<float, 4>> uv;  // name -> u0,v0,u1,v1
+    bool tried = false, ok = false;
+};
+SpriteAtlas g_atlas;
+
+double json_num(const char* s, size_t lo, size_t hi, const char* key) {
+    std::string k = std::string("\"") + key + "\"";
+    for (size_t p = lo; p + k.size() < hi; ++p)
+        if (std::memcmp(s + p, k.data(), k.size()) == 0) {
+            size_t q = p + k.size();
+            while (q < hi && (s[q] == ' ' || s[q] == ':')) ++q;
+            return std::atof(s + q);
+        }
+    return 0;
+}
+
+// Parse a MapLibre sprite JSON ({"name":{"x":,"y":,"width":,"height":},..}) into
+// name -> normalised UV rect. The pivot-centred entry is the bare name.
+void parse_sprite_json(const char* s, size_t len, int tw, int th,
+                       std::unordered_map<std::string, std::array<float, 4>>& out) {
+    if (tw <= 0 || th <= 0 || !s) return;
+    size_t i = 0;
+    auto ws = [&] { while (i < len && (s[i]==' '||s[i]=='\n'||s[i]=='\t'||s[i]=='\r')) ++i; };
+    ws(); if (i >= len || s[i] != '{') return; ++i;
+    while (i < len) {
+        ws(); if (i < len && s[i] == '}') break;
+        if (i >= len || s[i] != '"') break;
+        ++i; size_t ns = i; while (i < len && s[i] != '"') ++i;
+        std::string name(s + ns, i - ns); if (i < len) ++i;
+        ws(); if (i < len && s[i] == ':') ++i; ws();
+        if (i >= len || s[i] != '{') break;
+        int depth = 0; size_t os = i;
+        while (i < len) { char ch = s[i]; if (ch=='{') ++depth; else if (ch=='}') { if (--depth==0) { ++i; break; } } ++i; }
+        double x = json_num(s, os, i, "x"), y = json_num(s, os, i, "y");
+        double w = json_num(s, os, i, "width"), h = json_num(s, os, i, "height");
+        if (w > 0 && h > 0)
+            out[name] = { (float)(x/tw), (float)(y/th), (float)((x+w)/tw), (float)((y+h)/th) };
+        ws(); if (i < len && s[i] == ',') ++i;
+    }
+}
+
+void load_sprite_atlas() {
+    if (g_atlas.tried) return;
+    g_atlas.tried = true;
+    tile57_assets assets{};
+    // sprite-mln: pivot-centred cells + {name:{x,y,w,h}} JSON. NULL => embedded.
+    if (!tile57_bake_sprite_mln(nullptr, &assets)) return;
+    if (assets.sprite_png && assets.sprite_png_len) {
+        wxMemoryInputStream mis(assets.sprite_png, assets.sprite_png_len);
+        wxImage img;
+        if (img.LoadFile(mis, wxBITMAP_TYPE_PNG)) {
+            int tw = img.GetWidth(), th = img.GetHeight();
+            std::vector<uint8_t> rgba((size_t)tw * th * 4);
+            const uint8_t* rgb = img.GetData();
+            const uint8_t* al = img.HasAlpha() ? img.GetAlpha() : nullptr;
+            for (int p = 0; p < tw * th; ++p) {
+                rgba[p*4+0] = rgb[p*3+0]; rgba[p*4+1] = rgb[p*3+1]; rgba[p*4+2] = rgb[p*3+2];
+                rgba[p*4+3] = al ? al[p] : 255;
+            }
+            glGenTextures(1, &g_atlas.tex);
+            glBindTexture(GL_TEXTURE_2D, g_atlas.tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            parse_sprite_json((const char*)assets.sprite_json, assets.sprite_json_len, tw, th, g_atlas.uv);
+            g_atlas.ok = g_atlas.tex != 0 && !g_atlas.uv.empty();
+        }
+    }
+    tile57_assets_free(&assets);
+}
+}  // namespace
+
+// Point symbol as a textured quad from the atlas: quad of ±half centred on the
+// anchor, rotated, mapped to the symbol's atlas cell (AA'd by texture filtering).
+void ChartRenderer::on_draw_sprite(const char* name, size_t len, tile57_world_point anchor,
+                                   float rot_deg, float hw, float hh, float thresh) {
+    if (!g_atlas.ok || hw <= 0 || hh <= 0) return;
+    auto it = g_atlas.uv.find(std::string(name, len));
+    if (it == g_atlas.uv.end()) return;
+    const auto& uv = it->second;  // u0, v0, u1, v1
+    float awx = (float)(anchor.x - ref_wx_), awy = (float)(anchor.y - ref_wy_);
+    float rad = rot_deg * (float)kPi / 180.0f, c = std::cos(rad), s = std::sin(rad);
+    auto corner = [&](float lx, float ly, float u, float vv) {
+        sprite_.push_back({ awx, awy, lx*c - ly*s, lx*s + ly*c, u, vv, thresh });
+    };
+    corner(-hw, -hh, uv[0], uv[1]); corner(hw, -hh, uv[2], uv[1]); corner(hw, hh, uv[2], uv[3]);
+    corner(-hw, -hh, uv[0], uv[1]); corner(hw, hh, uv[2], uv[3]); corner(-hw, hh, uv[0], uv[3]);
+}
+
 // ---- C surface trampolines (ctx == ChartRenderer*) -------------------------
 static float feat_thresh(const tile57_feature* f) { return scamin_threshold(f ? f->scamin : 0); }
 static void tr_fill(void* c, const tile57_feature* f, const tile57_world_rings* r, tile57_rgba col, int) {
@@ -187,6 +304,10 @@ static void tr_symbol(void* c, const tile57_feature* f, tile57_world_point a, co
 }
 static void tr_text(void* c, const tile57_feature* f, tile57_world_point a, const tile57_local_rings* g, tile57_rgba col, tile57_rgba halo, float) {
     static_cast<ChartRenderer*>(c)->on_draw_text(a, g, col, halo, feat_thresh(f));
+}
+static void tr_sprite(void* c, const tile57_feature* f, const char* name, size_t len,
+                      tile57_world_point a, float rot, float hw, float hh) {
+    static_cast<ChartRenderer*>(c)->on_draw_sprite(name, len, a, rot, hw, hh, feat_thresh(f));
 }
 
 // ---- chart / GL lifecycle --------------------------------------------------
@@ -230,6 +351,31 @@ static const char* FS = R"(
 varying vec4 vCol;
 void main(){ gl_FragColor = vec4(vCol.rgb*vCol.a, vCol.a); }
 )";
+// Sprite program: same world transform, but sample the atlas at aUV. Output
+// premultiplied so it composites with GL_ONE, GL_ONE_MINUS_SRC_ALPHA.
+static const char* VS_SPRITE = R"(
+attribute vec2 aWorld;
+attribute vec2 aPost;
+attribute vec2 aUV;
+attribute float aThresh;
+uniform float uScale;
+uniform vec2 uOrigin;
+uniform vec2 uVp;
+uniform float uZoom;
+varying vec2 vUV;
+void main(){
+  if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); vUV = vec2(0.0); return; }
+  vec2 screen = aWorld*uScale + uOrigin + aPost;
+  vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
+  gl_Position = vec4(ndc, 0.0, 1.0);
+  vUV = aUV;
+}
+)";
+static const char* FS_SPRITE = R"(
+uniform sampler2D uAtlas;
+varying vec2 vUV;
+void main(){ vec4 t = texture2D(uAtlas, vUV); gl_FragColor = vec4(t.rgb*t.a, t.a); }
+)";
 static uint32_t compile(GLenum t, const char* body) {
     std::string src = std::string(T57_GLSL_VERSION) + body;
     const char* s = src.c_str();
@@ -258,15 +404,35 @@ bool ChartRenderer::ensure_gl() {
     glGenBuffers(1, &vbo_line_);
     glGenBuffers(1, &vbo_symbol_);
     glGenBuffers(1, &vbo_text_);
+
+    // Sprite program (textured point symbols).
+    prog_sprite_ = glCreateProgram();
+    glAttachShader(prog_sprite_, compile(GL_VERTEX_SHADER, VS_SPRITE));
+    glAttachShader(prog_sprite_, compile(GL_FRAGMENT_SHADER, FS_SPRITE));
+    glBindAttribLocation(prog_sprite_, 0, "aWorld");
+    glBindAttribLocation(prog_sprite_, 1, "aPost");
+    glBindAttribLocation(prog_sprite_, 2, "aUV");
+    glBindAttribLocation(prog_sprite_, 3, "aThresh");
+    glLinkProgram(prog_sprite_);
+    su_scale_ = glGetUniformLocation(prog_sprite_, "uScale");
+    su_origin_ = glGetUniformLocation(prog_sprite_, "uOrigin");
+    su_vp_ = glGetUniformLocation(prog_sprite_, "uVp");
+    su_zoom_ = glGetUniformLocation(prog_sprite_, "uZoom");
+    su_atlas_ = glGetUniformLocation(prog_sprite_, "uAtlas");
+    glGenBuffers(1, &vbo_sprite_);
+    load_sprite_atlas();
+
     gl_ready_ = true;
     return true;
 }
 
 void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                             const tile57_mariner& m) {
-    area_.clear(); line_.clear(); symbol_.clear(); text_.clear();
+    area_.clear(); line_.clear(); symbol_.clear(); text_.clear(); sprite_.clear();
     // World reference: the view centre, so vertex offsets stay tiny (f32-precise).
     lonlat_to_world(lon, lat, ref_wx_, ref_wy_);
+    // Decimate geometry to ~half a pixel at the portrayal zoom.
+    decimate_eps_ = 0.5 / (256.0 * std::pow(2.0, zoom));
 
     tile57_surface_cb cb{};
     cb.ctx = this;
@@ -274,6 +440,8 @@ void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uin
     cb.stroke_line = tr_stroke;
     cb.draw_symbol = tr_symbol;
     cb.draw_text = tr_text;
+    // Point symbols draw as atlas sprites when the atlas loaded; else tessellate.
+    if (g_atlas.ok) cb.draw_sprite = tr_sprite;
     int rc = tile57_chart_render_surface_cb(chart_, lon, lat, zoom, w, h, &m, &cb);
     if (rc != 0) std::fprintf(stderr, "t57 render_surface_cb rc=%d\n", rc);
     upload();
@@ -289,6 +457,9 @@ void ChartRenderer::upload() {
     up(vbo_line_, line_, n_line_);
     up(vbo_symbol_, symbol_, n_symbol_);
     up(vbo_text_, text_, n_text_);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_sprite_);
+    glBufferData(GL_ARRAY_BUFFER, sprite_.size() * sizeof(SpriteVtx), sprite_.data(), GL_DYNAMIC_DRAW);
+    n_sprite_ = (uint32_t)sprite_.size();
 }
 
 void ChartRenderer::draw_range(uint32_t vbo, uint32_t count) {
@@ -318,19 +489,27 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         min_zoom_ = info.min_zoom; max_zoom_ = info.max_zoom; have_range_ = true;
     }
     // Portray at the view zoom clamped to the baked band (tile selection); the
-    // GPU then transforms to ANY zoom, so pan (inside the margin) and zoom
-    // (within ~1 level of the portrayal, so finer tiles land) are re-portray-free.
+    // GPU then transforms to ANY zoom, so pan and zoom are re-portray-free.
     double cz = zoom;
     if (cz < min_zoom_) cz = min_zoom_;
     if (cz > max_zoom_) cz = max_zoom_;
+
+    // Re-portray on zoom only once the gesture SETTLES: while the zoom is still
+    // changing frame-to-frame we transform the cached geometry (smooth, like a
+    // native chart), and refresh to crisp detail when it stops. A large excursion
+    // (>3 levels) refreshes even mid-gesture to avoid extreme scaling artefacts.
+    bool zoom_settled = std::fabs(zoom - last_zoom_) < 0.02;
+    if (pass != Pass::kText) last_zoom_ = zoom;
+    bool zoom_stale = std::fabs(cz - cam_zoom_) > 0.3;
 
     uint64_t mh = mariner_hash(m);
     // Pan margin: a small overscan so short pans replay without re-portraying.
     // Kept tight — portrayal + tessellation cost scales with camera AREA, and a
     // big buffer is slow to draw every frame (it was the zoom-blank cause).
     auto cam_dim = [&](uint32_t v) { return (uint32_t)std::min(std::ceil(v * 1.15), 4096.0); };
-    bool need = !have_cam_ || mh != cam_mhash_ || std::fabs(cz - cam_zoom_) > 1.0
-             || cam_w_ < cam_dim(w) / 2 || cam_h_ < cam_dim(h) / 2;
+    bool need = !have_cam_ || mh != cam_mhash_
+             || cam_w_ < cam_dim(w) / 2 || cam_h_ < cam_dim(h) / 2
+             || (zoom_stale && (zoom_settled || std::fabs(cz - cam_zoom_) > 3.0));
     if (!need) {
         // Pan check: is the view centre still well inside the portrayed window?
         double cwx, cwy, vwx, vwy;
@@ -377,6 +556,30 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         draw_range(vbo_area_, n_area_);
         draw_range(vbo_line_, n_line_);
         draw_range(vbo_symbol_, n_symbol_);
+        if (n_sprite_ && g_atlas.ok) {
+            glUseProgram(prog_sprite_);
+            glUniform1f(su_scale_, (float)scale_px);
+            glUniform2fv(su_origin_, 1, origin);
+            glUniform2fv(su_vp_, 1, vp);
+            glUniform1f(su_zoom_, (float)zoom);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, g_atlas.tex);
+            glUniform1i(su_atlas_, 0);
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_sprite_);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx), (void*)offsetof(SpriteVtx, wx));
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx), (void*)offsetof(SpriteVtx, px));
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx), (void*)offsetof(SpriteVtx, u));
+            glEnableVertexAttribArray(3);
+            glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx), (void*)offsetof(SpriteVtx, thresh));
+            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)n_sprite_);
+            glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
+            glDisableVertexAttribArray(2); glDisableVertexAttribArray(3);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glUseProgram(prog_);
+        }
     }
     if (pass != Pass::kBase) draw_range(vbo_text_, n_text_);
 
@@ -385,8 +588,10 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
 }
 
 void ChartRenderer::shutdown() {
-    gl_ready_ = false; prog_ = 0; vbo_area_ = vbo_line_ = vbo_symbol_ = vbo_text_ = 0;
-    n_area_ = n_line_ = n_symbol_ = n_text_ = 0; have_cam_ = false; have_range_ = false;
+    gl_ready_ = false; prog_ = prog_sprite_ = 0;
+    vbo_area_ = vbo_line_ = vbo_symbol_ = vbo_text_ = vbo_sprite_ = 0;
+    n_area_ = n_line_ = n_symbol_ = n_text_ = n_sprite_ = 0;
+    have_cam_ = false; have_range_ = false;
     if (chart_) { tile57_chart_close(chart_); chart_ = nullptr; }
 }
 

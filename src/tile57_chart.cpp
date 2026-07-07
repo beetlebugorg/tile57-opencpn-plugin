@@ -15,6 +15,19 @@ wxIMPLEMENT_DYNAMIC_CLASS(ChartTile57, PlugInChartBaseExtended);
 namespace {
 constexpr double kEarthR = 6378137.0;
 constexpr double kPi = 3.14159265358979323846;
+// tile57 sizes symbols/text/line-widths at size_scale=1.0 against a 72-DPI
+// reference (2.8346 px/mm). Scale that to the real display's pixels-per-mm so
+// S-52 symbology is physically the right size — matching native OpenCPN, which
+// derives its own symbol scale from the same display width. Without this, dense
+// modern displays render everything at a fraction of size ("2x density").
+constexpr double kTile57RefPxPerMm = 2.8346;
+double display_size_scale() {
+    double mm = PlugInGetDisplaySizeMM();
+    int sw = wxGetDisplaySize().GetWidth();
+    if (mm < 1.0 || sw <= 0) return 1.0;
+    double s = (sw / mm) / kTile57RefPxPerMm;
+    return (s > 0.1 && s < 12.0) ? s : 1.0;
+}
 // Pixels per metre of a nominal 96-DPI display; turns a ground resolution into
 // an OpenCPN "1:N" scale denominator.
 constexpr double kPxPerMetre = 96.0 / 0.0254;
@@ -50,6 +63,7 @@ ChartTile57::ChartTile57() {
     m_ChartFamily = PI_CHART_FAMILY_VECTOR;
     m_projection = PI_PROJECTION_MERCATOR;
     tile57_mariner_defaults(&mariner_);
+    mariner_.size_scale = display_size_scale();
 }
 
 ChartTile57::~ChartTile57() { renderer_.shutdown(); }
@@ -194,6 +208,9 @@ void ChartTile57::refresh_mariner() {
         mariner_.show_meta_bounds = meta;
 
         double v;
+        // Prefer the stored contour values (the mariner's set depths) over the
+        // PI getter, which can hand back the snapped/displayed safety contour.
+        if (cfg->Read("S52_MAR_SAFETY_CONTOUR", &v)) mariner_.safety_contour = v;
         if (cfg->Read("S52_MAR_SHALLOW_CONTOUR", &v)) mariner_.shallow_contour = v;
         if (cfg->Read("S52_MAR_DEEP_CONTOUR", &v)) mariner_.deep_contour = v;
         if (cfg->Read("S52_MAR_SAFETY_DEPTH", &v)) mariner_.safety_depth = v;
@@ -230,7 +247,6 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     double csf = OCPN_GetDisplayContentScaleFactor();
     if (csf > 1.0 && fbw == (uint32_t)std::lround(vp.pix_width * csf)) ppm *= csf;
     double zoom = zoom_for_ppm(ppm);
-
     renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip);
     return true;
 }

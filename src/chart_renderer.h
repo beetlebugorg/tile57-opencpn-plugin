@@ -39,12 +39,21 @@ public:
 
     // Unified GPU vertex (see header note).
     struct Vtx { float wx, wy, px, py; uint8_t r, g, b, a; float thresh; };
+    // Sprite vertex: world anchor + screen-px quad corner + atlas UV + SCAMIN.
+    struct SpriteVtx { float wx, wy, px, py, u, v, thresh; };
+
+    // TEMP diagnostic snapshot of the last render().
+    struct Dbg { uint32_t area, line, symbol, text; bool rebuilt; double cam_zoom; };
+    Dbg dbg() const { return { n_area_, n_line_, n_symbol_, n_text_, last_rebuilt_, cam_zoom_ }; }
 
     // Geometry sinks the C surface callbacks append to (public for the
     // trampolines). Grouped by paint layer so we draw area->line->symbol->text.
     std::vector<Vtx> area_, line_, symbol_, text_;
+    std::vector<SpriteVtx> sprite_;   // point symbols drawn from the atlas
     // The world reference point offsets are relative to (set per portrayal).
     double ref_wx_ = 0, ref_wy_ = 0;
+    // Geometry decimation epsilon in world units (~half a portrayal pixel).
+    double decimate_eps_ = 0;
     // Callback handlers (world/local geometry -> Vtx).
     void on_fill_area(const tile57_world_rings* r, tile57_rgba c, float thresh);
     void on_stroke_line(const tile57_world_rings* l, float width_px, tile57_rgba c, float thresh);
@@ -52,6 +61,8 @@ public:
                         tile57_rgba c, int even_odd, float stroke_w, float thresh);
     void on_draw_text(tile57_world_point anchor, const tile57_local_rings* g,
                       tile57_rgba c, tile57_rgba halo, float thresh);
+    void on_draw_sprite(const char* name, size_t len, tile57_world_point anchor,
+                        float rot_deg, float half_w, float half_h, float thresh);
 
 private:
     void rebuild(double lon, double lat, double zoom, uint32_t w, uint32_t h,
@@ -63,6 +74,9 @@ private:
     uint32_t prog_ = 0, vbo_area_ = 0, vbo_line_ = 0, vbo_symbol_ = 0, vbo_text_ = 0;
     uint32_t n_area_ = 0, n_line_ = 0, n_symbol_ = 0, n_text_ = 0;
     int u_scale_ = -1, u_origin_ = -1, u_vp_ = -1, u_zoom_ = -1;
+    // Sprite (textured) program + buffer for point symbols.
+    uint32_t prog_sprite_ = 0, vbo_sprite_ = 0, n_sprite_ = 0;
+    int su_scale_ = -1, su_origin_ = -1, su_vp_ = -1, su_zoom_ = -1, su_atlas_ = -1;
     bool gl_ready_ = false;
 
     bool have_range_ = false;
@@ -72,6 +86,8 @@ private:
     // world window; leaving it (pan) or a big zoom step re-portrays.
     bool have_cam_ = false;
     double cam_lon_ = 0, cam_lat_ = 0, cam_zoom_ = 0;
+    double last_zoom_ = -1;   // previous frame's view zoom (settle detection)
+    bool last_rebuilt_ = false;   // TEMP diagnostic
     uint32_t cam_w_ = 0, cam_h_ = 0;
     uint64_t cam_mhash_ = 0;
 };
