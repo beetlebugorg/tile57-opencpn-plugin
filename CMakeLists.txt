@@ -3,6 +3,8 @@ project(tile57_opencpn_plugin LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# clangd reads build/compile_commands.json for editor diagnostics.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()

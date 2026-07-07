@@ -113,8 +113,14 @@ double ChartTile57::GetNormalScaleMin(double /*canvas_scale_factor*/, bool b_all
 }
 
 double ChartTile57::GetNormalScaleMax(double /*canvas_scale_factor*/, int /*canvas_width*/) {
-    // Keep the chart selected out to (well past) its coarsest baked zoom.
-    return scale_denom(min_zoom_, center_lat_) * 4.0;
+    // Zoomed-OUT limit: show the cell out to ~4x its native (finest-baked)
+    // scale — a native ENC's usable range — so OpenCPN's quilt hands off to a
+    // coarser-band cell past that instead of underzooming this one. tile57
+    // bands max_zoom by compilation scale (overview cells max ~z10, harbour
+    // ~z16), so m_Chart_Scale IS band-appropriate; min_zoom is only a uniform
+    // bake floor (z8) and must NOT drive selection, or every cell claims to be
+    // usable when zoomed right out.
+    return m_Chart_Scale * 4.0;
 }
 
 double ChartTile57::GetNearestPreferredScalePPM(double target_scale_ppm) {
@@ -147,10 +153,14 @@ void ChartTile57::refresh_mariner() {
     // PI_GetPLIBSymbolStyle/BoundaryStyle return S52 LUP table names:
     // 'L' simplified / 'R' paper-chart points; 'N' plain / 'O' symbolized.
     mariner_.simplified_points = (PI_GetPLIBSymbolStyle() == 'L');
-    mariner_.boundary_style = (PI_GetPLIBBoundaryStyle() == 'N')
-                                  ? TILE57_BOUNDARY_PLAIN : TILE57_BOUNDARY_SYMBOLIZED;
+    // Symbolized area boundaries (S-52 'O' LUP) — richer edge symbology.
+    mariner_.boundary_style = TILE57_BOUNDARY_SYMBOLIZED;
     mariner_.depth_unit = (PI_GetPLIBDepthUnitInt() == 0) ? TILE57_DEPTH_FEET
                                                           : TILE57_DEPTH_METERS;
+    // Information callouts (INFORM/TXTDSC balloons) clutter the chart — keep them
+    // off unconditionally (set here, not in the config block below which may be
+    // skipped when GetOCPNConfigObject() is null).
+    mariner_.show_inform_callouts = false;
 
     // The remaining vector-chart options aren't exposed through PI getters;
     // OpenCPN's live config object carries them (the options dialog writes
@@ -178,6 +188,11 @@ void ChartTile57::refresh_mariner() {
         // category, so honour OpenCPN's explicit soundings toggle here.
         mariner_.display_other = (cat == 'O') || soundings;
 
+        // bShowMeta drives OpenCPN's meta-object (M_* boundary) display.
+        bool meta = false;
+        cfg->Read("bShowMeta", &meta, false);
+        mariner_.show_meta_bounds = meta;
+
         double v;
         if (cfg->Read("S52_MAR_SHALLOW_CONTOUR", &v)) mariner_.shallow_contour = v;
         if (cfg->Read("S52_MAR_DEEP_CONTOUR", &v)) mariner_.deep_contour = v;
@@ -190,7 +205,7 @@ void ChartTile57::refresh_mariner() {
 }
 
 int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
-                             bool stencil_clip, const char* tag) {
+                             bool stencil_clip) {
     if (!vp.bValid) return false;
     if (!renderer_.ensure_gl()) return false;
     refresh_mariner();
@@ -216,16 +231,6 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     if (csf > 1.0 && fbw == (uint32_t)std::lround(vp.pix_width * csf)) ppm *= csf;
     double zoom = zoom_for_ppm(ppm);
 
-    // TEMP diagnostic (throttled to view changes) — remove once macOS is confirmed.
-    if (vp.clat != dbg_lat_ || vp.clon != dbg_lon_ || zoom != dbg_zoom_) {
-        dbg_lat_ = vp.clat; dbg_lon_ = vp.clon; dbg_zoom_ = zoom;
-        wxLogMessage("tile57 GL[%s]: clat=%.4f clon=%.4f ppm=%.6g rot=%.3f pix=%dx%d "
-                     "glVp=[%d,%d %dx%d] csf=%.2f stencil=%d -> zoom=%.4f",
-                     tag, vp.clat, vp.clon, vp.view_scale_ppm, vp.rotation,
-                     vp.pix_width, vp.pix_height, gvp[0], gvp[1], gvp[2], gvp[3],
-                     csf, (int)stencil_clip, zoom);
-    }
-
     renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip);
     return true;
 }
@@ -233,21 +238,21 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
 int ChartTile57::RenderRegionViewOnGL(const wxGLContext& /*glc*/, const PlugIn_ViewPort& vp,
                                       const wxRegion& /*Region*/, bool /*b_use_stencil*/) {
     // Single-chart (unquilted) path: the core wrapper scissors per rect; draw all.
-    return render_pass(vp, t57::ChartRenderer::Pass::kAll, false, "all");
+    return render_pass(vp, t57::ChartRenderer::Pass::kAll, false);
 }
 
 int ChartTile57::RenderRegionViewOnGLNoText(const wxGLContext& /*glc*/, const PlugIn_ViewPort& vp,
                                             const wxRegion& /*Region*/, bool b_use_stencil) {
     // Quilt geometry pass. The core pre-writes this chart's patch region into
     // the stencil buffer (SetClipRegion) and expects the chart to clip itself.
-    return render_pass(vp, t57::ChartRenderer::Pass::kBase, b_use_stencil, "base");
+    return render_pass(vp, t57::ChartRenderer::Pass::kBase, b_use_stencil);
 }
 
 int ChartTile57::RenderRegionViewOnGLTextOnly(const wxGLContext& /*glc*/, const PlugIn_ViewPort& vp,
                                               const wxRegion& /*Region*/, bool /*b_use_stencil*/) {
     // Quilt text pass: once across the whole quilt, unclipped (text declutters
     // across patch boundaries).
-    return render_pass(vp, t57::ChartRenderer::Pass::kText, false, "text");
+    return render_pass(vp, t57::ChartRenderer::Pass::kText, false);
 }
 
 wxBitmap& ChartTile57::transparent_bitmap(const PlugIn_ViewPort& vp) {

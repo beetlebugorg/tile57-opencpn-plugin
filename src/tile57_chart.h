@@ -73,7 +73,7 @@ public:
 private:
     // Shared per-pass render: ViewPort -> tile57 camera -> draw `pass` buffers.
     int render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
-                    bool stencil_clip, const char* tag);
+                    bool stencil_clip);
     wxBitmap& transparent_bitmap(const PlugIn_ViewPort& vp);
     // Pull OpenCPN's S52/vector-chart options (soundings, display category,
     // text, contours, …) into the tile57 mariner. Cheap: re-reads only when
@@ -90,9 +90,6 @@ private:
     float covr_[8] = {0};   // 4 points, each (lat, lon), OpenCPN float_2Dpt order
 
     wxBitmap dc_bmp_;       // backing store for the DC fallback
-
-    // Throttle for the render-path diagnostic log (last logged view).
-    double dbg_lon_ = 1e9, dbg_lat_ = 1e9, dbg_zoom_ = 1e9;
 
     int plib_hash_ = -1;    // last PI_GetPLIBStateHash() folded into mariner_
 
