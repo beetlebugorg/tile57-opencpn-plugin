@@ -1,7 +1,9 @@
 // tile57_chart.cpp — see tile57_chart.h.
 #include "tile57_chart.h"
+#include "gl.h"
 #include <wx/filename.h>
 #include <wx/image.h>
+#include <wx/log.h>
 #include <cmath>
 #include <cstring>
 
@@ -127,12 +129,36 @@ int ChartTile57::RenderRegionViewOnGL(const wxGLContext& /*glc*/, const PlugIn_V
     if (!vp.bValid) return false;
     if (!renderer_.ensure_gl()) return false;
 
-    // OpenCPN ViewPort -> tile57 camera (centre + web-mercator zoom).
-    double mpp = (vp.view_scale_ppm > 0) ? 1.0 / vp.view_scale_ppm : 100.0;
+    // Render at the TRUE framebuffer resolution, not the ViewPort's logical pixel
+    // size. On HiDPI/Retina, OpenCPN's GL framebuffer is (contentScale)x larger
+    // than vp.pix_width/height; our shader maps a render of size N across the whole
+    // framebuffer, so a logical-sized render is stretched and the chart no longer
+    // fits the view. glViewport is exactly what NDC maps to. (On non-HiDPI it
+    // equals pix_width/height, so this is a no-op there.)
+    GLint gvp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, gvp);
+    uint32_t fbw = gvp[2] > 0 ? (uint32_t)gvp[2] : (uint32_t)vp.pix_width;
+    uint32_t fbh = gvp[3] > 0 ? (uint32_t)gvp[3] : (uint32_t)vp.pix_height;
+
+    // Metres of ground the view spans (unit-consistent: pix and ppm share units),
+    // then metres per framebuffer pixel -> web-mercator zoom for that resolution.
+    double ground_w = (vp.view_scale_ppm > 0 && vp.pix_width > 0)
+                          ? vp.pix_width / vp.view_scale_ppm
+                          : fbw * 100.0;
+    double mpp = ground_w / (fbw > 0 ? fbw : 1);
     double zoom = zoom_for_resolution(mpp, vp.clat);
-    renderer_.render(vp.clon, vp.clat, zoom,
-                     (uint32_t)vp.pix_width, (uint32_t)vp.pix_height,
-                     mariner_, /*draw_text=*/true);
+
+    // TEMP diagnostic (throttled to view changes) — remove once HiDPI is confirmed.
+    static double dbg_lat = 1e9, dbg_lon = 1e9, dbg_zoom = 1e9;
+    if (vp.clat != dbg_lat || vp.clon != dbg_lon || zoom != dbg_zoom) {
+        dbg_lat = vp.clat; dbg_lon = vp.clon; dbg_zoom = zoom;
+        wxLogMessage("tile57 GL: clat=%.4f clon=%.4f ppm=%.6g pix=%dx%d glVp=%dx%d "
+                     "csf=%.2f -> mpp=%.4f zoom=%.4f",
+                     vp.clat, vp.clon, vp.view_scale_ppm, vp.pix_width, vp.pix_height,
+                     (int)fbw, (int)fbh, OCPN_GetDisplayContentScaleFactor(), mpp, zoom);
+    }
+
+    renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, /*draw_text=*/true);
     return true;
 }
 
