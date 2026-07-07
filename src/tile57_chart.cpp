@@ -184,8 +184,10 @@ void ChartTile57::refresh_mariner() {
     // PI_GetPLIBSymbolStyle/BoundaryStyle return S52 LUP table names:
     // 'L' simplified / 'R' paper-chart points; 'N' plain / 'O' symbolized.
     mariner_.simplified_points = (PI_GetPLIBSymbolStyle() == 'L');
-    // Symbolized area boundaries (S-52 'O' LUP) — richer edge symbology.
-    mariner_.boundary_style = TILE57_BOUNDARY_SYMBOLIZED;
+    // Area boundaries: 'O' symbolized (richer edge symbology) / 'N' plain. Was
+    // hardcoded to symbolized, so OpenCPN's Plain/Symbolized toggle did nothing.
+    mariner_.boundary_style = (PI_GetPLIBBoundaryStyle() == 'O') ? TILE57_BOUNDARY_SYMBOLIZED
+                                                                 : TILE57_BOUNDARY_PLAIN;
     mariner_.depth_unit = (PI_GetPLIBDepthUnitInt() == 0) ? TILE57_DEPTH_FEET
                                                           : TILE57_DEPTH_METERS;
     // Information callouts (INFORM/TXTDSC balloons) clutter the chart — keep them
@@ -233,6 +235,21 @@ void ChartTile57::refresh_mariner() {
         if (cfg->Read("S52_MAR_SAFETY_DEPTH", &v)) mariner_.safety_depth = v;
         long two_shades = 0;
         if (cfg->Read("S52_MAR_TWO_SHADES", &two_shades)) mariner_.four_shade_water = !two_shades;
+
+        // Full-length light sector lines (OpenCPN "Extended light sectors").
+        bool full_sectors = true;
+        cfg->Read("bExtendLightSectors", &full_sectors, true);
+        mariner_.show_full_sector_lines = full_sectors;
+        // SCAMIN on/off (bUseSCAMIN); off => show every feature regardless of scale.
+        bool use_scamin = true;
+        cfg->Read("bUseSCAMIN", &use_scamin, true);
+        mariner_.ignore_scamin = !use_scamin;
+
+        // Data-quality (M_QUAL/QUAPOS) display is a per-canvas setting.
+        cfg->SetPath("/Canvas/CanvasConfig1");
+        bool dq = false;
+        cfg->Read("canvasENCShowDataQuality", &dq, false);
+        mariner_.data_quality = dq;
 
         cfg->SetPath(path);
     }
