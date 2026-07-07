@@ -21,6 +21,7 @@
 // Tile57Plugin::GetDynamicChartClassNameArray).
 #pragma once
 #include <cstdint>  // ocpn_plugin.h (api-18) references uint8_t before including it
+#include <vector>
 #include "ocpn_plugin.h"
 #include "chart_renderer.h"
 #include <wx/bitmap.h>
@@ -70,17 +71,16 @@ public:
 
     wxBitmap* GetThumbnail(int tnx, int tny, int cs) override { return nullptr; }
 
-    // Object query (S-52 §10.8 pick): OpenCPN calls these on a double-click over a
-    // plugin chart. GetObjRuleListAtLatLon returns the objects under the point;
-    // CreateObjDescriptions turns them into the dialog HTML. The PI_S57Obj records
-    // are allocated WITHOUT their constructor (its symbol isn't exported on macOS)
-    // — OpenCPN reads and frees them.
-    ListOfPI_S57Obj* GetObjRuleListAtLatLon(float lat, float lon, float select_radius,
-                                            PlugIn_ViewPort* VPoint) override;
-    wxString CreateObjDescriptions(ListOfPI_S57Obj* obj_list) override;
+    // Object query (S-52 §10.8 pick). The plugin drives this from its own mouse
+    // handler rather than OpenCPN's GetObjRuleListAtLatLon path, whose PI_S57Obj
+    // constructor isn't exported on macOS. QueryDescription returns HTML feature
+    // blocks for the features under (lon,lat); covers() is the coverage test;
+    // instances() is the live registry of open charts.
+    wxString QueryDescription(double lon, double lat) const;
+    bool covers(double lon, double lat) const;
+    static const std::vector<ChartTile57*>& instances();
 
 private:
-    wxString query_html_;   // description built in GetObjRuleListAtLatLon
     // Shared per-pass render: ViewPort -> tile57 camera -> draw `pass` buffers.
     int render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
                     bool stencil_clip);

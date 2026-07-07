@@ -5,6 +5,7 @@
 #include <wx/filename.h>
 #include <wx/image.h>
 #include <wx/log.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -34,6 +35,13 @@ double display_size_scale() {
 // Pixels per metre of a nominal 96-DPI display; turns a ground resolution into
 // an OpenCPN "1:N" scale denominator.
 constexpr double kPxPerMetre = 96.0 / 0.0254;
+
+// Live registry of open charts, so the plugin's mouse handler can find the ones
+// covering the cursor to query them.
+std::vector<ChartTile57*>& chart_registry() {
+    static std::vector<ChartTile57*> v;
+    return v;
+}
 
 // OpenCPN's Mercator scale constant: toSM easting = dLon_rad * a * k0 and
 // screen px = easting * view_scale_ppm, so ppm counts PROJECTED metres.
@@ -67,9 +75,14 @@ ChartTile57::ChartTile57() {
     m_projection = PI_PROJECTION_MERCATOR;
     tile57_mariner_defaults(&mariner_);
     mariner_.size_scale = display_size_scale();
+    chart_registry().push_back(this);
 }
 
-ChartTile57::~ChartTile57() { renderer_.shutdown(); }
+ChartTile57::~ChartTile57() {
+    auto& reg = chart_registry();
+    reg.erase(std::remove(reg.begin(), reg.end(), this), reg.end());
+    renderer_.shutdown();
+}
 
 int ChartTile57::Init(const wxString& full_path, int /*init_flags*/) {
     // Opening a PMTiles bundle is cheap (it only peeks the archive metadata), so
@@ -307,8 +320,9 @@ void json_rows(const std::string& j, wxString& out) {
     }
 }
 
+// Feature blocks — the plugin wraps the concatenation in <html><body>.
 wxString build_query_html(const std::vector<QueryHit>& hits) {
-    wxString h = "<html><body>";
+    wxString h;
     for (const auto& f : hits) {
         h += "<font size=+1><b>" + wxString::FromUTF8(f.cls.c_str()) + "</b></font>";
         if (!f.cell.empty())
@@ -317,38 +331,25 @@ wxString build_query_html(const std::vector<QueryHit>& hits) {
         json_rows(f.s57, h);
         h += "</table><hr>";
     }
-    h += "</body></html>";
     return h;
 }
 }  // namespace
 
-ListOfPI_S57Obj* ChartTile57::GetObjRuleListAtLatLon(float lat, float lon, float /*radius*/,
-                                                     PlugIn_ViewPort* /*vp*/) {
-    auto* list = new ListOfPI_S57Obj;
-    query_html_.Clear();
+const std::vector<ChartTile57*>& ChartTile57::instances() { return chart_registry(); }
+
+wxString ChartTile57::QueryDescription(double lon, double lat) const {
     tile57_chart* ch = renderer_.chart_handle();
-    if (!ch) return list;
+    if (!ch) return wxEmptyString;
     std::vector<QueryHit> hits;
     tile57_query_cb cb{ &hits, collect_hit };
     tile57_chart_query(ch, lon, lat, &cb);
-    if (hits.empty()) return list;
-    query_html_ = build_query_html(hits);
-    // Allocate each PI_S57Obj WITHOUT its constructor (the ctor symbol isn't
-    // exported on macOS, and calling it would fail plugin load). Zeroed is fine:
-    // OpenCPN reads FeatureName + the reference point and frees them.
-    for (const auto& f : hits) {
-        auto* o = static_cast<PI_S57Obj*>(std::calloc(1, sizeof(PI_S57Obj)));
-        if (!o) break;
-        std::strncpy(o->FeatureName, f.cls.c_str(), sizeof(o->FeatureName) - 1);
-        o->m_lat = lat;
-        o->m_lon = lon;
-        list->Append(o);
-    }
-    return list;
+    if (hits.empty()) return wxEmptyString;
+    return build_query_html(hits);
 }
 
-wxString ChartTile57::CreateObjDescriptions(ListOfPI_S57Obj* /*obj_list*/) {
-    return query_html_;
+bool ChartTile57::covers(double lon, double lat) const {
+    return covr_valid_ && lon >= bounds_west_ && lon <= bounds_east_
+        && lat >= bounds_south_ && lat <= bounds_north_;
 }
 
 wxBitmap& ChartTile57::transparent_bitmap(const PlugIn_ViewPort& vp) {
