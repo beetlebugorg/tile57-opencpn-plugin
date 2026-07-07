@@ -1,11 +1,20 @@
 // tile57_chart.h — a first-class OpenCPN plugin chart backed by tile57.
 //
-// ChartTile57 is a PlugInChartBaseGL (VECTOR family): OpenCPN discovers a baked
-// tile57 bundle's chart.pmtiles via GetFileSearchMask, adds it to the chart
-// database like any native chart, and drives it through the chart bar, quilting
-// and scale transitions. Rendering reuses the GL vector renderer used by the
-// former overlay (see chart_renderer): each RenderRegionViewOnGL converts the
-// ViewPort into a tile57 camera and paints tile57's live S-52 portrayal.
+// ChartTile57 is a PlugInChartBaseExtended (VECTOR family): OpenCPN discovers a
+// baked tile57 bundle's chart.pmtiles via GetFileSearchMask, adds it to the
+// chart database like any native chart, and drives it through the chart bar,
+// quilting and scale transitions.
+//
+// Extended (not the legacy PlugInChartBaseGL) matters for quilting: OpenCPN
+// draws quilted vector charts in two passes — per-patch geometry
+// (RenderRegionViewOnGLNoText, clipped to the patch via a stencil mask the core
+// pre-writes) and then ONE decluttered text pass across the whole quilt
+// (RenderRegionViewOnGLTextOnly, possibly with a laterally-expanded ViewPort).
+// A legacy BaseGL chart is wedged through a per-rect compatibility path that
+// composites its full render (text included) at patch granularity, which shows
+// seams and doubled text. Rendering reuses the GL vector renderer (see
+// chart_renderer); each pass converts the ViewPort into a tile57 camera and
+// draws the cached portrayal geometry.
 //
 // The class is registered with wxWidgets' dynamic-class system so OpenCPN can
 // create instances by name (the name it returns from
@@ -19,7 +28,7 @@
 
 extern "C" void tile57_mariner_defaults(tile57_mariner*);
 
-class ChartTile57 : public PlugInChartBaseGL {
+class ChartTile57 : public PlugInChartBaseExtended {
 public:
     ChartTile57();
     virtual ~ChartTile57();
@@ -43,16 +52,30 @@ public:
     int GetNoCOVRTablenPoints(int iTable) override { return 4; }
     float* GetNoCOVRTableHead(int iTable) override { return covr_; }
 
-    // GL vector render path — the primary path when OpenCPN runs with OpenGL.
+    // GL render passes. Quilted: NoText per patch (stencil-clipped) + TextOnly
+    // once across the quilt. Single-chart mode uses the combined render.
     int RenderRegionViewOnGL(const wxGLContext& glc, const PlugIn_ViewPort& VPoint,
                              const wxRegion& Region, bool b_use_stencil) override;
+    int RenderRegionViewOnGLNoText(const wxGLContext& glc, const PlugIn_ViewPort& VPoint,
+                                   const wxRegion& Region, bool b_use_stencil) override;
+    int RenderRegionViewOnGLTextOnly(const wxGLContext& glc, const PlugIn_ViewPort& VPoint,
+                                     const wxRegion& Region, bool b_use_stencil) override;
+
     // DC fallback (non-GL canvas). This plugin needs OpenGL to draw; on the DC
     // canvas it returns a transparent bitmap so nothing is clobbered.
     wxBitmap& RenderRegionView(const PlugIn_ViewPort& VPoint, const wxRegion& Region) override;
+    wxBitmap& RenderRegionViewOnDCNoText(const PlugIn_ViewPort& VPoint, const wxRegion& Region) override;
+    bool RenderRegionViewOnDCTextOnly(wxMemoryDC& dc, const PlugIn_ViewPort& VPoint,
+                                      const wxRegion& Region) override;
 
     wxBitmap* GetThumbnail(int tnx, int tny, int cs) override { return nullptr; }
 
 private:
+    // Shared per-pass render: ViewPort -> tile57 camera -> draw `pass` buffers.
+    int render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
+                    bool stencil_clip, const char* tag);
+    wxBitmap& transparent_bitmap(const PlugIn_ViewPort& vp);
+
     t57::ChartRenderer renderer_;
     tile57_mariner mariner_{};
 
@@ -63,6 +86,9 @@ private:
     float covr_[8] = {0};   // 4 points, each (lat, lon), OpenCPN float_2Dpt order
 
     wxBitmap dc_bmp_;       // backing store for the DC fallback
+
+    // Throttle for the render-path diagnostic log (last logged view).
+    double dbg_lon_ = 1e9, dbg_lat_ = 1e9, dbg_zoom_ = 1e9;
 
     wxDECLARE_DYNAMIC_CLASS(ChartTile57);
 };

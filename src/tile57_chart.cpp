@@ -9,7 +9,7 @@
 
 // wxWidgets can create ChartTile57 by class name; OpenCPN uses this to
 // instantiate the chart for each matching file it finds in a chart directory.
-wxIMPLEMENT_DYNAMIC_CLASS(ChartTile57, PlugInChartBaseGL);
+wxIMPLEMENT_DYNAMIC_CLASS(ChartTile57, PlugInChartBaseExtended);
 
 namespace {
 constexpr double kEarthR = 6378137.0;
@@ -46,16 +46,14 @@ ChartTile57::ChartTile57() {
 ChartTile57::~ChartTile57() { renderer_.shutdown(); }
 
 int ChartTile57::Init(const wxString& full_path, int /*init_flags*/) {
-    // Opening a PMTiles bundle is cheap, so header/thumb/full inits are handled
-    // identically — each needs the extent and scale.
+    // Opening a PMTiles bundle is cheap (it only peeks the archive metadata), so
+    // header/thumb/full inits are handled identically — each needs the extent
+    // and scale. GL setup is deferred to first render.
     m_FullPath = full_path;
     m_Name = wxFileName(full_path).GetName();
     m_Description = _T("tile57 S-57/S-101 ENC (EXPERIMENTAL — NOT FOR NAVIGATION)");
     m_ID = full_path;
 
-    // Opening a PMTiles bundle is cheap (it only peeks the archive metadata), so
-    // we open it for every init flavour — header/thumb reads need the extent and
-    // scale just as a full init does. GL setup is deferred to first render.
     if (!renderer_.open_chart(std::string(full_path.mb_str()))) return PI_INIT_FAIL_REMOVE;
 
     tile57_chart_info info{};
@@ -83,6 +81,11 @@ int ChartTile57::Init(const wxString& full_path, int /*init_flags*/) {
     bounds_east_ = info.east; bounds_north_ = info.north;
     min_zoom_ = info.min_zoom; max_zoom_ = info.max_zoom;
 
+    wxLogMessage("tile57 Init: %s  bounds[W%.5f S%.5f E%.5f N%.5f] zoom[%d..%d] "
+                 "centerLat=%.5f nativeScale=1:%d",
+                 m_FullPath.c_str(), info.west, info.south, info.east, info.north,
+                 (int)info.min_zoom, (int)info.max_zoom, center_lat_, m_Chart_Scale);
+
     m_bReadyToRender = true;
     return PI_INIT_OK;
 }
@@ -96,7 +99,7 @@ void ChartTile57::SetColorScheme(int cs, bool /*bApplyImmediate*/) {
 }
 
 double ChartTile57::GetNormalScaleMin(double /*canvas_scale_factor*/, bool b_allow_overzoom) {
-    // Allow zooming in past native detail (tile57 re-portrays live at any zoom).
+    // Allow zooming in past native detail (the renderer overzooms the vectors).
     return m_Chart_Scale * (b_allow_overzoom ? 0.125 : 0.25);
 }
 
@@ -124,45 +127,68 @@ void ChartTile57::GetValidCanvasRegion(const PlugIn_ViewPort& vp, wxRegion* pVal
     if (pValidRegion) *pValidRegion = wxRegion(0, 0, vp.pix_width, vp.pix_height);
 }
 
-int ChartTile57::RenderRegionViewOnGL(const wxGLContext& /*glc*/, const PlugIn_ViewPort& vp,
-                                      const wxRegion& /*Region*/, bool /*b_use_stencil*/) {
+int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
+                             bool stencil_clip, const char* tag) {
     if (!vp.bValid) return false;
     if (!renderer_.ensure_gl()) return false;
 
-    // Render at the TRUE framebuffer resolution, not the ViewPort's logical pixel
-    // size. On HiDPI/Retina, OpenCPN's GL framebuffer is (contentScale)x larger
-    // than vp.pix_width/height; our shader maps a render of size N across the whole
-    // framebuffer, so a logical-sized render is stretched and the chart no longer
-    // fits the view. glViewport is exactly what NDC maps to. (On non-HiDPI it
-    // equals pix_width/height, so this is a no-op there.)
+    // Render into the CURRENT GL viewport — that is what NDC maps to, and it is
+    // OpenCPN's choice of target (canvas FBO, or a sub-rect of it). Do NOT size
+    // the render from vp.pix_width: OpenCPN sometimes hands charts an expanded
+    // ViewPort (rv_rect under rotation; the text pass grows pix_width laterally)
+    // whose pixel dims exceed the render target, and sizing from them squeezes
+    // the whole render (~"slightly zoomed out").
     GLint gvp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, gvp);
     uint32_t fbw = gvp[2] > 0 ? (uint32_t)gvp[2] : (uint32_t)vp.pix_width;
     uint32_t fbh = gvp[3] > 0 ? (uint32_t)gvp[3] : (uint32_t)vp.pix_height;
 
-    // Metres of ground the view spans (unit-consistent: pix and ppm share units),
-    // then metres per framebuffer pixel -> web-mercator zoom for that resolution.
-    double ground_w = (vp.view_scale_ppm > 0 && vp.pix_width > 0)
-                          ? vp.pix_width / vp.view_scale_ppm
-                          : fbw * 100.0;
-    double mpp = ground_w / (fbw > 0 ? fbw : 1);
+    // Scale comes from view_scale_ppm ALONE (metres per rendered pixel), which
+    // is invariant under viewport expansion. In GL mode OpenCPN keeps ViewPort
+    // pixels and view_scale_ppm in framebuffer (physical) units; if a build
+    // hands us a logical-unit ViewPort against a HiDPI framebuffer (glViewport
+    // == contentScale * pix_width), correct ppm by that factor.
+    double ppm = (vp.view_scale_ppm > 0) ? vp.view_scale_ppm : 0.01;
+    double csf = OCPN_GetDisplayContentScaleFactor();
+    if (csf > 1.0 && fbw == (uint32_t)std::lround(vp.pix_width * csf)) ppm *= csf;
+    double mpp = 1.0 / ppm;
     double zoom = zoom_for_resolution(mpp, vp.clat);
 
-    // TEMP diagnostic (throttled to view changes) — remove once HiDPI is confirmed.
-    static double dbg_lat = 1e9, dbg_lon = 1e9, dbg_zoom = 1e9;
-    if (vp.clat != dbg_lat || vp.clon != dbg_lon || zoom != dbg_zoom) {
-        dbg_lat = vp.clat; dbg_lon = vp.clon; dbg_zoom = zoom;
-        wxLogMessage("tile57 GL: clat=%.4f clon=%.4f ppm=%.6g pix=%dx%d glVp=%dx%d "
-                     "csf=%.2f -> mpp=%.4f zoom=%.4f",
-                     vp.clat, vp.clon, vp.view_scale_ppm, vp.pix_width, vp.pix_height,
-                     (int)fbw, (int)fbh, OCPN_GetDisplayContentScaleFactor(), mpp, zoom);
+    // TEMP diagnostic (throttled to view changes) — remove once macOS is confirmed.
+    if (vp.clat != dbg_lat_ || vp.clon != dbg_lon_ || zoom != dbg_zoom_) {
+        dbg_lat_ = vp.clat; dbg_lon_ = vp.clon; dbg_zoom_ = zoom;
+        wxLogMessage("tile57 GL[%s]: clat=%.4f clon=%.4f ppm=%.6g rot=%.3f pix=%dx%d "
+                     "glVp=[%d,%d %dx%d] csf=%.2f stencil=%d -> mpp=%.4f zoom=%.4f",
+                     tag, vp.clat, vp.clon, vp.view_scale_ppm, vp.rotation,
+                     vp.pix_width, vp.pix_height, gvp[0], gvp[1], gvp[2], gvp[3],
+                     csf, (int)stencil_clip, mpp, zoom);
     }
 
-    renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, /*draw_text=*/true);
+    renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip);
     return true;
 }
 
-wxBitmap& ChartTile57::RenderRegionView(const PlugIn_ViewPort& vp, const wxRegion& /*Region*/) {
+int ChartTile57::RenderRegionViewOnGL(const wxGLContext& /*glc*/, const PlugIn_ViewPort& vp,
+                                      const wxRegion& /*Region*/, bool /*b_use_stencil*/) {
+    // Single-chart (unquilted) path: the core wrapper scissors per rect; draw all.
+    return render_pass(vp, t57::ChartRenderer::Pass::kAll, false, "all");
+}
+
+int ChartTile57::RenderRegionViewOnGLNoText(const wxGLContext& /*glc*/, const PlugIn_ViewPort& vp,
+                                            const wxRegion& /*Region*/, bool b_use_stencil) {
+    // Quilt geometry pass. The core pre-writes this chart's patch region into
+    // the stencil buffer (SetClipRegion) and expects the chart to clip itself.
+    return render_pass(vp, t57::ChartRenderer::Pass::kBase, b_use_stencil, "base");
+}
+
+int ChartTile57::RenderRegionViewOnGLTextOnly(const wxGLContext& /*glc*/, const PlugIn_ViewPort& vp,
+                                              const wxRegion& /*Region*/, bool /*b_use_stencil*/) {
+    // Quilt text pass: once across the whole quilt, unclipped (text declutters
+    // across patch boundaries).
+    return render_pass(vp, t57::ChartRenderer::Pass::kText, false, "text");
+}
+
+wxBitmap& ChartTile57::transparent_bitmap(const PlugIn_ViewPort& vp) {
     int w = vp.pix_width > 0 ? vp.pix_width : 1;
     int h = vp.pix_height > 0 ? vp.pix_height : 1;
     wxImage img(w, h);
@@ -170,4 +196,17 @@ wxBitmap& ChartTile57::RenderRegionView(const PlugIn_ViewPort& vp, const wxRegio
     std::memset(img.GetAlpha(), 0, (size_t)w * h);  // fully transparent
     dc_bmp_ = wxBitmap(img);
     return dc_bmp_;
+}
+
+wxBitmap& ChartTile57::RenderRegionView(const PlugIn_ViewPort& vp, const wxRegion& /*Region*/) {
+    return transparent_bitmap(vp);
+}
+
+wxBitmap& ChartTile57::RenderRegionViewOnDCNoText(const PlugIn_ViewPort& vp, const wxRegion& /*Region*/) {
+    return transparent_bitmap(vp);
+}
+
+bool ChartTile57::RenderRegionViewOnDCTextOnly(wxMemoryDC& /*dc*/, const PlugIn_ViewPort& /*VPoint*/,
+                                               const wxRegion& /*Region*/) {
+    return false;  // GL-only plugin; nothing to draw on the DC canvas
 }

@@ -19,7 +19,7 @@ static uint64_t mariner_hash(const tile57_mariner& m) {
 }
 
 // ---- tessellation (pixel space) --------------------------------------------
-void ChartRenderer::add_fill(const tile57_rings* p, tile57_rgba c) {
+void ChartRenderer::add_fill(const tile57_rings* p, tile57_rgba c, std::vector<Vtx>& out) {
     if (!p || p->n < 3) return;
     using Pt = std::array<float, 2>;
     std::vector<std::vector<Pt>> poly;
@@ -36,7 +36,7 @@ void ChartRenderer::add_fill(const tile57_rings* p, tile57_rgba c) {
     std::vector<uint32_t> idx = mapbox::earcut<uint32_t>(poly);
     for (size_t i = 0; i + 2 < idx.size(); i += 3)
         for (int k = 0; k < 3; ++k)
-            tris.push_back({ flat[idx[i + k]][0], flat[idx[i + k]][1], c.r, c.g, c.b, c.a });
+            out.push_back({ flat[idx[i + k]][0], flat[idx[i + k]][1], c.r, c.g, c.b, c.a });
 }
 
 void ChartRenderer::add_stroke(const tile57_rings* p, float w, tile57_rgba c) {
@@ -50,7 +50,7 @@ void ChartRenderer::add_stroke(const tile57_rings* p, float w, tile57_rgba c) {
             float dx = bx - ax, dy = by - ay, len = std::sqrt(dx * dx + dy * dy);
             if (len < 1e-4f) continue;
             float nx = -dy / len * hw, ny = dx / len * hw;
-            auto v = [&](float x, float y) { tris.push_back({x, y, c.r, c.g, c.b, c.a}); };
+            auto v = [&](float x, float y) { base_tris.push_back({x, y, c.r, c.g, c.b, c.a}); };
             v(ax + nx, ay + ny); v(bx + nx, by + ny); v(bx - nx, by - ny);
             v(ax + nx, ay + ny); v(bx - nx, by - ny); v(ax - nx, ay - ny);
         }
@@ -59,19 +59,21 @@ void ChartRenderer::add_stroke(const tile57_rings* p, float w, tile57_rgba c) {
 
 // ---- C trampolines (ctx == ChartRenderer*) -----------------------------
 static void tr_fill(void* c, const tile57_rings* r, tile57_rgba col, int) {
-    static_cast<ChartRenderer*>(c)->add_fill(r, col);
+    auto* self = static_cast<ChartRenderer*>(c);
+    self->add_fill(r, col, self->base_tris);
 }
 static void tr_stroke(void* c, const tile57_rings* r, float w, float, float, tile57_rgba col) {
     static_cast<ChartRenderer*>(c)->add_stroke(r, w, col);
 }
 static void tr_pattern(void* c, const tile57_rings* r, uint32_t, uint32_t, const uint8_t*) {
     // Pattern fills are approximated with a flat tint for now.
-    static_cast<ChartRenderer*>(c)->add_fill(r, tile57_rgba{160, 160, 170, 140});
+    auto* self = static_cast<ChartRenderer*>(c);
+    self->add_fill(r, tile57_rgba{160, 160, 170, 140}, self->base_tris);
 }
 static void tr_glyphs(void* c, const tile57_rings* r, tile57_rgba col, tile57_rgba, float) {
     // Glyph outlines are filled as-is; letter counters need an even-odd fill.
     auto* self = static_cast<ChartRenderer*>(c);
-    if (!self->skip_text) self->add_fill(r, col);
+    self->add_fill(r, col, self->text_tris);
 }
 
 // ---- chart / GL lifecycle --------------------------------------------------
@@ -126,14 +128,15 @@ bool ChartRenderer::ensure_gl() {
     u_vp_ = glGetUniformLocation(prog_, "uVp");
     u_scale_ = glGetUniformLocation(prog_, "uScale");
     u_center_ = glGetUniformLocation(prog_, "uCenter");
-    glGenBuffers(1, &vbo_);
+    glGenBuffers(1, &vbo_base_);
+    glGenBuffers(1, &vbo_text_);
     gl_ready_ = true;
     return true;
 }
 
 void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                             const tile57_mariner& m) {
-    tris.clear();
+    base_tris.clear(); text_tris.clear();
     tile57_canvas_cb cb{};
     cb.ctx = this;
     cb.fill_path = tr_fill; cb.stroke_path = tr_stroke;
@@ -142,19 +145,33 @@ void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uin
     if (rc != 0) { std::fprintf(stderr, "t57 render_view_cb rc=%d\n", rc); return; }
 
     // No VAO in GL 2.1 — just upload; attribute pointers are set at draw time.
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
-    glBufferData(GL_ARRAY_BUFFER, tris.size() * sizeof(Vtx), tris.data(), GL_DYNAMIC_DRAW);
-    vbo_count_ = static_cast<uint32_t>(tris.size());
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_base_);
+    glBufferData(GL_ARRAY_BUFFER, base_tris.size() * sizeof(Vtx), base_tris.data(), GL_DYNAMIC_DRAW);
+    base_count_ = static_cast<uint32_t>(base_tris.size());
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_text_);
+    glBufferData(GL_ARRAY_BUFFER, text_tris.size() * sizeof(Vtx), text_tris.data(), GL_DYNAMIC_DRAW);
+    text_count_ = static_cast<uint32_t>(text_tris.size());
+}
+
+void ChartRenderer::draw_buffer(uint32_t vbo, uint32_t count) {
+    if (!count) return;
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vtx), (void*)offsetof(Vtx, r));
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)count);
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
 }
 
 void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
-                               const tile57_mariner& m, bool draw_text) {
+                           const tile57_mariner& m, Pass pass, bool stencil_clip) {
     if (!chart_ || !ensure_gl()) return;
-    skip_text = !draw_text;
 
     // tile57 only portrays within the chart's baked [min_zoom, max_zoom]; beyond
     // it, it paints the flat S-52 NODTA fill. So render at the range-clamped zoom
-    // and, when the view is over/under it, scale the (vector) geometry to the real
+    // and, when the view is outside it, scale the (vector) geometry to the real
     // view about its centre — crisp overzoom instead of a grey no-data plate.
     if (!have_range_) {
         tile57_chart_info info{};
@@ -167,32 +184,36 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     double oscale = std::pow(2.0, zoom - zr);   // 1.0 when in range
 
     // Rebuild geometry only when the view or (clamped) render zoom changed.
+    // Both passes of one frame share a single rebuild.
     uint64_t mh = mariner_hash(m);
     bool changed = !have_last_ || lon != last_lon_ || lat != last_lat_ || zr != last_zoom_
-                || w != last_w_ || h != last_h_ || mh != last_mhash_ || draw_text != last_text_;
+                || w != last_w_ || h != last_h_ || mh != last_mhash_;
     if (changed) {
         rebuild(lon, lat, zr, w, h, m);
         have_last_ = true; last_lon_ = lon; last_lat_ = lat; last_zoom_ = zr;
-        last_w_ = w; last_h_ = h; last_mhash_ = mh; last_text_ = draw_text;
+        last_w_ = w; last_h_ = h; last_mhash_ = mh;
     }
-    if (!vbo_count_) return;
 
     glUseProgram(prog_);
     glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA); glDisable(GL_DEPTH_TEST);
+    // Clip to the stencil mask OpenCPN pre-wrote for this chart's quilt patch
+    // (glChartCanvas::SetClipRegion tags the patch region with stencil 1).
+    if (stencil_clip) {
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(GL_EQUAL, 1, 0xFF);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    }
     float vp[2] = { float(w), float(h) };
     glUniform2fv(u_vp_, 1, vp);
     float center[2] = { w * 0.5f, h * 0.5f };
     glUniform2fv(u_center_, 1, center);
     glUniform1f(u_scale_, float(oscale));
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vtx), (void*)offsetof(Vtx, r));
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)vbo_count_);
+
+    if (pass != Pass::kText) draw_buffer(vbo_base_, base_count_);
+    if (pass != Pass::kBase) draw_buffer(vbo_text_, text_count_);
+
     // Restore state so OpenCPN's fixed-function (legacy) drawing isn't disturbed.
-    glDisableVertexAttribArray(0);
-    glDisableVertexAttribArray(1);
+    if (stencil_clip) glDisable(GL_STENCIL_TEST);
     glUseProgram(0);
 }
 
@@ -200,7 +221,8 @@ void ChartRenderer::shutdown() {
     // OpenCPN calls DeInit() without a current GL context, so deleting GL objects
     // here crashes. Drop the chart and force a fresh GL setup on re-enable; the
     // tiny leaked program/VBO are reclaimed when the GL context is destroyed.
-    gl_ready_ = false; prog_ = 0; vbo_ = 0; vbo_count_ = 0; have_last_ = false;
+    gl_ready_ = false; prog_ = 0; vbo_base_ = 0; vbo_text_ = 0;
+    base_count_ = 0; text_count_ = 0; have_last_ = false;
     have_range_ = false;
     if (chart_) { tile57_chart_close(chart_); chart_ = nullptr; }
 }
