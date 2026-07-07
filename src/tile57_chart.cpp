@@ -80,54 +80,138 @@ ChartTile57::ChartTile57() {
 }
 
 ChartTile57::~ChartTile57() {
+    // Stop the bake thread first (it publishes into pending_chart_ / calls back into
+    // the canvas), then drain any handle it left, then tear down the renderer. join()
+    // waits out at most the current bake phase (cancel_ is checked between phases).
+    cancel_.store(true, std::memory_order_release);
+    if (bake_thread_.joinable()) bake_thread_.join();
+    if (tile57_chart* p = pending_chart_.exchange(nullptr, std::memory_order_acq_rel))
+        tile57_chart_close(p);
+
     auto& reg = chart_registry();
     reg.erase(std::remove(reg.begin(), reg.end(), this), reg.end());
     renderer_.shutdown();
 }
 
-int ChartTile57::Init(const wxString& full_path, int /*init_flags*/) {
-    // Opening a PMTiles bundle is cheap (it only peeks the archive metadata), so
-    // header/thumb/full inits are handled identically — each needs the extent
-    // and scale. GL setup is deferred to first render.
-    m_FullPath = full_path;
-    m_Name = wxFileName(full_path).GetName();
-    m_Description = _T("tile57 S-57/S-101 ENC (EXPERIMENTAL — NOT FOR NAVIGATION)");
-    m_ID = full_path;
-
-    if (!renderer_.open_chart(std::string(full_path.mb_str()))) return PI_INIT_FAIL_REMOVE;
-
-    tile57_chart_info info{};
-    if (!renderer_.get_info(info) || !info.has_bounds) return PI_INIT_FAIL_REMOVE;
-
+// Pull bbox / native scale / M_COVR coverage from an open chart handle into this
+// chart's members (drives GetChartExtent, m_Chart_Scale, GetCOVR*).
+void ChartTile57::apply_info(tile57_chart* h, const tile57_chart_info& info) {
     center_lat_ = 0.5 * (info.north + info.south);
-
-    // Native scale = finest detail the bundle carries; display range spans the
-    // baked zoom band, generously padded so this single chart stays selected
-    // across OpenCPN's zoom transitions.
-    m_Chart_Scale = scale_denom(info.max_zoom, center_lat_);
+    // A cell reports its real compilation scale (CSCL); fall back to the finest baked
+    // zoom band otherwise. Using the CSCL is essential — the raw zoom range is 0..18,
+    // which would yield an absurd 1:~1700 and OpenCPN would deselect the chart.
+    m_Chart_Scale = info.native_scale > 0 ? info.native_scale
+                                          : scale_denom(info.max_zoom, center_lat_);
     m_Chart_Skew = 0.0;
     m_depth_unit_id = PI_DEPTH_UNIT_METERS;
     m_DepthUnits = _T("Meters");
 
-    // Coverage rectangle: OpenCPN COVR points are float_2Dpt (lat, lon) pairs.
+    // Coverage rectangle fallback: OpenCPN COVR points are float_2Dpt (lat, lon).
     covr_[0] = (float)info.north; covr_[1] = (float)info.west;   // NW
     covr_[2] = (float)info.north; covr_[3] = (float)info.east;   // NE
     covr_[4] = (float)info.south; covr_[5] = (float)info.east;   // SE
     covr_[6] = (float)info.south; covr_[7] = (float)info.west;   // SW
     covr_valid_ = true;
 
-    // Stash the bounds for GetChartExtent.
+    // Real M_COVR data-coverage polygons: report these so OpenCPN quilts gaps to
+    // coarser cells instead of over-claiming the bbox above.
+    covr_tables_.clear();
+    tile57_coverage_cb ccb{ &covr_tables_, [](void* ctx, const double* ll, size_t n) {
+        auto* tables = static_cast<std::vector<std::vector<float>>*>(ctx);
+        std::vector<float> ring;
+        ring.reserve(n * 2);
+        for (size_t i = 0; i < n; ++i) {   // tile57 gives lon,lat; OpenCPN wants lat,lon
+            ring.push_back((float)ll[2 * i + 1]);
+            ring.push_back((float)ll[2 * i]);
+        }
+        tables->push_back(std::move(ring));
+    } };
+    tile57_chart_coverage(h, &ccb);
+
     bounds_west_ = info.west; bounds_south_ = info.south;
     bounds_east_ = info.east; bounds_north_ = info.north;
     min_zoom_ = info.min_zoom; max_zoom_ = info.max_zoom;
+}
 
-    wxLogMessage("tile57 Init: %s  bounds[W%.5f S%.5f E%.5f N%.5f] zoom[%d..%d] "
-                 "centerLat=%.5f nativeScale=1:%d",
-                 m_FullPath.c_str(), info.west, info.south, info.east, info.north,
-                 (int)info.min_zoom, (int)info.max_zoom, center_lat_, m_Chart_Scale);
+int ChartTile57::Init(const wxString& full_path, int init_flags) {
+    m_FullPath = full_path;
+    m_Name = wxFileName(full_path).GetName();
+    m_Description = _T("tile57 S-57/S-101 ENC (EXPERIMENTAL — NOT FOR NAVIGATION)");
+    m_ID = full_path;
 
-    m_bReadyToRender = true;
+    // Resolve the .t57 symlink to the real .000 so tile57 finds the .001.. update
+    // chain in the cell's own directory (the symlink tree carries only the base link).
+    std::string path = std::string(full_path.mb_str());
+    if (char* rp = realpath(path.c_str(), nullptr)) { path = rp; std::free(rp); }
+
+    // Metadata via a cheap header PARSE (bbox + native scale + coverage) — no tile
+    // bake, so a chart-DB scan over hundreds of cells stays fast.
+    tile57_chart* h = tile57_chart_open_header(path.c_str());
+    if (!h) return PI_INIT_FAIL_REMOVE;
+    tile57_chart_info info{};
+    tile57_chart_get_info(h, &info);
+    if (!info.has_bounds) { tile57_chart_close(h); return PI_INIT_FAIL_REMOVE; }
+    apply_info(h, info);
+    tile57_chart_close(h);
+
+    wxLogMessage("tile57 Init: %s bounds[W%.5f S%.5f E%.5f N%.5f] zoom[%d..%d] "
+                 "scale=1:%d flags=%d", m_FullPath.c_str(), info.west, info.south,
+                 info.east, info.north, (int)info.min_zoom, (int)info.max_zoom,
+                 m_Chart_Scale, init_flags);
+
+    // Header/thumbnail scan: metadata only, nothing renders — done (and "ready").
+    if (init_flags == PI_HEADER_ONLY || init_flags == PI_THUMB_ONLY) {
+        ready_.store(true, std::memory_order_release);
+        m_bReadyToRender = true;
+        return PI_INIT_OK;
+    }
+
+    // Full init: bake the tiles on a background thread (progressive — a quick native
+    // band for first paint, then the full zoom range). IsReadyToRender() stays false
+    // until the first band lands, so OpenCPN skips this chart meanwhile.
+    bake_path_ = path;
+    int zn = info.native_scale > 0
+                 ? (int)std::lround(std::log2(559082264.0 / (double)info.native_scale))
+                 : 14;
+    bake_quick_max_ = (uint8_t)std::max(6, std::min(15, zn - 3));
+    canvas_ = GetOCPNCanvasWindow();
+    ready_.store(false, std::memory_order_release);
+    cancel_.store(false, std::memory_order_release);
+    m_bReadyToRender = false;
+    start_bake();
     return PI_INIT_OK;
+}
+
+// Bake thread: quick native band -> first paint, then full range -> smooth zoom.
+// Only READS the warmed global registries; the allocator is thread-safe. Hands each
+// baked handle to the render thread via publish(); never touches renderer_.chart_.
+void ChartTile57::start_bake() {
+    bake_thread_ = std::thread([this]() {
+        if (cancel_.load(std::memory_order_acquire)) return;
+        tile57_chart* ov = tile57_chart_open_zoom(bake_path_.c_str(), 0, bake_quick_max_);
+        if (cancel_.load(std::memory_order_acquire)) { if (ov) tile57_chart_close(ov); return; }
+        if (ov) publish(ov);
+
+        if (cancel_.load(std::memory_order_acquire)) return;
+        tile57_chart* full = tile57_chart_open(bake_path_.c_str());
+        if (cancel_.load(std::memory_order_acquire)) { if (full) tile57_chart_close(full); return; }
+        if (full) publish(full);
+    });
+}
+
+// Bake thread -> render thread handoff. exchange() returns any prior pending handle
+// the render thread never consumed; the bake thread closes that (it was never shared).
+void ChartTile57::publish(tile57_chart* c) {
+    tile57_chart* prev = pending_chart_.exchange(c, std::memory_order_acq_rel);
+    if (prev) tile57_chart_close(prev);
+    ready_.store(true, std::memory_order_release);
+    if (canvas_) canvas_->CallAfter([w = canvas_]() { w->Refresh(false); });
+}
+
+// Render thread: adopt a freshly baked chart if one is waiting (sole owner of chart_).
+void ChartTile57::adopt_pending() {
+    if (tile57_chart* c = pending_chart_.exchange(nullptr, std::memory_order_acq_rel))
+        renderer_.set_chart(c);
 }
 
 void ChartTile57::SetColorScheme(int cs, bool /*bApplyImmediate*/) {
@@ -258,6 +342,11 @@ void ChartTile57::refresh_mariner() {
 int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
                              bool stencil_clip) {
     if (!vp.bValid) return false;
+    // Adopt a freshly baked chart if the background thread has one waiting (main-thread
+    // owner of chart_). Until the first band lands there's nothing to draw yet — report
+    // success (a blank patch) so OpenCPN doesn't treat it as a failed render.
+    adopt_pending();
+    if (!renderer_.has_chart()) return true;
     if (!renderer_.ensure_gl()) return false;
     refresh_mariner();
 

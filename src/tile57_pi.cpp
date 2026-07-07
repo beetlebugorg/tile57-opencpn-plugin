@@ -18,6 +18,11 @@ public:
 
     int Init() override {
         wxLogMessage("tile57_pi: initialised");
+        // Populate tile57's process-global read-only registries (S-100 catalogue +
+        // linestyles) on this, the main thread, BEFORE any chart spawns a background
+        // bake thread — thereafter they're read-only, so concurrent bake/render is
+        // race-free. Must precede the chart-DB scan (which creates ChartTile57s).
+        tile57_warmup();
         return INSTALLS_PLUGIN_CHART | INSTALLS_PLUGIN_CHART_GL
              | WANTS_MOUSE_EVENTS | WANTS_CURSOR_LATLON;
     }

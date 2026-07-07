@@ -475,15 +475,24 @@ static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, 
 // ---- chart / GL lifecycle --------------------------------------------------
 bool ChartRenderer::open_chart(const std::string& path) {
     if (chart_) return true;
-    // A .pmtiles bundle and a live .000 cell take different open entry points
-    // (open_pmtiles streams the archive; open reads an S-57 cell / ENC_ROOT).
+    // A .t57 file is a symlink to a live .000 cell (its .001.. updates live in the
+    // cell's real directory), so resolve it first — then tile57_chart_open reads the
+    // update chain from there. A .pmtiles bundle streams the baked archive.
+    std::string real = path;
+    if (char* rp = realpath(path.c_str(), nullptr)) { real = rp; std::free(rp); }
     auto ends_with = [&](const char* suf) {
         std::string s(suf);
-        return path.size() >= s.size() && path.compare(path.size() - s.size(), s.size(), s) == 0;
+        return real.size() >= s.size() && real.compare(real.size() - s.size(), s.size(), s) == 0;
     };
-    chart_ = ends_with(".pmtiles") ? tile57_chart_open_pmtiles(path.c_str())
-                                   : tile57_chart_open(path.c_str());
+    chart_ = ends_with(".pmtiles") ? tile57_chart_open_pmtiles(real.c_str())
+                                   : tile57_chart_open(real.c_str());
     return chart_ != nullptr;
+}
+void ChartRenderer::set_chart(tile57_chart* c) {
+    if (c == chart_) return;
+    if (chart_) tile57_chart_close(chart_);
+    chart_ = c;
+    have_cam_ = false;   // force a re-portray against the newly swapped-in chart
 }
 bool ChartRenderer::get_info(tile57_chart_info& out) const {
     if (!chart_) return false;
