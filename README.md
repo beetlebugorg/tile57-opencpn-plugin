@@ -4,8 +4,12 @@ An OpenCPN plugin that draws S-57/S-101 electronic navigational charts using
 [tile57](https://github.com/beetlebugorg/tile57)'s live S-52 portrayal, rendered
 as vector geometry on the GPU.
 
-> **EXPERIMENTAL — NOT FOR NAVIGATION.** tile57 is experimental software. This
-> plugin marks its output accordingly and must not be used for navigation.
+> [!WARNING]
+> **Experimental — not for navigation.** This plugin and the tile57 engine behind it
+> are coded almost entirely with AI (Claude) and human-reviewed — an experiment in
+> implementing a large, complex specification, not a certified or tested navigation
+> product. The plugin marks its output accordingly. Do not rely on it for real-world
+> navigation.
 
 ## How it works
 
