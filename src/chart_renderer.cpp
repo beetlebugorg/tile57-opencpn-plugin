@@ -57,6 +57,75 @@ void ChartRenderer::add_stroke(const tile57_rings* p, float w, tile57_rgba c) {
     }
 }
 
+// Glyph text arrives as ONE tile57_rings holding EVERY letter's contours
+// (outlines and counters) as flat sibling rings. Earcutting that as a single
+// polygon-with-holes bridges triangles between letters — labels rendered as
+// solid bars. Group rings by containment parity instead: even nesting depth is
+// a letter outline, odd depth a counter of its immediate parent; tessellate
+// each letter as its own polygon.
+static bool point_in_ring(float x, float y, const std::vector<std::array<float, 2>>& ring) {
+    bool in = false;
+    for (size_t i = 0, j = ring.size() - 1; i < ring.size(); j = i++) {
+        if (((ring[i][1] > y) != (ring[j][1] > y)) &&
+            (x < (ring[j][0] - ring[i][0]) * (y - ring[i][1]) / (ring[j][1] - ring[i][1]) + ring[i][0]))
+            in = !in;
+    }
+    return in;
+}
+
+void ChartRenderer::add_glyph(const tile57_rings* p, tile57_rgba c) {
+    if (!p || p->n < 3) return;
+    using Pt = std::array<float, 2>;
+    std::vector<std::vector<Pt>> rings;
+    for (uint32_t r = 0; r < p->ring_count; ++r) {
+        uint32_t s = p->ring_starts[r];
+        uint32_t e = (r + 1 < p->ring_count) ? p->ring_starts[r + 1] : p->n;
+        if (e <= s + 2) continue;
+        std::vector<Pt> ring;
+        for (uint32_t i = s; i < e; ++i) ring.push_back({p->pts[i].x, p->pts[i].y});
+        rings.push_back(std::move(ring));
+    }
+    if (rings.empty()) return;
+
+    const size_t n = rings.size();
+    std::vector<double> area(n, 0.0);           // |area|, for immediate-parent choice
+    for (size_t i = 0; i < n; ++i) {
+        double a = 0;
+        for (size_t k = 0, j = rings[i].size() - 1; k < rings[i].size(); j = k++)
+            a += (double)rings[i][j][0] * rings[i][k][1] - (double)rings[i][k][0] * rings[i][j][1];
+        area[i] = std::fabs(a) * 0.5;
+    }
+    // Nesting depth of each ring = how many other rings contain it; the
+    // immediate parent is the smallest containing ring. (Glyph contours nest
+    // but never intersect, so a single sample vertex decides containment.)
+    std::vector<int> depth(n, 0), parent(n, -1);
+    for (size_t i = 0; i < n; ++i)
+        for (size_t j = 0; j < n; ++j) {
+            if (i == j) continue;
+            if (point_in_ring(rings[i][0][0], rings[i][0][1], rings[j])) {
+                ++depth[i];
+                if (parent[i] < 0 || area[j] < area[parent[i]]) parent[i] = (int)j;
+            }
+        }
+
+    for (size_t i = 0; i < n; ++i) {
+        if (depth[i] % 2) continue;             // counters are handled with their letter
+        std::vector<std::vector<Pt>> poly;
+        std::vector<Pt> flat;
+        poly.push_back(rings[i]);
+        flat.insert(flat.end(), rings[i].begin(), rings[i].end());
+        for (size_t j = 0; j < n; ++j) {
+            if (parent[j] != (int)i || depth[j] % 2 == 0) continue;
+            poly.push_back(rings[j]);
+            flat.insert(flat.end(), rings[j].begin(), rings[j].end());
+        }
+        std::vector<uint32_t> idx = mapbox::earcut<uint32_t>(poly);
+        for (size_t t = 0; t + 2 < idx.size(); t += 3)
+            for (int k = 0; k < 3; ++k)
+                text_tris.push_back({ flat[idx[t + k]][0], flat[idx[t + k]][1], c.r, c.g, c.b, c.a });
+    }
+}
+
 // ---- C trampolines (ctx == ChartRenderer*) -----------------------------
 static void tr_fill(void* c, const tile57_rings* r, tile57_rgba col, int) {
     auto* self = static_cast<ChartRenderer*>(c);
@@ -71,9 +140,7 @@ static void tr_pattern(void* c, const tile57_rings* r, uint32_t, uint32_t, const
     self->add_fill(r, tile57_rgba{160, 160, 170, 140}, self->base_tris);
 }
 static void tr_glyphs(void* c, const tile57_rings* r, tile57_rgba col, tile57_rgba, float) {
-    // Glyph outlines are filled as-is; letter counters need an even-odd fill.
-    auto* self = static_cast<ChartRenderer*>(c);
-    self->add_fill(r, col, self->text_tris);
+    static_cast<ChartRenderer*>(c)->add_glyph(r, col);
 }
 
 // ---- chart / GL lifecycle --------------------------------------------------

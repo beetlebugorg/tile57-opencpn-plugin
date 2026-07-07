@@ -42,6 +42,10 @@ public:
     std::vector<Vtx> base_tris, text_tris;
     void add_fill(const tile57_rings* p, tile57_rgba c, std::vector<Vtx>& out);
     void add_stroke(const tile57_rings* p, float w, tile57_rgba c);
+    // Glyph text: unlike area fills (ring 0 = outer, rest = holes), a label's
+    // rings are every letter's contours as flat siblings; group them by
+    // containment before tessellating (else earcut bridges letters into bars).
+    void add_glyph(const tile57_rings* p, tile57_rgba c);
 
 private:
     // Re-run tile57 portrayal and rebuild both triangle buffers for this view.
