@@ -31,28 +31,37 @@ src/chart_renderer.*     callback canvas -> triangles -> GPU
 src/safety_overlay.*     the NOT FOR NAVIGATION banner (own GL program + font)
 src/gl.h                 GL headers + GLSL version prologue
 third_party/earcut.hpp   polygon tessellation (Mapbox earcut, ISC)
+opencpn-libs/            OpenCPN plugin API (git submodule; api-18 -> ocpn::api)
 ```
 
 ## Building
 
 Requires a C++17 compiler, CMake ≥ 3.16, wxWidgets (with the `gl` component),
-OpenGL, GLEW and GLU, plus:
+OpenGL, GLEW and GLU, plus **tile57** built as a static library — in a tile57
+checkout, run `zig build` to produce `zig-out/lib/libtile57.a` and
+`include/tile57.h`.
 
-- **tile57** built as a static library — in a tile57 checkout, run `zig build`;
-  this produces `zig-out/lib/libtile57.a` and `include/tile57.h`.
-- **OpenCPN**'s `ocpn_plugin.h` (from an OpenCPN source checkout).
+The OpenCPN plugin API is vendored as the `opencpn-libs` submodule (its
+header-only `api-18` target, matching the `opencpn_plugin_118` base class), so no
+separate OpenCPN source checkout is needed. Clone with submodules — or, in an
+existing checkout, initialise them:
 
-By default the build looks for tile57 at `../tile57` and OpenCPN at `../OpenCPN`.
-Override with cache variables as needed:
+```sh
+git clone --recursive <repo-url>
+git submodule update --init   # in an already-cloned checkout
+```
+
+By default the build looks for tile57 at `../tile57`; override with a cache
+variable as needed. On macOS, point CMake at Homebrew so it finds GLEW/wxWidgets:
 
 ```sh
 cmake -S . -B build \
   -DTILE57_DIR=/path/to/tile57 \
-  -DOCPN_INCLUDE=/path/to/OpenCPN/include
+  -DCMAKE_PREFIX_PATH="$(brew --prefix)"   # macOS/Homebrew only
 cmake --build build -j
 ```
 
-The result is `build/libtile57_pi.so`.
+The result is `build/libtile57_pi.so` (`libtile57_pi.dylib` on macOS).
 
 ## Installing and running
 
