@@ -271,6 +271,79 @@ int ChartTile57::RenderRegionViewOnGLTextOnly(const wxGLContext& /*glc*/, const 
     return render_pass(vp, t57::ChartRenderer::Pass::kText, false);
 }
 
+// ---- object query (S-52 §10.8 pick) ----------------------------------------
+namespace {
+struct QueryHit { std::string cls, s57, cell; };
+void collect_hit(void* ctx, const char* cls, size_t cl, const char* s57, size_t sl,
+                 const char* cell, size_t cel) {
+    static_cast<std::vector<QueryHit>*>(ctx)->push_back(
+        {std::string(cls, cl), std::string(s57, sl), std::string(cell, cel)});
+}
+
+// Append a flat JSON object {"KEY":"VAL",...} (the pick blob) as HTML table rows.
+void json_rows(const std::string& j, wxString& out) {
+    size_t i = 0, n = j.size();
+    auto ws = [&] { while (i < n && (j[i]==' '||j[i]=='\n'||j[i]=='\t'||j[i]=='\r')) ++i; };
+    auto str = [&](std::string& s) -> bool {
+        if (i >= n || j[i] != '"') return false;
+        ++i; s.clear();
+        while (i < n && j[i] != '"') { if (j[i] == '\\' && i + 1 < n) ++i; s += j[i++]; }
+        if (i < n) ++i;
+        return true;
+    };
+    ws(); if (i < n && j[i] == '{') ++i;
+    while (i < n) {
+        ws(); if (i < n && j[i] == '}') break;
+        std::string k, v;
+        if (!str(k)) break;
+        ws(); if (i < n && j[i] == ':') ++i; ws();
+        if (!str(v)) break;
+        out += "<tr><td valign=top><b>" + wxString::FromUTF8(k.c_str()) +
+               "</b></td><td>" + wxString::FromUTF8(v.c_str()) + "</td></tr>";
+        ws(); if (i < n && j[i] == ',') ++i;
+    }
+}
+
+wxString build_query_html(const std::vector<QueryHit>& hits) {
+    wxString h = "<html><body>";
+    for (const auto& f : hits) {
+        h += "<font size=+1><b>" + wxString::FromUTF8(f.cls.c_str()) + "</b></font>";
+        if (!f.cell.empty())
+            h += "  <font size=-1 color=#808080>" + wxString::FromUTF8(f.cell.c_str()) + "</font>";
+        h += "<table>";
+        json_rows(f.s57, h);
+        h += "</table><hr>";
+    }
+    h += "</body></html>";
+    return h;
+}
+}  // namespace
+
+ListOfPI_S57Obj* ChartTile57::GetObjRuleListAtLatLon(float lat, float lon, float /*radius*/,
+                                                     PlugIn_ViewPort* /*vp*/) {
+    auto* list = new ListOfPI_S57Obj;
+    tile57_chart* ch = renderer_.chart_handle();
+    if (!ch) return list;
+    std::vector<QueryHit> hits;
+    tile57_query_cb cb{ &hits, collect_hit };
+    tile57_chart_query(ch, lon, lat, &cb);
+    if (hits.empty()) return list;
+    query_html_ = build_query_html(hits);
+    // One PI_S57Obj per hit so OpenCPN opens the dialog and can count/anchor them.
+    for (const auto& f : hits) {
+        auto* o = new PI_S57Obj();
+        std::strncpy(o->FeatureName, f.cls.c_str(), sizeof(o->FeatureName) - 1);
+        o->FeatureName[sizeof(o->FeatureName) - 1] = 0;
+        o->m_lat = lat; o->m_lon = lon;
+        list->Append(o);
+    }
+    return list;
+}
+
+wxString ChartTile57::CreateObjDescriptions(ListOfPI_S57Obj* /*obj_list*/) {
+    return query_html_;
+}
+
 wxBitmap& ChartTile57::transparent_bitmap(const PlugIn_ViewPort& vp) {
     int w = vp.pix_width > 0 ? vp.pix_width : 1;
     int h = vp.pix_height > 0 ? vp.pix_height : 1;

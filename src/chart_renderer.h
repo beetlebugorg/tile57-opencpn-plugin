@@ -36,6 +36,7 @@ public:
     void shutdown();
     bool has_chart() const { return chart_ != nullptr; }
     bool get_info(tile57_chart_info& out) const;
+    tile57_chart* chart_handle() const { return chart_; }   // for object-query
 
     // Unified GPU vertex (see header note).
     struct Vtx { float wx, wy, px, py; uint8_t r, g, b, a; float thresh; };

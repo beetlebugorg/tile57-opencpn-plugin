@@ -70,7 +70,14 @@ public:
 
     wxBitmap* GetThumbnail(int tnx, int tny, int cs) override { return nullptr; }
 
+    // Object query (S-52 §10.8 pick): return the features under the cursor and
+    // describe them as HTML for OpenCPN's Object Query dialog.
+    ListOfPI_S57Obj* GetObjRuleListAtLatLon(float lat, float lon, float select_radius,
+                                            PlugIn_ViewPort* VPoint) override;
+    wxString CreateObjDescriptions(ListOfPI_S57Obj* obj_list) override;
+
 private:
+    wxString query_html_;   // description built in GetObjRuleListAtLatLon
     // Shared per-pass render: ViewPort -> tile57 camera -> draw `pass` buffers.
     int render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
                     bool stencil_clip);
