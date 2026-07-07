@@ -63,14 +63,29 @@ cmake --build build -j
 
 The result is `build/libtile57_pi.so` (`libtile57_pi.dylib` on macOS).
 
+On **macOS**, a plugin must use the *same* wxWidgets as OpenCPN.app, or a second
+wxWidgets loads and OpenCPN silently drops the plugin. The build compiles against
+your (Homebrew) wx, then a post-build step (`cmake/fix-macos-libs.sh`) repoints
+the plugin's wx references to the app's bundled copy. It looks for the app at
+`OCPN_APP`, default `/Applications/OpenCPN.app`; override if it lives elsewhere:
+
+```sh
+cmake -S . -B build -DOCPN_APP=/path/to/OpenCPN.app ...
+```
+
 ## Installing and running
 
 Install into OpenCPN's user plugin directory and enable it in
 Options → Plugins:
 
 ```sh
+# Linux
 mkdir -p ~/.local/lib/opencpn
 cp build/libtile57_pi.so ~/.local/lib/opencpn/
+
+# macOS
+mkdir -p ~/Library/Application\ Support/OpenCPN/Contents/PlugIns
+cp build/libtile57_pi.dylib ~/Library/Application\ Support/OpenCPN/Contents/PlugIns/
 ```
 
 The chart is a baked tile57 bundle's `chart.pmtiles`. Point the plugin at it with
