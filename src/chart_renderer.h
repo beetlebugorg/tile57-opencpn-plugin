@@ -76,6 +76,8 @@ private:
                  const tile57_mariner& m);
     void upload();
     void draw_range(uint32_t vbo, uint32_t count);
+    bool ensure_ss(uint32_t w, uint32_t h);   // (re)create the supersample FBO
+    void composite_ss();                        // draw the SS texture downsampled
 
     tile57_chart* chart_ = nullptr;
     uint32_t prog_ = 0, vbo_area_ = 0, vbo_line_ = 0, vbo_symbol_ = 0, vbo_text_ = 0;
@@ -87,6 +89,15 @@ private:
     // Pattern (tiled-texture) program + buffer for area fills.
     uint32_t prog_pat_ = 0, vbo_pat_ = 0, n_pat_ = 0;
     int pu_scale_ = -1, pu_origin_ = -1, pu_vp_ = -1, pu_zoom_ = -1, pu_atlas_ = -1;
+    // Supersample (SSAA) FBO + composite program: render the scene at SS× the
+    // viewport, then draw it back down-sampled (linear) to antialias tessellated
+    // text/lines/area edges. Sprites/patterns are already texture-filtered.
+    static constexpr int kSS = 2;
+    uint32_t ss_fbo_ = 0, ss_tex_ = 0;
+    uint32_t ss_w_ = 0, ss_h_ = 0;
+    uint32_t prog_blit_ = 0, vbo_quad_ = 0;
+    int bu_tex_ = -1;
+    bool ss_ok_ = false;
     bool gl_ready_ = false;
 
     bool have_range_ = false;

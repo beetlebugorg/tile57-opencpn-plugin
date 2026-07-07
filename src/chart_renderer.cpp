@@ -460,6 +460,19 @@ void main(){
   gl_FragColor = vec4(t.rgb*t.a, t.a);
 }
 )";
+// Composite program: draw the supersampled texture as a fullscreen quad,
+// down-sampled by the sampler's linear filter (already premultiplied).
+static const char* VS_BLIT = R"(
+attribute vec2 aPos;
+attribute vec2 aTex;
+varying vec2 vTex;
+void main(){ vTex = aTex; gl_Position = vec4(aPos, 0.0, 1.0); }
+)";
+static const char* FS_BLIT = R"(
+uniform sampler2D uTex;
+varying vec2 vTex;
+void main(){ gl_FragColor = texture2D(uTex, vTex); }
+)";
 static uint32_t compile(GLenum t, const char* body) {
     std::string src = std::string(T57_GLSL_VERSION) + body;
     const char* s = src.c_str();
@@ -521,10 +534,63 @@ bool ChartRenderer::ensure_gl() {
     pu_atlas_ = glGetUniformLocation(prog_pat_, "uAtlas");
     glGenBuffers(1, &vbo_pat_);
 
+    // Composite program + a unit fullscreen quad (pos.xy, tex.uv).
+    prog_blit_ = glCreateProgram();
+    glAttachShader(prog_blit_, compile(GL_VERTEX_SHADER, VS_BLIT));
+    glAttachShader(prog_blit_, compile(GL_FRAGMENT_SHADER, FS_BLIT));
+    glBindAttribLocation(prog_blit_, 0, "aPos");
+    glBindAttribLocation(prog_blit_, 1, "aTex");
+    glLinkProgram(prog_blit_);
+    bu_tex_ = glGetUniformLocation(prog_blit_, "uTex");
+    const float quad[] = { -1,-1, 0,0,  1,-1, 1,0,  1,1, 1,1,
+                           -1,-1, 0,0,  1,1, 1,1,  -1,1, 0,1 };
+    glGenBuffers(1, &vbo_quad_);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_quad_);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+
     load_sprite_atlas();
 
     gl_ready_ = true;
     return true;
+}
+
+// (Re)create the supersample colour FBO at kSS× the viewport.
+bool ChartRenderer::ensure_ss(uint32_t w, uint32_t h) {
+    if (w == 0 || h == 0) return false;
+    uint32_t sw = w * kSS, sh = h * kSS;
+    if (ss_fbo_ && ss_w_ == sw && ss_h_ == sh) return ss_ok_;
+    if (!ss_fbo_) { glGenFramebuffers(1, &ss_fbo_); glGenTextures(1, &ss_tex_); }
+    glBindTexture(GL_TEXTURE_2D, ss_tex_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sw, sh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindFramebuffer(GL_FRAMEBUFFER, ss_fbo_);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ss_tex_, 0);
+    ss_ok_ = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    ss_w_ = sw; ss_h_ = sh;
+    return ss_ok_;
+}
+
+void ChartRenderer::composite_ss() {
+    glUseProgram(prog_blit_);
+    glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, ss_tex_);
+    glUniform1i(bu_tex_, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_quad_);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
 }
 
 void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uint32_t h,
@@ -643,12 +709,25 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     double oy = (ref_wy_ - vwy) * scale_px + h * 0.5;
 
     (void)stencil_clip;
+    // Render the scene into the SS FBO (at kSS× res), then composite it back
+    // down-sampled — antialiasing tessellated text/lines/area edges. Clip to the
+    // chart's quilt patch via OpenCPN's SCISSOR (SetClipRect) rather than a
+    // stencil EQUAL test (unreliable across GL backends).
+    GLint prev_fbo = 0, prev_vp[4] = {0,0,0,0}, prev_sc[4] = {0,0,0,0};
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+    glGetIntegerv(GL_VIEWPORT, prev_vp);
+    glGetIntegerv(GL_SCISSOR_BOX, prev_sc);
+    GLboolean sc_on = glIsEnabled(GL_SCISSOR_TEST);
+    bool ss = ensure_ss(w, h);
+    if (ss) {
+        glBindFramebuffer(GL_FRAMEBUFFER, ss_fbo_);
+        glViewport(0, 0, (GLsizei)(w * kSS), (GLsizei)(h * kSS));
+        if (sc_on) glScissor(prev_sc[0]*kSS, prev_sc[1]*kSS, prev_sc[2]*kSS, prev_sc[3]*kSS);
+        glClearColor(0, 0, 0, 0);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
     glUseProgram(prog_);
     glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA); glDisable(GL_DEPTH_TEST);
-    // Clip to the chart's quilt patch via OpenCPN's SCISSOR (glChartCanvas::
-    // SetClipRect sets it) rather than a stencil EQUAL test: the stencil buffer
-    // isn't reliably marked for us across GL backends (culled the whole base on
-    // some drivers, leaving only the un-stencilled text pass).
     glDisable(GL_STENCIL_TEST);
     glUniform1f(u_scale_, (float)scale_px);
     float origin[2] = { (float)ox, (float)oy };
@@ -712,14 +791,22 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     }
     if (pass != Pass::kBase) draw_range(vbo_text_, n_text_);
 
-    if (stencil_clip) glDisable(GL_STENCIL_TEST);
+    if (ss) {
+        // Composite the supersampled result over OpenCPN's framebuffer, clipped
+        // to the same patch scissor.
+        glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
+        glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+        if (sc_on) glScissor(prev_sc[0], prev_sc[1], prev_sc[2], prev_sc[3]);
+        composite_ss();
+    }
     glUseProgram(0);
 }
 
 void ChartRenderer::shutdown() {
-    gl_ready_ = false; prog_ = prog_sprite_ = prog_pat_ = 0;
-    vbo_area_ = vbo_line_ = vbo_symbol_ = vbo_text_ = vbo_sprite_ = vbo_pat_ = 0;
+    gl_ready_ = false; prog_ = prog_sprite_ = prog_pat_ = prog_blit_ = 0;
+    vbo_area_ = vbo_line_ = vbo_symbol_ = vbo_text_ = vbo_sprite_ = vbo_pat_ = vbo_quad_ = 0;
     n_area_ = n_line_ = n_symbol_ = n_text_ = n_sprite_ = n_pat_ = 0;
+    ss_fbo_ = ss_tex_ = 0; ss_w_ = ss_h_ = 0; ss_ok_ = false;
     have_cam_ = false; have_range_ = false;
     if (chart_) { tile57_chart_close(chart_); chart_ = nullptr; }
 }
