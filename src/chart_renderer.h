@@ -41,6 +41,8 @@ public:
     struct Vtx { float wx, wy, px, py; uint8_t r, g, b, a; float thresh; };
     // Sprite vertex: world anchor + screen-px quad corner + atlas UV + SCAMIN.
     struct SpriteVtx { float wx, wy, px, py, u, v, thresh; };
+    // Pattern vertex: world position + atlas cell rect + tile screen px + SCAMIN.
+    struct PatVtx { float wx, wy, u0, v0, u1, v1, tw, th, thresh; };
 
     // TEMP diagnostic snapshot of the last render().
     struct Dbg { uint32_t area, line, symbol, text; bool rebuilt; double cam_zoom; };
@@ -50,10 +52,13 @@ public:
     // trampolines). Grouped by paint layer so we draw area->line->symbol->text.
     std::vector<Vtx> area_, line_, symbol_, text_;
     std::vector<SpriteVtx> sprite_;   // point symbols drawn from the atlas
+    std::vector<PatVtx> pattern_;     // area fills tiled from the pattern atlas
     // The world reference point offsets are relative to (set per portrayal).
     double ref_wx_ = 0, ref_wy_ = 0;
     // Geometry decimation epsilon in world units (~half a portrayal pixel).
     double decimate_eps_ = 0;
+    // Display scale (mariner size_scale) — pattern tile screen size.
+    double size_scale_ = 1.0;
     // Callback handlers (world/local geometry -> Vtx).
     void on_fill_area(const tile57_world_rings* r, tile57_rgba c, float thresh);
     void on_stroke_line(const tile57_world_rings* l, float width_px, tile57_rgba c, float thresh);
@@ -63,6 +68,8 @@ public:
                       tile57_rgba c, tile57_rgba halo, float thresh);
     void on_draw_sprite(const char* name, size_t len, tile57_world_point anchor,
                         float rot_deg, float half_w, float half_h, float thresh);
+    void on_draw_pattern(const char* name, size_t len, const tile57_world_rings* rings,
+                         float thresh);
 
 private:
     void rebuild(double lon, double lat, double zoom, uint32_t w, uint32_t h,
@@ -77,6 +84,9 @@ private:
     // Sprite (textured) program + buffer for point symbols.
     uint32_t prog_sprite_ = 0, vbo_sprite_ = 0, n_sprite_ = 0;
     int su_scale_ = -1, su_origin_ = -1, su_vp_ = -1, su_zoom_ = -1, su_atlas_ = -1;
+    // Pattern (tiled-texture) program + buffer for area fills.
+    uint32_t prog_pat_ = 0, vbo_pat_ = 0, n_pat_ = 0;
+    int pu_scale_ = -1, pu_origin_ = -1, pu_vp_ = -1, pu_zoom_ = -1, pu_atlas_ = -1;
     bool gl_ready_ = false;
 
     bool have_range_ = false;

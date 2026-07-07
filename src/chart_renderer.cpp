@@ -197,9 +197,12 @@ void ChartRenderer::on_draw_text(tile57_world_point anchor, const tile57_local_r
 
 // ---- sprite atlas (shared; loaded once in a GL context) --------------------
 namespace {
+// Normalised UV rect + the cell's logical px size (atlas px / pixelRatio), used
+// as the pattern tile's screen size (× size_scale).
+struct AtlasRect { float u0, v0, u1, v1, px_w, px_h; };
 struct SpriteAtlas {
     uint32_t tex = 0;
-    std::unordered_map<std::string, std::array<float, 4>> uv;  // name -> u0,v0,u1,v1
+    std::unordered_map<std::string, AtlasRect> uv;  // name -> rect
     bool tried = false, ok = false;
 };
 SpriteAtlas g_atlas;
@@ -218,7 +221,7 @@ double json_num(const char* s, size_t lo, size_t hi, const char* key) {
 // Parse a MapLibre sprite JSON ({"name":{"x":,"y":,"width":,"height":},..}) into
 // name -> normalised UV rect. The pivot-centred entry is the bare name.
 void parse_sprite_json(const char* s, size_t len, int tw, int th,
-                       std::unordered_map<std::string, std::array<float, 4>>& out) {
+                       std::unordered_map<std::string, AtlasRect>& out) {
     if (tw <= 0 || th <= 0 || !s) return;
     size_t i = 0;
     auto ws = [&] { while (i < len && (s[i]==' '||s[i]=='\n'||s[i]=='\t'||s[i]=='\r')) ++i; };
@@ -234,8 +237,10 @@ void parse_sprite_json(const char* s, size_t len, int tw, int th,
         while (i < len) { char ch = s[i]; if (ch=='{') ++depth; else if (ch=='}') { if (--depth==0) { ++i; break; } } ++i; }
         double x = json_num(s, os, i, "x"), y = json_num(s, os, i, "y");
         double w = json_num(s, os, i, "width"), h = json_num(s, os, i, "height");
+        double ratio = json_num(s, os, i, "pixelRatio"); if (ratio <= 0) ratio = 1;
         if (w > 0 && h > 0)
-            out[name] = { (float)(x/tw), (float)(y/th), (float)((x+w)/tw), (float)((y+h)/th) };
+            out[name] = { (float)(x/tw), (float)(y/th), (float)((x+w)/tw), (float)((y+h)/th),
+                          (float)(w/ratio), (float)(h/ratio) };
         ws(); if (i < len && s[i] == ',') ++i;
     }
 }
@@ -281,14 +286,52 @@ void ChartRenderer::on_draw_sprite(const char* name, size_t len, tile57_world_po
     if (!g_atlas.ok || hw <= 0 || hh <= 0) return;
     auto it = g_atlas.uv.find(std::string(name, len));
     if (it == g_atlas.uv.end()) return;
-    const auto& uv = it->second;  // u0, v0, u1, v1
+    const AtlasRect& r = it->second;
     float awx = (float)(anchor.x - ref_wx_), awy = (float)(anchor.y - ref_wy_);
     float rad = rot_deg * (float)kPi / 180.0f, c = std::cos(rad), s = std::sin(rad);
     auto corner = [&](float lx, float ly, float u, float vv) {
         sprite_.push_back({ awx, awy, lx*c - ly*s, lx*s + ly*c, u, vv, thresh });
     };
-    corner(-hw, -hh, uv[0], uv[1]); corner(hw, -hh, uv[2], uv[1]); corner(hw, hh, uv[2], uv[3]);
-    corner(-hw, -hh, uv[0], uv[1]); corner(hw, hh, uv[2], uv[3]); corner(-hw, hh, uv[0], uv[3]);
+    corner(-hw, -hh, r.u0, r.v0); corner(hw, -hh, r.u1, r.v0); corner(hw, hh, r.u1, r.v1);
+    corner(-hw, -hh, r.u0, r.v0); corner(hw, hh, r.u1, r.v1); corner(-hw, hh, r.u0, r.v1);
+}
+
+// Area fill pattern: tessellate the polygon and tile the pattern cell across it
+// (world-anchored, constant screen size) via the pattern program.
+void ChartRenderer::on_draw_pattern(const char* name, size_t len,
+                                    const tile57_world_rings* p, float thresh) {
+    if (!g_atlas.ok || !p || p->n < 3) return;
+    auto it = g_atlas.uv.find("pat:" + std::string(name, len));
+    if (it == g_atlas.uv.end()) {  // unknown pattern -> flat translucent tint
+        on_fill_area(p, tile57_rgba{160, 160, 170, 140}, thresh);
+        return;
+    }
+    const AtlasRect& r = it->second;
+    float tw = std::max(1.0f, r.px_w * (float)size_scale_);   // tile size in screen px
+    float th = std::max(1.0f, r.px_h * (float)size_scale_);
+    using Pt = std::array<double, 2>;
+    const double eps2 = decimate_eps_ * decimate_eps_;
+    std::vector<std::vector<Pt>> poly;
+    for (uint32_t rr = 0; rr < p->ring_count; ++rr) {
+        uint32_t s = p->ring_starts[rr];
+        uint32_t e = (rr + 1 < p->ring_count) ? p->ring_starts[rr + 1] : p->n;
+        if (e <= s + 2) continue;
+        std::vector<Pt> ring{{p->pts[s].x, p->pts[s].y}};
+        for (uint32_t i = s + 1; i < e; ++i) {
+            double dx = p->pts[i].x - ring.back()[0], dy = p->pts[i].y - ring.back()[1];
+            if (i == e - 1 || dx*dx + dy*dy >= eps2) ring.push_back({p->pts[i].x, p->pts[i].y});
+        }
+        if (ring.size() >= 3) poly.push_back(std::move(ring));
+    }
+    if (poly.empty()) return;
+    std::vector<Pt> flat;
+    for (const auto& ring : poly) flat.insert(flat.end(), ring.begin(), ring.end());
+    std::vector<uint32_t> idx = mapbox::earcut<uint32_t>(poly);
+    for (size_t i = 0; i + 2 < idx.size(); i += 3)
+        for (int k = 0; k < 3; ++k) {
+            float wx = (float)(flat[idx[i + k]][0] - ref_wx_), wy = (float)(flat[idx[i + k]][1] - ref_wy_);
+            pattern_.push_back({ wx, wy, r.u0, r.v0, r.u1, r.v1, tw, th, thresh });
+        }
 }
 
 // ---- C surface trampolines (ctx == ChartRenderer*) -------------------------
@@ -308,6 +351,10 @@ static void tr_text(void* c, const tile57_feature* f, tile57_world_point a, cons
 static void tr_sprite(void* c, const tile57_feature* f, const char* name, size_t len,
                       tile57_world_point a, float rot, float hw, float hh) {
     static_cast<ChartRenderer*>(c)->on_draw_sprite(name, len, a, rot, hw, hh, feat_thresh(f));
+}
+static void tr_pattern(void* c, const tile57_feature* f, const char* name, size_t len,
+                       const tile57_world_rings* rings) {
+    static_cast<ChartRenderer*>(c)->on_draw_pattern(name, len, rings, feat_thresh(f));
 }
 
 // ---- chart / GL lifecycle --------------------------------------------------
@@ -376,6 +423,43 @@ uniform sampler2D uAtlas;
 varying vec2 vUV;
 void main(){ vec4 t = texture2D(uAtlas, vUV); gl_FragColor = vec4(t.rgb*t.a, t.a); }
 )";
+// Pattern program: tile a pattern cell across a polygon, world-anchored at a
+// constant screen size. vWorldPx (= aWorld*uScale) is the screen offset from the
+// chart reference point, so fract(vWorldPx/tile) keeps the pattern fixed to the
+// chart. The cell is a sub-rect of the atlas; wrap into it with fract.
+static const char* VS_PAT = R"(
+attribute vec2 aWorld;
+attribute vec4 aRect;
+attribute vec2 aTile;
+attribute float aThresh;
+uniform float uScale;
+uniform vec2 uOrigin;
+uniform vec2 uVp;
+uniform float uZoom;
+varying vec4 vRect;
+varying vec2 vTile;
+varying vec2 vWorldPx;
+void main(){
+  if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); return; }
+  vec2 wpx = aWorld*uScale;
+  vec2 screen = wpx + uOrigin;
+  vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
+  gl_Position = vec4(ndc, 0.0, 1.0);
+  vRect = aRect; vTile = aTile; vWorldPx = wpx;
+}
+)";
+static const char* FS_PAT = R"(
+uniform sampler2D uAtlas;
+varying vec4 vRect;
+varying vec2 vTile;
+varying vec2 vWorldPx;
+void main(){
+  vec2 f = fract(vWorldPx / vTile);
+  vec2 uv = vRect.xy + f * (vRect.zw - vRect.xy);
+  vec4 t = texture2D(uAtlas, uv);
+  gl_FragColor = vec4(t.rgb*t.a, t.a);
+}
+)";
 static uint32_t compile(GLenum t, const char* body) {
     std::string src = std::string(T57_GLSL_VERSION) + body;
     const char* s = src.c_str();
@@ -420,6 +504,23 @@ bool ChartRenderer::ensure_gl() {
     su_zoom_ = glGetUniformLocation(prog_sprite_, "uZoom");
     su_atlas_ = glGetUniformLocation(prog_sprite_, "uAtlas");
     glGenBuffers(1, &vbo_sprite_);
+
+    // Pattern program (tiled area fills).
+    prog_pat_ = glCreateProgram();
+    glAttachShader(prog_pat_, compile(GL_VERTEX_SHADER, VS_PAT));
+    glAttachShader(prog_pat_, compile(GL_FRAGMENT_SHADER, FS_PAT));
+    glBindAttribLocation(prog_pat_, 0, "aWorld");
+    glBindAttribLocation(prog_pat_, 1, "aRect");
+    glBindAttribLocation(prog_pat_, 2, "aTile");
+    glBindAttribLocation(prog_pat_, 3, "aThresh");
+    glLinkProgram(prog_pat_);
+    pu_scale_ = glGetUniformLocation(prog_pat_, "uScale");
+    pu_origin_ = glGetUniformLocation(prog_pat_, "uOrigin");
+    pu_vp_ = glGetUniformLocation(prog_pat_, "uVp");
+    pu_zoom_ = glGetUniformLocation(prog_pat_, "uZoom");
+    pu_atlas_ = glGetUniformLocation(prog_pat_, "uAtlas");
+    glGenBuffers(1, &vbo_pat_);
+
     load_sprite_atlas();
 
     gl_ready_ = true;
@@ -428,11 +529,12 @@ bool ChartRenderer::ensure_gl() {
 
 void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                             const tile57_mariner& m) {
-    area_.clear(); line_.clear(); symbol_.clear(); text_.clear(); sprite_.clear();
+    area_.clear(); line_.clear(); symbol_.clear(); text_.clear(); sprite_.clear(); pattern_.clear();
     // World reference: the view centre, so vertex offsets stay tiny (f32-precise).
     lonlat_to_world(lon, lat, ref_wx_, ref_wy_);
     // Decimate geometry to ~half a pixel at the portrayal zoom.
     decimate_eps_ = 0.5 / (256.0 * std::pow(2.0, zoom));
+    size_scale_ = m.size_scale > 0 ? m.size_scale : 1.0;
 
     tile57_surface_cb cb{};
     cb.ctx = this;
@@ -440,8 +542,8 @@ void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uin
     cb.stroke_line = tr_stroke;
     cb.draw_symbol = tr_symbol;
     cb.draw_text = tr_text;
-    // Point symbols draw as atlas sprites when the atlas loaded; else tessellate.
-    if (g_atlas.ok) cb.draw_sprite = tr_sprite;
+    // Point symbols/patterns draw from the atlas when it loaded; else tessellate.
+    if (g_atlas.ok) { cb.draw_sprite = tr_sprite; cb.draw_pattern = tr_pattern; }
     int rc = tile57_chart_render_surface_cb(chart_, lon, lat, zoom, w, h, &m, &cb);
     if (rc != 0) std::fprintf(stderr, "t57 render_surface_cb rc=%d\n", rc);
     upload();
@@ -460,6 +562,9 @@ void ChartRenderer::upload() {
     glBindBuffer(GL_ARRAY_BUFFER, vbo_sprite_);
     glBufferData(GL_ARRAY_BUFFER, sprite_.size() * sizeof(SpriteVtx), sprite_.data(), GL_DYNAMIC_DRAW);
     n_sprite_ = (uint32_t)sprite_.size();
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_pat_);
+    glBufferData(GL_ARRAY_BUFFER, pattern_.size() * sizeof(PatVtx), pattern_.data(), GL_DYNAMIC_DRAW);
+    n_pat_ = (uint32_t)pattern_.size();
 }
 
 void ChartRenderer::draw_range(uint32_t vbo, uint32_t count) {
@@ -554,6 +659,30 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
 
     if (pass != Pass::kText) {
         draw_range(vbo_area_, n_area_);
+        if (n_pat_ && g_atlas.ok) {
+            glUseProgram(prog_pat_);
+            glUniform1f(pu_scale_, (float)scale_px);
+            glUniform2fv(pu_origin_, 1, origin);
+            glUniform2fv(pu_vp_, 1, vp);
+            glUniform1f(pu_zoom_, (float)zoom);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, g_atlas.tex);
+            glUniform1i(pu_atlas_, 0);
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_pat_);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, wx));
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, u0));
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, tw));
+            glEnableVertexAttribArray(3);
+            glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, thresh));
+            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)n_pat_);
+            glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
+            glDisableVertexAttribArray(2); glDisableVertexAttribArray(3);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glUseProgram(prog_);
+        }
         draw_range(vbo_line_, n_line_);
         draw_range(vbo_symbol_, n_symbol_);
         if (n_sprite_ && g_atlas.ok) {
@@ -588,9 +717,9 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
 }
 
 void ChartRenderer::shutdown() {
-    gl_ready_ = false; prog_ = prog_sprite_ = 0;
-    vbo_area_ = vbo_line_ = vbo_symbol_ = vbo_text_ = vbo_sprite_ = 0;
-    n_area_ = n_line_ = n_symbol_ = n_text_ = n_sprite_ = 0;
+    gl_ready_ = false; prog_ = prog_sprite_ = prog_pat_ = 0;
+    vbo_area_ = vbo_line_ = vbo_symbol_ = vbo_text_ = vbo_sprite_ = vbo_pat_ = 0;
+    n_area_ = n_line_ = n_symbol_ = n_text_ = n_sprite_ = n_pat_ = 0;
     have_cam_ = false; have_range_ = false;
     if (chart_) { tile57_chart_close(chart_); chart_ = nullptr; }
 }
