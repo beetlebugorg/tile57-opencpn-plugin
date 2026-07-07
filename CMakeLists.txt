@@ -20,8 +20,7 @@ set(OCPN_INCLUDE "${CMAKE_SOURCE_DIR}/../OpenCPN/include" CACHE PATH "directory 
 
 find_package(wxWidgets REQUIRED COMPONENTS core base gl)
 find_package(OpenGL REQUIRED)
-find_library(GLEW_LIB GLEW REQUIRED)
-find_library(GLU_LIB GLU REQUIRED)
+find_library(GLEW_LIB GLEW REQUIRED)   # Homebrew on macOS; distro package on Linux
 include(${wxWidgets_USE_FILE})
 
 if(NOT EXISTS ${TILE57_LIB})
@@ -41,8 +40,11 @@ target_include_directories(tile57_pi PRIVATE
 target_compile_definitions(tile57_pi PRIVATE ${wxWidgets_DEFINITIONS})
 target_compile_options(tile57_pi PRIVATE ${wxWidgets_CXX_FLAGS})
 
-# libtile57.a bundles its own copy of a few single-header libraries; allow the
-# linker to pick one definition when they overlap with the plugin's.
 target_link_libraries(tile57_pi PRIVATE
-  ${wxWidgets_LIBRARIES} ${OPENGL_LIBRARIES} ${GLEW_LIB} ${GLU_LIB} ${TILE57_LIB}
-  -Wl,--allow-multiple-definition m pthread)
+  ${wxWidgets_LIBRARIES} ${OPENGL_LIBRARIES} ${GLEW_LIB} ${TILE57_LIB} m pthread)
+
+# OpenCPN loads plugins as .dylib on macOS; silence its OpenGL deprecation noise.
+if(APPLE)
+  set_target_properties(tile57_pi PROPERTIES SUFFIX ".dylib")
+  target_compile_definitions(tile57_pi PRIVATE GL_SILENCE_DEPRECATION)
+endif()
