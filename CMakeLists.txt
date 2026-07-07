@@ -36,8 +36,8 @@ endif()
 # --- the plugin -------------------------------------------------------------
 add_library(tile57_pi MODULE
   src/tile57_pi.cpp
-  src/chart_renderer.cpp
-  src/safety_overlay.cpp)
+  src/tile57_chart.cpp
+  src/chart_renderer.cpp)
 
 target_include_directories(tile57_pi PRIVATE
   ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party

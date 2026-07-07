@@ -9,7 +9,13 @@ as vector geometry on the GPU.
 
 ## How it works
 
-The plugin registers as an OpenGL overlay. Each frame it:
+The plugin installs a **first-class GL vector chart** (`ChartTile57`, a
+`PlugInChartBaseGL`). OpenCPN discovers a baked tile57 bundle's `chart.pmtiles`
+by file mask (`*.pmtiles`), adds it to the chart database, and drives it like any
+native chart — chart bar, quilting and scale transitions included. The plugin is
+not an overlay; OpenCPN owns the draw order.
+
+When OpenCPN renders the chart (`RenderRegionViewOnGL`) it:
 
 1. converts OpenCPN's `PlugIn_ViewPort` into a tile57 camera (centre + a
    continuous web-mercator zoom derived from the view's ground resolution);
@@ -17,18 +23,22 @@ The plugin registers as an OpenGL overlay. Each frame it:
    and paints the view through a callback canvas — flattened, resolved
    primitives (fills, strokes, glyph outlines) in screen-pixel space;
 3. tessellates those primitives to triangles (fills via ear clipping, strokes
-   expanded to quads) and draws them on the GPU;
-4. draws a persistent "NOT FOR NAVIGATION" banner over the result.
+   expanded to quads) and draws them on the GPU.
 
 tile57 portrayal is only re-run when the view or mariner settings change; between
-changes the cached geometry is replayed.
+changes the cached geometry is replayed. At `Init` the chart reads the bundle's
+metadata (`tile57_chart_get_info`) for its extent, native scale and coverage.
+
+Since tile57 is experimental, the "NOT FOR NAVIGATION" warning rides in the
+chart's name and description, which OpenCPN shows in the chart bar and chart
+info.
 
 ## Layout
 
 ```
-src/tile57_pi.cpp        OpenCPN plugin entry (create_pi / plugin class)
+src/tile57_pi.cpp        OpenCPN plugin entry (create_pi / plugin class); installs the chart
+src/tile57_chart.*       ChartTile57 — the PlugInChartBaseGL chart class
 src/chart_renderer.*     callback canvas -> triangles -> GPU
-src/safety_overlay.*     the NOT FOR NAVIGATION banner (own GL program + font)
 src/gl.h                 GL headers + GLSL version prologue
 third_party/earcut.hpp   polygon tessellation (Mapbox earcut, ISC)
 opencpn-libs/            OpenCPN plugin API (git submodule; api-18 -> ocpn::api)
@@ -88,17 +98,23 @@ mkdir -p ~/Library/Application\ Support/OpenCPN/Contents/PlugIns
 cp build/libtile57_pi.dylib ~/Library/Application\ Support/OpenCPN/Contents/PlugIns/
 ```
 
-The chart is a baked tile57 bundle's `chart.pmtiles`. Point the plugin at it with
-the `OPENCPN_T57_CHART` environment variable (there is a default path otherwise):
+The chart is a baked tile57 bundle's `chart.pmtiles`. Because the plugin installs
+a real chart, you point OpenCPN at it the same way you would any chart — add the
+folder holding `chart.pmtiles` as a chart directory:
 
 ```sh
 # bake an unencrypted S-57 cell to a tile57 bundle
 tile57 bake CELL.000 -o /path/to/bundle
-export OPENCPN_T57_CHART=/path/to/bundle/tiles/chart.pmtiles
+# -> /path/to/bundle/tiles/chart.pmtiles
 ```
 
-Navigate OpenCPN to the chart's area at a matching scale; the vector chart is
-drawn as an overlay.
+In OpenCPN: **Options → Charts → Chart Files**, add `/path/to/bundle/tiles`
+(the folder containing `chart.pmtiles`), and **Scan Charts / Prepare**. The
+tile57 chart then appears in the chart bar. Navigate to its area and OpenCPN
+selects and draws it like a native chart.
+
+OpenCPN must be running with **OpenGL enabled** (Options → Display → Advanced) —
+the chart renders through the GPU; on the non-GL canvas it draws nothing.
 
 ## Licensing
 

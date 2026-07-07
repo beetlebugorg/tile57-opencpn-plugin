@@ -81,6 +81,12 @@ bool ChartRenderer::open_chart(const std::string& path) {
     return chart_ != nullptr;
 }
 
+bool ChartRenderer::get_info(tile57_chart_info& out) const {
+    if (!chart_) return false;
+    tile57_chart_get_info(chart_, &out);
+    return true;
+}
+
 static const char* VS = R"(
 attribute vec2 aPx;
 attribute vec4 aCol;

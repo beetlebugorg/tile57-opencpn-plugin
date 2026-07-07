@@ -23,6 +23,8 @@ public:
                 const tile57_mariner& m, bool draw_text);
     void shutdown();
     bool has_chart() const { return chart_ != nullptr; }
+    // Fixed chart metadata (zoom range, bounds, anchor). False if no chart open.
+    bool get_info(tile57_chart_info& out) const;
 
     // Geometry sink for the C callbacks (public so the trampolines can reach it).
     struct Vtx { float x, y; uint8_t r, g, b, a; };
