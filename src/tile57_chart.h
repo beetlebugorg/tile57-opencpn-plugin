@@ -70,8 +70,11 @@ public:
 
     wxBitmap* GetThumbnail(int tnx, int tny, int cs) override { return nullptr; }
 
-    // Object query (S-52 §10.8 pick): return the features under the cursor and
-    // describe them as HTML for OpenCPN's Object Query dialog.
+    // Object query (S-52 §10.8 pick): OpenCPN calls these on a double-click over a
+    // plugin chart. GetObjRuleListAtLatLon returns the objects under the point;
+    // CreateObjDescriptions turns them into the dialog HTML. The PI_S57Obj records
+    // are allocated WITHOUT their constructor (its symbol isn't exported on macOS)
+    // — OpenCPN reads and frees them.
     ListOfPI_S57Obj* GetObjRuleListAtLatLon(float lat, float lon, float select_radius,
                                             PlugIn_ViewPort* VPoint) override;
     wxString CreateObjDescriptions(ListOfPI_S57Obj* obj_list) override;

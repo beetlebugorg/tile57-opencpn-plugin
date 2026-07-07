@@ -6,7 +6,10 @@
 #include <wx/image.h>
 #include <wx/log.h>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
 // wxWidgets can create ChartTile57 by class name; OpenCPN uses this to
 // instantiate the chart for each matching file it finds in a chart directory.
@@ -322,6 +325,7 @@ wxString build_query_html(const std::vector<QueryHit>& hits) {
 ListOfPI_S57Obj* ChartTile57::GetObjRuleListAtLatLon(float lat, float lon, float /*radius*/,
                                                      PlugIn_ViewPort* /*vp*/) {
     auto* list = new ListOfPI_S57Obj;
+    query_html_.Clear();
     tile57_chart* ch = renderer_.chart_handle();
     if (!ch) return list;
     std::vector<QueryHit> hits;
@@ -329,12 +333,15 @@ ListOfPI_S57Obj* ChartTile57::GetObjRuleListAtLatLon(float lat, float lon, float
     tile57_chart_query(ch, lon, lat, &cb);
     if (hits.empty()) return list;
     query_html_ = build_query_html(hits);
-    // One PI_S57Obj per hit so OpenCPN opens the dialog and can count/anchor them.
+    // Allocate each PI_S57Obj WITHOUT its constructor (the ctor symbol isn't
+    // exported on macOS, and calling it would fail plugin load). Zeroed is fine:
+    // OpenCPN reads FeatureName + the reference point and frees them.
     for (const auto& f : hits) {
-        auto* o = new PI_S57Obj();
+        auto* o = static_cast<PI_S57Obj*>(std::calloc(1, sizeof(PI_S57Obj)));
+        if (!o) break;
         std::strncpy(o->FeatureName, f.cls.c_str(), sizeof(o->FeatureName) - 1);
-        o->FeatureName[sizeof(o->FeatureName) - 1] = 0;
-        o->m_lat = lat; o->m_lon = lon;
+        o->m_lat = lat;
+        o->m_lon = lon;
         list->Append(o);
     }
     return list;
