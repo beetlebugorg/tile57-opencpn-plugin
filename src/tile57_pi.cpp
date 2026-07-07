@@ -30,7 +30,7 @@ public:
     }
 
     int Init() override {
-        wxLogMessage("tile57_pi: Init() called");
+        wxLogMessage("tile57_pi: initialised");
         // Chart location: a baked tile57 bundle's chart.pmtiles, from the
         // environment or a default.
         const char* p = std::getenv("OPENCPN_T57_CHART");
@@ -76,8 +76,5 @@ private:
     std::string chart_path_;
 };
 
-extern "C" DECL_EXP opencpn_plugin* create_pi(void* pmgr) {
-    wxLogMessage("tile57_pi: create_pi entered (reports API 1.18)");
-    return new Tile57Plugin(pmgr);
-}
+extern "C" DECL_EXP opencpn_plugin* create_pi(void* pmgr) { return new Tile57Plugin(pmgr); }
 extern "C" DECL_EXP void destroy_pi(opencpn_plugin* p) { delete p; }
