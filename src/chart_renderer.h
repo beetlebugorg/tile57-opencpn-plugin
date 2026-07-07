@@ -44,6 +44,9 @@ public:
     struct SpriteVtx { float wx, wy, px, py, u, v, thresh; };
     // Pattern vertex: world position + atlas cell rect + tile screen px + SCAMIN.
     struct PatVtx { float wx, wy, u0, v0, u1, v1, tw, th, thresh; };
+    // Glyph vertex: world anchor + screen-px quad corner + SDF atlas UV + colour
+    // + SCAMIN (text drawn as SDF quads from the glyph atlas).
+    struct GlyphVtx { float wx, wy, px, py, u, v; uint8_t r, g, b, a; float thresh; };
 
     // TEMP diagnostic snapshot of the last render().
     struct Dbg { uint32_t area, line, symbol, text; bool rebuilt; double cam_zoom; };
@@ -54,6 +57,7 @@ public:
     std::vector<Vtx> area_, line_, symbol_, text_;
     std::vector<SpriteVtx> sprite_;   // point symbols drawn from the atlas
     std::vector<PatVtx> pattern_;     // area fills tiled from the pattern atlas
+    std::vector<GlyphVtx> glyph_;     // text drawn as SDF quads from the glyph atlas
     // The world reference point offsets are relative to (set per portrayal).
     double ref_wx_ = 0, ref_wy_ = 0;
     // Geometry decimation epsilon in world units (~half a portrayal pixel).
@@ -71,6 +75,11 @@ public:
                         float rot_deg, float half_w, float half_h, float thresh);
     void on_draw_pattern(const char* name, size_t len, const tile57_world_rings* rings,
                          float thresh);
+    // Lay out `text` from the SDF glyph atlas at (anchor + origin px), size in px,
+    // appending one quad per glyph to glyph_.
+    void on_draw_text_str(tile57_world_point anchor, float ox, float oy, const char* text,
+                          size_t len, float size_px, tile57_rgba color, tile57_rgba halo,
+                          float thresh);
 
 private:
     void rebuild(double lon, double lat, double zoom, uint32_t w, uint32_t h,
@@ -89,6 +98,9 @@ private:
     // Pattern (tiled-texture) program + buffer for area fills.
     uint32_t prog_pat_ = 0, vbo_pat_ = 0, n_pat_ = 0;
     int pu_scale_ = -1, pu_origin_ = -1, pu_vp_ = -1, pu_zoom_ = -1, pu_atlas_ = -1;
+    // Glyph (SDF text) program + buffer.
+    uint32_t prog_glyph_ = 0, vbo_glyph_ = 0, n_glyph_ = 0;
+    int gu_scale_ = -1, gu_origin_ = -1, gu_vp_ = -1, gu_zoom_ = -1, gu_atlas_ = -1;
     // Composite program + fullscreen quad: draw the resolved MSAA texture (a
     // shared multisampled FBO, see chart_renderer.cpp) over OpenCPN's FBO. MSAA
     // antialiases tessellated text/lines/area edges at ~1x fill cost.

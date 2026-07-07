@@ -2,6 +2,7 @@
 #include "chart_renderer.h"
 #include "gl.h"
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -277,6 +278,88 @@ void load_sprite_atlas() {
     }
     tile57_assets_free(&assets);
 }
+
+// ---- SDF glyph atlas (shared; loaded once in a GL context) -----------------
+struct GlyphInfo { float u0, v0, u1, v1, ox, oy, w, h, adv; };  // UV + EM-space quad
+struct GlyphAtlas {
+    uint32_t tex = 0;
+    std::unordered_map<uint32_t, GlyphInfo> g;  // codepoint -> metrics
+    bool tried = false, ok = false;
+};
+GlyphAtlas g_glyph;
+
+// Parse {"em_px":..,"pad":..,"glyphs":{"cp":[u0,v0,u1,v1,ox,oy,w,h,adv],..}}.
+void parse_glyph_json(const char* s, size_t len, std::unordered_map<uint32_t, GlyphInfo>& out) {
+    if (!s || len < 8) return;
+    size_t i = 0;
+    for (; i + 8 < len; ++i) if (std::memcmp(s + i, "\"glyphs\"", 8) == 0) break;
+    i += 8;
+    while (i < len && s[i] != '{') ++i;
+    if (i >= len) return;
+    ++i;
+    auto ws = [&] { while (i < len && (s[i]==' '||s[i]=='\n'||s[i]=='\t'||s[i]=='\r'||s[i]==',')) ++i; };
+    while (i < len) {
+        ws(); if (i < len && s[i] == '}') break;
+        if (i >= len || s[i] != '"') break;
+        ++i; uint32_t cp = (uint32_t)std::atoi(s + i);
+        while (i < len && s[i] != '"') ++i; if (i < len) ++i;
+        ws(); if (i < len && s[i] == ':') ++i; ws();
+        if (i >= len || s[i] != '[') break; ++i;
+        float v[9] = {0};
+        for (int k = 0; k < 9; ++k) {
+            ws(); v[k] = (float)std::atof(s + i);
+            while (i < len && s[i] != ',' && s[i] != ']') ++i;
+            if (i < len && s[i] == ',') ++i;
+        }
+        while (i < len && s[i] != ']') ++i; if (i < len) ++i;
+        out[cp] = { v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8] };
+    }
+}
+
+void load_glyph_atlas() {
+    if (g_glyph.tried) return;
+    g_glyph.tried = true;
+    tile57_assets a{};
+    if (!tile57_bake_glyph_sdf(&a)) return;
+    if (a.sprite_png && a.sprite_png_len) {
+        wxMemoryInputStream mis(a.sprite_png, a.sprite_png_len);
+        wxImage img;
+        if (img.LoadFile(mis, wxBITMAP_TYPE_PNG)) {
+            int tw = img.GetWidth(), th = img.GetHeight();
+            std::vector<uint8_t> rgba((size_t)tw * th * 4);
+            const uint8_t* rgb = img.GetData();
+            const uint8_t* al = img.HasAlpha() ? img.GetAlpha() : nullptr;
+            for (int p = 0; p < tw * th; ++p) {
+                rgba[p*4+0] = rgb[p*3+0]; rgba[p*4+1] = rgb[p*3+1]; rgba[p*4+2] = rgb[p*3+2];
+                rgba[p*4+3] = al ? al[p] : 255;
+            }
+            glGenTextures(1, &g_glyph.tex);
+            glBindTexture(GL_TEXTURE_2D, g_glyph.tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            parse_glyph_json((const char*)a.sprite_json, a.sprite_json_len, g_glyph.g);
+            g_glyph.ok = g_glyph.tex != 0 && !g_glyph.g.empty();
+        }
+    }
+    tile57_assets_free(&a);
+}
+
+// Minimal UTF-8 decode (advances i); covers the atlas's ASCII + Latin-1 range.
+uint32_t decode_utf8(const char* s, size_t len, size_t& i) {
+    unsigned char c = (unsigned char)s[i++];
+    if (c < 0x80) return c;
+    int n; uint32_t cp;
+    if ((c & 0xE0) == 0xC0) { n = 1; cp = c & 0x1F; }
+    else if ((c & 0xF0) == 0xE0) { n = 2; cp = c & 0x0F; }
+    else if ((c & 0xF8) == 0xF0) { n = 3; cp = c & 0x07; }
+    else return c;
+    for (int k = 0; k < n && i < len; ++k) cp = (cp << 6) | ((unsigned char)s[i++] & 0x3F);
+    return cp;
+}
 }  // namespace
 
 // Point symbol as a textured quad from the atlas: quad of ±half centred on the
@@ -334,6 +417,34 @@ void ChartRenderer::on_draw_pattern(const char* name, size_t len,
         }
 }
 
+// Lay a label out from the SDF glyph atlas: one textured quad per glyph at the
+// anchor + local px (origin + pen + glyph offset, all × the text px size). The
+// atlas is monochrome SDF, tinted by the text colour in the glyph shader.
+void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float oy,
+                                     const char* text, size_t len, float size_px,
+                                     tile57_rgba c, tile57_rgba /*halo*/, float thresh) {
+    if (!g_glyph.ok || size_px <= 0 || !text) return;
+    float awx = (float)(anchor.x - ref_wx_), awy = (float)(anchor.y - ref_wy_);
+    float pen = 0;
+    size_t i = 0;
+    while (i < len) {
+        uint32_t cp = decode_utf8(text, len, i);
+        auto it = g_glyph.g.find(cp);
+        if (it == g_glyph.g.end()) { it = g_glyph.g.find('?'); if (it == g_glyph.g.end()) continue; }
+        const GlyphInfo& g = it->second;
+        if (g.w > 0 && g.h > 0) {
+            float x0 = ox + pen + g.ox * size_px, y0 = oy + g.oy * size_px;
+            float x1 = x0 + g.w * size_px, y1 = y0 + g.h * size_px;
+            auto v = [&](float px, float py, float u, float vv) {
+                glyph_.push_back({ awx, awy, px, py, u, vv, c.r, c.g, c.b, c.a, thresh });
+            };
+            v(x0, y0, g.u0, g.v0); v(x1, y0, g.u1, g.v0); v(x1, y1, g.u1, g.v1);
+            v(x0, y0, g.u0, g.v0); v(x1, y1, g.u1, g.v1); v(x0, y1, g.u0, g.v1);
+        }
+        pen += g.adv * size_px;
+    }
+}
+
 // ---- C surface trampolines (ctx == ChartRenderer*) -------------------------
 static float feat_thresh(const tile57_feature* f) { return scamin_threshold(f ? f->scamin : 0); }
 static void tr_fill(void* c, const tile57_feature* f, const tile57_world_rings* r, tile57_rgba col, int) {
@@ -355,6 +466,10 @@ static void tr_sprite(void* c, const tile57_feature* f, const char* name, size_t
 static void tr_pattern(void* c, const tile57_feature* f, const char* name, size_t len,
                        const tile57_world_rings* rings) {
     static_cast<ChartRenderer*>(c)->on_draw_pattern(name, len, rings, feat_thresh(f));
+}
+static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, float ox, float oy,
+                        const char* text, size_t len, float size, tile57_rgba col, tile57_rgba halo) {
+    static_cast<ChartRenderer*>(c)->on_draw_text_str(a, ox, oy, text, len, size, col, halo, feat_thresh(f));
 }
 
 // ---- chart / GL lifecycle --------------------------------------------------
@@ -460,6 +575,40 @@ void main(){
   gl_FragColor = vec4(t.rgb*t.a, t.a);
 }
 )";
+// Glyph program: same world transform + aPost (local px), sample the SDF atlas
+// and threshold to a crisp, size-independent edge (fwidth = the on-screen slope),
+// tinted by the per-glyph colour. Output premultiplied.
+static const char* VS_GLYPH = R"(
+attribute vec2 aWorld;
+attribute vec2 aPost;
+attribute vec2 aUV;
+attribute vec4 aColor;
+attribute float aThresh;
+uniform float uScale;
+uniform vec2 uOrigin;
+uniform vec2 uVp;
+uniform float uZoom;
+varying vec2 vUV;
+varying vec4 vCol;
+void main(){
+  if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); vUV = vec2(0.0); vCol = vec4(0.0); return; }
+  vec2 screen = aWorld*uScale + uOrigin + aPost;
+  vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
+  gl_Position = vec4(ndc, 0.0, 1.0);
+  vUV = aUV; vCol = aColor;
+}
+)";
+static const char* FS_GLYPH = R"(
+uniform sampler2D uAtlas;
+varying vec2 vUV;
+varying vec4 vCol;
+void main(){
+  float d = texture2D(uAtlas, vUV).a;
+  float w = fwidth(d);
+  float a = smoothstep(0.5 - w, 0.5 + w, d);
+  gl_FragColor = vec4(vCol.rgb*vCol.a, vCol.a) * a;
+}
+)";
 // Composite program: draw the supersampled texture as a fullscreen quad,
 // down-sampled by the sampler's linear filter (already premultiplied).
 static const char* VS_BLIT = R"(
@@ -534,6 +683,23 @@ bool ChartRenderer::ensure_gl() {
     pu_atlas_ = glGetUniformLocation(prog_pat_, "uAtlas");
     glGenBuffers(1, &vbo_pat_);
 
+    // Glyph program (SDF text).
+    prog_glyph_ = glCreateProgram();
+    glAttachShader(prog_glyph_, compile(GL_VERTEX_SHADER, VS_GLYPH));
+    glAttachShader(prog_glyph_, compile(GL_FRAGMENT_SHADER, FS_GLYPH));
+    glBindAttribLocation(prog_glyph_, 0, "aWorld");
+    glBindAttribLocation(prog_glyph_, 1, "aPost");
+    glBindAttribLocation(prog_glyph_, 2, "aUV");
+    glBindAttribLocation(prog_glyph_, 3, "aColor");
+    glBindAttribLocation(prog_glyph_, 4, "aThresh");
+    glLinkProgram(prog_glyph_);
+    gu_scale_ = glGetUniformLocation(prog_glyph_, "uScale");
+    gu_origin_ = glGetUniformLocation(prog_glyph_, "uOrigin");
+    gu_vp_ = glGetUniformLocation(prog_glyph_, "uVp");
+    gu_zoom_ = glGetUniformLocation(prog_glyph_, "uZoom");
+    gu_atlas_ = glGetUniformLocation(prog_glyph_, "uAtlas");
+    glGenBuffers(1, &vbo_glyph_);
+
     // Composite program + a unit fullscreen quad (pos.xy, tex.uv).
     prog_blit_ = glCreateProgram();
     glAttachShader(prog_blit_, compile(GL_VERTEX_SHADER, VS_BLIT));
@@ -549,6 +715,7 @@ bool ChartRenderer::ensure_gl() {
     glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
 
     load_sprite_atlas();
+    load_glyph_atlas();
 
     gl_ready_ = true;
     return true;
@@ -608,7 +775,8 @@ void ChartRenderer::composite_ss() {
 
 void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                             const tile57_mariner& m) {
-    area_.clear(); line_.clear(); symbol_.clear(); text_.clear(); sprite_.clear(); pattern_.clear();
+    auto t0 = std::chrono::steady_clock::now();
+    area_.clear(); line_.clear(); symbol_.clear(); text_.clear(); sprite_.clear(); pattern_.clear(); glyph_.clear();
     // World reference: the view centre, so vertex offsets stay tiny (f32-precise).
     lonlat_to_world(lon, lat, ref_wx_, ref_wy_);
     // Decimate geometry to ~half a pixel at the portrayal zoom.
@@ -623,9 +791,24 @@ void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uin
     cb.draw_text = tr_text;
     // Point symbols/patterns draw from the atlas when it loaded; else tessellate.
     if (g_atlas.ok) { cb.draw_sprite = tr_sprite; cb.draw_pattern = tr_pattern; }
+    // SDF glyph atlas: send text as strings (skips glyph tessellation). If it did
+    // not load, draw_text_str stays null and text tessellates via draw_text.
+    if (g_glyph.ok) cb.draw_text_str = tr_text_str;
     int rc = tile57_chart_render_surface_cb(chart_, lon, lat, zoom, w, h, &m, &cb);
     if (rc != 0) std::fprintf(stderr, "t57 render_surface_cb rc=%d\n", rc);
+    auto t1 = std::chrono::steady_clock::now();
     upload();
+    auto t2 = std::chrono::steady_clock::now();
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    static FILE* pf = std::fopen("/tmp/t57_perf.log", "w");
+    if (pf) {
+        std::fprintf(pf,
+                     "rebuild z=%.1f %ux%u: portray+tess=%.1fms upload=%.1fms | "
+                     "verts area=%zu line=%zu sym=%zu txt=%zu glyph=%zu spr=%zu pat=%zu\n",
+                     zoom, w, h, ms(t0, t1), ms(t1, t2),
+                     area_.size(), line_.size(), symbol_.size(), text_.size(), glyph_.size(), sprite_.size(), pattern_.size());
+        std::fflush(pf);
+    }
 }
 
 void ChartRenderer::upload() {
@@ -644,6 +827,9 @@ void ChartRenderer::upload() {
     glBindBuffer(GL_ARRAY_BUFFER, vbo_pat_);
     glBufferData(GL_ARRAY_BUFFER, pattern_.size() * sizeof(PatVtx), pattern_.data(), GL_DYNAMIC_DRAW);
     n_pat_ = (uint32_t)pattern_.size();
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_glyph_);
+    glBufferData(GL_ARRAY_BUFFER, glyph_.size() * sizeof(GlyphVtx), glyph_.data(), GL_DYNAMIC_DRAW);
+    n_glyph_ = (uint32_t)glyph_.size();
 }
 
 void ChartRenderer::draw_range(uint32_t vbo, uint32_t count) {
@@ -809,7 +995,35 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
             glUseProgram(prog_);
         }
     }
-    if (pass != Pass::kBase) draw_range(vbo_text_, n_text_);
+    if (pass != Pass::kBase) {
+        draw_range(vbo_text_, n_text_);   // tessellated fallback (empty when SDF text is active)
+        if (n_glyph_ && g_glyph.ok) {
+            glUseProgram(prog_glyph_);
+            glUniform1f(gu_scale_, (float)scale_px);
+            glUniform2fv(gu_origin_, 1, origin);
+            glUniform2fv(gu_vp_, 1, vp);
+            glUniform1f(gu_zoom_, (float)zoom);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, g_glyph.tex);
+            glUniform1i(gu_atlas_, 0);
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_glyph_);
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, wx));
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, px));
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, u));
+            glEnableVertexAttribArray(3);
+            glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, r));
+            glEnableVertexAttribArray(4);
+            glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, thresh));
+            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)n_glyph_);
+            glDisableVertexAttribArray(0); glDisableVertexAttribArray(1); glDisableVertexAttribArray(2);
+            glDisableVertexAttribArray(3); glDisableVertexAttribArray(4);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glUseProgram(prog_);
+        }
+    }
 
     if (ss) {
         // Composite the supersampled texture over OpenCPN's FBO, down-sampled by
@@ -823,9 +1037,9 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
 }
 
 void ChartRenderer::shutdown() {
-    gl_ready_ = false; prog_ = prog_sprite_ = prog_pat_ = prog_blit_ = 0;
-    vbo_area_ = vbo_line_ = vbo_symbol_ = vbo_text_ = vbo_sprite_ = vbo_pat_ = vbo_quad_ = 0;
-    n_area_ = n_line_ = n_symbol_ = n_text_ = n_sprite_ = n_pat_ = 0;
+    gl_ready_ = false; prog_ = prog_sprite_ = prog_pat_ = prog_glyph_ = prog_blit_ = 0;
+    vbo_area_ = vbo_line_ = vbo_symbol_ = vbo_text_ = vbo_sprite_ = vbo_pat_ = vbo_glyph_ = vbo_quad_ = 0;
+    n_area_ = n_line_ = n_symbol_ = n_text_ = n_sprite_ = n_pat_ = n_glyph_ = 0;
     have_cam_ = false; have_range_ = false;
     if (chart_) { tile57_chart_close(chart_); chart_ = nullptr; }
 }
