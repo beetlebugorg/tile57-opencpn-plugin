@@ -21,7 +21,10 @@ public:
         return INSTALLS_PLUGIN_CHART | INSTALLS_PLUGIN_CHART_GL
              | WANTS_MOUSE_EVENTS | WANTS_CURSOR_LATLON;
     }
-    bool DeInit() override { return true; }
+    bool DeInit() override {
+        if (query_dlg_) { query_dlg_->Destroy(); query_dlg_ = nullptr; }
+        return true;
+    }
 
     int GetAPIVersionMajor() override { return 1; }
     int GetAPIVersionMinor() override { return 18; }
@@ -45,36 +48,40 @@ public:
     // OpenCPN feeds us the cursor position in lat/lon as it moves.
     void SetCursorLatLon(double lat, double lon) override { cur_lat_ = lat; cur_lon_ = lon; }
 
-    // Object query on double-click: ask each of our charts covering the cursor for
-    // the features there and show them in a dialog. Returning true asks OpenCPN to
-    // stop processing the event (so its own — empty for us — query does not fire).
-    // This test tells us whether the hook fires and whether the consume works.
+    // Object query on a single click (a press+release that did NOT drag, so
+    // panning is unaffected): query the charts under the cursor and show the
+    // result in a floating, non-modal panel that updates on each click. We do NOT
+    // consume the click, so normal chart interaction still works.
     bool MouseEventHook(wxMouseEvent& event) override {
-        if (!event.LeftDClick()) return false;
-        wxLogMessage("tile57_pi: double-click at (%.5f, %.5f)", cur_lat_, cur_lon_);
+        if (!event.LeftDClick()) return false;   // double-click = the OpenCPN pick gesture
         wxString body;
         for (auto* c : ChartTile57::instances())
             if (c->covers(cur_lon_, cur_lat_)) body += c->QueryDescription(cur_lon_, cur_lat_);
-        wxLogMessage("tile57_pi: query body length = %zu", (size_t)body.length());
-        if (body.IsEmpty()) return false;   // nothing here — let OpenCPN handle it
+        if (body.IsEmpty()) return false;        // nothing here — let OpenCPN handle it
         show_query(body);
-        return true;                         // consume the double-click
+        return true;   // consume: suppress OpenCPN's own query and its center-on-double-click
     }
 
 private:
     double cur_lat_ = 0, cur_lon_ = 0;
+    wxDialog* query_dlg_ = nullptr;
+    wxHtmlWindow* query_html_ = nullptr;
 
     void show_query(const wxString& body) {
-        wxDialog dlg(GetOCPNCanvasWindow(), wxID_ANY, _T("Object Query — tile57"),
-                     wxDefaultPosition, wxSize(440, 500),
-                     wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER);
-        auto* sizer = new wxBoxSizer(wxVERTICAL);
-        auto* html = new wxHtmlWindow(&dlg);
-        html->SetPage("<html><body>" + body + "</body></html>");
-        sizer->Add(html, 1, wxEXPAND | wxALL, 4);
-        sizer->Add(dlg.CreateButtonSizer(wxOK), 0, wxALIGN_RIGHT | wxALL, 4);
-        dlg.SetSizer(sizer);
-        dlg.ShowModal();
+        if (!query_dlg_) {
+            query_dlg_ = new wxDialog(GetOCPNCanvasWindow(), wxID_ANY, _T("Object Query — tile57"),
+                                      wxDefaultPosition, wxSize(440, 500),
+                                      wxCAPTION | wxCLOSE_BOX | wxRESIZE_BORDER | wxFRAME_FLOAT_ON_PARENT);
+            auto* sizer = new wxBoxSizer(wxVERTICAL);
+            query_html_ = new wxHtmlWindow(query_dlg_);
+            sizer->Add(query_html_, 1, wxEXPAND | wxALL, 4);
+            query_dlg_->SetSizer(sizer);
+            // Closing the panel hides it (keep it for reuse) rather than deleting.
+            query_dlg_->Bind(wxEVT_CLOSE_WINDOW, [this](wxCloseEvent&) { query_dlg_->Hide(); });
+        }
+        query_html_->SetPage("<html><body>" + body + "</body></html>");
+        query_dlg_->Show();
+        query_dlg_->Raise();
     }
 };
 
