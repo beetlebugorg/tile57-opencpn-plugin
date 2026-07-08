@@ -9,7 +9,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <sys/stat.h>
 #include <unordered_set>
 #include <vector>
 
@@ -137,6 +140,55 @@ void ChartTile57::apply_info(tile57_chart* h, const tile57_chart_info& info) {
     min_zoom_ = info.min_zoom; max_zoom_ = info.max_zoom;
 }
 
+// Bump when the bake format or portrayal changes so stale caches are ignored.
+static constexpr int kBakeVersion = 1;
+
+// <cache>/tile57/cells/<stem>-<pathhash>-<keyhash>.pmtiles. The keyhash covers the
+// cell path, the freshest mtime across the .000 + its .001.. updates, the update
+// count, the bake zoom, and kBakeVersion — so a re-issued cell, an added/edited
+// update, a zoom change, or a format bump all miss and re-bake. The stable pathhash
+// lets us sweep THIS cell's now-stale siblings (a different keyhash, same path) so old
+// bakes don't pile up in the cache.
+std::string ChartTile57::cache_path(const std::string& cell_path, uint8_t maxz) {
+    namespace fs = std::filesystem;
+    const char* xdg = std::getenv("XDG_CACHE_HOME");
+    const char* home = std::getenv("HOME");
+    fs::path dir = (xdg && *xdg) ? fs::path(xdg) : fs::path(home ? home : "/tmp") / ".cache";
+    dir = dir / "tile57" / "cells";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    long mt = 0;
+    int ucount = 0;
+    struct stat st {};
+    if (::stat(cell_path.c_str(), &st) == 0) mt = (long)st.st_mtime;
+    if (cell_path.size() > 4) {
+        std::string stem = cell_path.substr(0, cell_path.size() - 4);   // strip ".000"
+        for (int u = 1; u <= 999; ++u) {
+            char sfx[16];
+            std::snprintf(sfx, sizeof sfx, ".%03d", u);
+            struct stat us {};
+            if (::stat((stem + sfx).c_str(), &us) != 0) break;
+            ++ucount;
+            if ((long)us.st_mtime > mt) mt = (long)us.st_mtime;
+        }
+    }
+    std::string key = cell_path + "|" + std::to_string(mt) + "|" + std::to_string(ucount) +
+                      "|z" + std::to_string((int)maxz) + "|v" + std::to_string(kBakeVersion);
+    char ph[12], kh[20];
+    std::snprintf(ph, sizeof ph, "%08zx", std::hash<std::string>{}(cell_path) & 0xffffffffu);
+    std::snprintf(kh, sizeof kh, "%016zx", std::hash<std::string>{}(key));
+    std::string prefix = fs::path(cell_path).stem().string() + "-" + ph + "-";
+    std::string current = prefix + kh + ".pmtiles";
+
+    // Sweep this cell's stale bakes (same path prefix, different key).
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+        std::string fn = e.path().filename().string();
+        if (fn.rfind(prefix, 0) == 0 && fn != current) fs::remove(e.path(), ec);
+    }
+    return (dir / current).string();
+}
+
 int ChartTile57::Init(const wxString& full_path, int init_flags) {
     m_FullPath = full_path;
     m_Name = wxFileName(full_path).GetName();
@@ -199,6 +251,22 @@ int ChartTile57::Init(const wxString& full_path, int init_flags) {
     zn = std::max(4, std::min(zn, 16));
     bake_full_max_ = (uint8_t)zn;
     bake_quick_max_ = (uint8_t)std::max(5, zn - 3);
+    cache_file_ = cache_path(path, bake_full_max_);
+
+    // Cache hit: the full bake already lives on disk — open it directly (fast) and
+    // render straight away, no background bake.
+    std::error_code ec;
+    if (std::filesystem::exists(cache_file_, ec) && renderer_.open_chart(cache_file_)) {
+        wxLogMessage("tile57: cache HIT %s", cache_file_.c_str());
+        ready_.store(true, std::memory_order_release);
+        m_bReadyToRender = true;
+        return PI_INIT_OK;
+    }
+    std::filesystem::remove(cache_file_, ec);   // stale/corrupt (open failed) -> re-bake
+    wxLogMessage("tile57: cache MISS, baking -> %s", cache_file_.c_str());
+
+    // Cache miss: bake on a background thread (progressive — a coarse band for first
+    // paint, then the full range persisted to the cache so the next run is instant).
     canvas_ = GetOCPNCanvasWindow();
     ready_.store(false, std::memory_order_release);
     cancel_.store(false, std::memory_order_release);
@@ -212,13 +280,29 @@ int ChartTile57::Init(const wxString& full_path, int init_flags) {
 // baked handle to the render thread via publish(); never touches renderer_.chart_.
 void ChartTile57::start_bake() {
     bake_thread_ = std::thread([this]() {
+        // Quick coarse band, rendered in-memory (not cached) for a fast first paint.
         if (cancel_.load(std::memory_order_acquire)) return;
         tile57_chart* ov = tile57_chart_open_zoom(bake_path_.c_str(), 0, bake_quick_max_);
         if (cancel_.load(std::memory_order_acquire)) { if (ov) tile57_chart_close(ov); return; }
         if (ov) publish(ov);
 
+        // Full band -> bytes -> PERSIST to the disk cache (atomic tmp+rename) -> open
+        // the written bundle, so the next run/restart is a cache hit.
         if (cancel_.load(std::memory_order_acquire)) return;
-        tile57_chart* full = tile57_chart_open_zoom(bake_path_.c_str(), 0, bake_full_max_);
+        uint8_t* bytes = nullptr;
+        size_t len = 0;
+        if (tile57_bake_cell_bytes(bake_path_.c_str(), 0, bake_full_max_, &bytes, &len) != 1)
+            return;
+        std::string tmp = cache_file_ + ".tmp";
+        { std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+          f.write(reinterpret_cast<const char*>(bytes), (std::streamsize)len); }
+        std::error_code ec;
+        std::filesystem::rename(tmp, cache_file_, ec);
+        tile57_free(bytes, len);
+        if (ec) std::filesystem::remove(tmp, ec);   // write failed -> leave no partial
+
+        if (cancel_.load(std::memory_order_acquire)) return;
+        tile57_chart* full = tile57_chart_open_pmtiles(cache_file_.c_str());
         if (cancel_.load(std::memory_order_acquire)) { if (full) tile57_chart_close(full); return; }
         if (full) publish(full);
     });
