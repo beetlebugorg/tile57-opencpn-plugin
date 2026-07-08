@@ -21,6 +21,8 @@
 #include <wx/stattext.h>
 #include <wx/sizer.h>
 #include <wx/fileconf.h>
+#include <wx/filename.h>
+#include <wx/stdpaths.h>
 #include <wx/log.h>
 
 #include <algorithm>
@@ -34,22 +36,31 @@ namespace {
 
 constexpr int kTimerMs = 200;
 
-// Persisted-config helpers (OpenCPN's shared wxFileConfig, /PlugIns/tile57).
+// Persisted config in a PLUGIN-OWNED ini file (wxStandardPaths user-config dir) —
+// deliberately NOT GetOCPNConfigObject(): that host symbol is resolved lazily via
+// -undefined dynamic_lookup and, if a given OpenCPN build doesn't export it, calling
+// it jumps to a bad address and crashes the moment the dialog is constructed. A
+// self-owned wxFileConfig depends only on the wx libs the plugin already links.
+wxString ConfigPath() {
+    return wxFileName(wxStandardPaths::Get().GetUserConfigDir(),
+                      _T("tile57_pi.ini")).GetFullPath();
+}
+
 void LoadPaths(wxString& enc, wxString& dest) {
-    if (wxFileConfig* cfg = GetOCPNConfigObject()) {
-        cfg->SetPath(_T("/PlugIns/tile57"));
-        cfg->Read(_T("EncSource"), &enc, wxEmptyString);
-        cfg->Read(_T("Dest"), &dest, wxEmptyString);
-    }
+    wxFileConfig cfg(wxEmptyString, wxEmptyString, ConfigPath(), wxEmptyString,
+                     wxCONFIG_USE_LOCAL_FILE);
+    cfg.SetPath(_T("/tile57"));
+    cfg.Read(_T("EncSource"), &enc, wxEmptyString);
+    cfg.Read(_T("Dest"), &dest, wxEmptyString);
 }
 
 void SavePaths(const wxString& enc, const wxString& dest) {
-    if (wxFileConfig* cfg = GetOCPNConfigObject()) {
-        cfg->SetPath(_T("/PlugIns/tile57"));
-        cfg->Write(_T("EncSource"), enc);
-        cfg->Write(_T("Dest"), dest);
-        cfg->Flush();
-    }
+    wxFileConfig cfg(wxEmptyString, wxEmptyString, ConfigPath(), wxEmptyString,
+                     wxCONFIG_USE_LOCAL_FILE);
+    cfg.SetPath(_T("/tile57"));
+    cfg.Write(_T("EncSource"), enc);
+    cfg.Write(_T("Dest"), dest);
+    cfg.Flush();
 }
 
 bool IsDotZeroZeroZero(const fs::path& p) {
@@ -65,44 +76,51 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     : wxDialog(parent, wxID_ANY, _T("Build Charts — tile57"),
                wxDefaultPosition, wxSize(520, 260),
                wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER) {
+    wxLogMessage("tile57: BuildChartsDialog ctor begin");
+    const int B = 12;   // outer margin
     auto* top = new wxBoxSizer(wxVERTICAL);
 
     top->Add(new wxStaticText(this, wxID_ANY, _T("ENC source (ENC_ROOT):")),
-             0, wxLEFT | wxRIGHT | wxTOP, 8);
+             0, wxLEFT | wxRIGHT | wxTOP, B);
     encPicker_ = new wxDirPickerCtrl(this, wxID_ANY, wxEmptyString,
                                      _T("Select ENC source folder"),
                                      wxDefaultPosition, wxDefaultSize,
                                      wxDIRP_USE_TEXTCTRL | wxDIRP_DIR_MUST_EXIST);
-    top->Add(encPicker_, 0, wxEXPAND | wxLEFT | wxRIGHT, 8);
+    top->Add(encPicker_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 4);
 
-    top->Add(new wxStaticText(this, wxID_ANY, _T("Destination folder:")),
-             0, wxLEFT | wxRIGHT | wxTOP, 8);
+    top->AddSpacer(10);
+    top->Add(new wxStaticText(this, wxID_ANY, _T("Destination folder (baked charts):")),
+             0, wxLEFT | wxRIGHT, B);
     destPicker_ = new wxDirPickerCtrl(this, wxID_ANY, wxEmptyString,
                                       _T("Select destination folder"),
                                       wxDefaultPosition, wxDefaultSize,
                                       wxDIRP_USE_TEXTCTRL);
-    top->Add(destPicker_, 0, wxEXPAND | wxLEFT | wxRIGHT, 8);
+    top->Add(destPicker_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 4);
 
+    top->AddSpacer(16);
     gauge_ = new wxGauge(this, wxID_ANY, 100);
-    top->Add(gauge_, 0, wxEXPAND | wxALL, 8);
-
+    top->Add(gauge_, 0, wxEXPAND | wxLEFT | wxRIGHT, B);
     status_ = new wxStaticText(this, wxID_ANY, _T("Idle"));
-    top->Add(status_, 0, wxEXPAND | wxLEFT | wxRIGHT, 8);
+    top->Add(status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 6);
 
+    top->AddSpacer(16);
     auto* btns = new wxBoxSizer(wxHORIZONTAL);
     buildBtn_ = new wxButton(this, wxID_ANY, _T("Build Charts"));
     cancelBtn_ = new wxButton(this, wxID_ANY, _T("Cancel"));
     cancelBtn_->Enable(false);
     auto* closeBtn = new wxButton(this, wxID_CLOSE, _T("Close"));
-    btns->Add(buildBtn_, 0, wxRIGHT, 6);
-    btns->Add(cancelBtn_, 0, wxRIGHT, 6);
+    btns->Add(buildBtn_, 0, wxRIGHT, 8);
+    btns->Add(cancelBtn_, 0, wxRIGHT, 8);
     btns->AddStretchSpacer();
     btns->Add(closeBtn, 0);
-    top->Add(btns, 0, wxEXPAND | wxALL, 8);
+    top->Add(btns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, B);
 
-    SetSizer(top);
+    SetSizerAndFit(top);
+    SetSize(wxSize(560, GetSize().GetHeight()));   // widen for readable paths
+    SetMinSize(GetSize());
 
     // Restore persisted paths.
+    wxLogMessage("tile57: BuildChartsDialog loading config");
     wxString enc, dest;
     LoadPaths(enc, dest);
     if (!enc.IsEmpty()) encPicker_->SetPath(enc);
@@ -114,6 +132,7 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     Bind(wxEVT_CLOSE_WINDOW, &BuildChartsDialog::OnClose, this);
     timer_.SetOwner(this);
     Bind(wxEVT_TIMER, &BuildChartsDialog::OnTimer, this);
+    wxLogMessage("tile57: BuildChartsDialog ctor end");
 }
 
 BuildChartsDialog::~BuildChartsDialog() {

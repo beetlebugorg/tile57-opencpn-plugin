@@ -60,10 +60,16 @@ public:
     // surface it. It bakes an ENC_ROOT to per-cell *.pmtiles and registers the
     // destination as a chart directory (see build_charts.*).
     void ShowPreferencesDialog(wxWindow* parent) override {
-        if (!prefs_dlg_)
-            prefs_dlg_ = new BuildChartsDialog(parent ? parent : GetOCPNCanvasWindow());
+        wxLogMessage("tile57: ShowPreferencesDialog enter (parent=%p)", (void*)parent);
+        if (!prefs_dlg_) {
+            // Parent to the canvas (a stable top-level that outlives the transient
+            // preferences window), falling back to the passed parent.
+            wxWindow* p = GetOCPNCanvasWindow();
+            prefs_dlg_ = new BuildChartsDialog(p ? p : parent);
+        }
         prefs_dlg_->Show();
         prefs_dlg_->Raise();
+        wxLogMessage("tile57: ShowPreferencesDialog shown");
     }
 
     // Two unobtrusive indicators, both fixed-function so they compose with OpenCPN's GL:
