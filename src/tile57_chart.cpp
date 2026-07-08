@@ -37,7 +37,13 @@ double display_size_scale() {
     double mm = PlugInGetDisplaySizeMM();
     int sw = wxGetDisplaySize().GetWidth();
     if (mm < 1.0 || sw <= 0) return 1.0;
-    double s = (sw / mm) / kTile57RefPxPerMm;
+    // We render into the PHYSICAL framebuffer (glViewport = contentScale * logical px),
+    // and symbols are sized in those pixels. wxGetDisplaySize is LOGICAL px on a HiDPI
+    // display, so without the content-scale factor a 5mm symbol (CHKSYM01) comes out at
+    // ~2.5mm on a 2x screen. Fold in contentScale to get true physical px/mm.
+    double csf = OCPN_GetDisplayContentScaleFactor();
+    if (!(csf > 0.5 && csf < 6.0)) csf = 1.0;
+    double s = (sw * csf / mm) / kTile57RefPxPerMm;
     return (s > 0.1 && s < 12.0) ? s : 1.0;
 }
 // Pixels per metre of a nominal 96-DPI display; turns a ground resolution into
@@ -437,6 +443,48 @@ void ChartTile57::refresh_mariner() {
     }
 }
 
+void ChartTile57::draw_calibration() const {
+    static const bool on = std::getenv("TILE57_CALIB") != nullptr;
+    if (!on) return;
+    GLint gvp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, gvp);
+    const float W = (float)gvp[2], H = (float)gvp[3];
+    if (W <= 0.f || H <= 0.f) return;
+
+    // A 5mm square at the SAME effective px/mm the chart symbols use (kTile57RefPxPerMm
+    // is tile57's size_scale=1 density; mariner_.size_scale carries the display + HiDPI
+    // scaling). Measured with a ruler it should be exactly 5mm — S-52 CHKSYM01.
+    const float side = (float)(5.0 * kTile57RefPxPerMm * mariner_.size_scale);
+    const float cx = W * 0.5f, cy = H * 0.5f, hs = side * 0.5f;
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        wxLogMessage("tile57 CALIB: 5mm square = %.1f px  (size_scale=%.3f, %.2f px/mm, "
+                     "displayMM=%.1f, csf=%.2f)", side, mariner_.size_scale,
+                     kTile57RefPxPerMm * mariner_.size_scale, PlugInGetDisplaySizeMM(),
+                     OCPN_GetDisplayContentScaleFactor());
+    }
+
+    glUseProgram(0);
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+    glOrtho(0, W, H, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+    glDisable(GL_TEXTURE_2D); glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND);
+    glColor3f(0.f, 0.f, 0.f);           // filled black 5mm square (like CHKSYM01)
+    glBegin(GL_QUADS);
+    glVertex2f(cx - hs, cy - hs); glVertex2f(cx + hs, cy - hs);
+    glVertex2f(cx + hs, cy + hs); glVertex2f(cx - hs, cy + hs);
+    glEnd();
+    glColor3f(1.f, 0.25f, 0.25f);       // crisp red edge for measuring
+    glLineWidth(1.f);
+    glBegin(GL_LINE_LOOP);
+    glVertex2f(cx - hs, cy - hs); glVertex2f(cx + hs, cy - hs);
+    glVertex2f(cx + hs, cy + hs); glVertex2f(cx - hs, cy + hs);
+    glEnd();
+    glMatrixMode(GL_PROJECTION); glPopMatrix();
+    glMatrixMode(GL_MODELVIEW); glPopMatrix();
+}
+
 int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
                              bool stencil_clip) {
     if (!vp.bValid) return false;
@@ -470,6 +518,7 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     double zoom = zoom_for_ppm(ppm);
     last_zoom_ = zoom;   // remembered for the object-query pick tolerance / SCAMIN
     renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip);
+    if (pass != t57::ChartRenderer::Pass::kText) draw_calibration();
     return true;
 }
 

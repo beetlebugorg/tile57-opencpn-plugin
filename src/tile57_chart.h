@@ -123,6 +123,11 @@ private:
     void publish(tile57_chart* c);     // bake thread -> render thread handoff
     void adopt_pending();              // render thread: swap in a freshly baked chart
 
+    // Debug (env TILE57_CALIB=1): draw a 5mm square at the exact px/mm the chart
+    // symbols/text use, centred, so it can be measured with a ruler — the S-52
+    // CHKSYM01 check ("should measure 5mm by 5mm"). Verifies physical sizing.
+    void draw_calibration() const;
+
     // Shared per-pass render: ViewPort -> tile57 camera -> draw `pass` buffers.
     int render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
                     bool stencil_clip);
