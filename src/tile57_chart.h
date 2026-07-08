@@ -100,14 +100,22 @@ public:
     bool covers(double lon, double lat) const;
     static const std::vector<ChartTile57*>& instances();
 
+    // True while this cell is baking its tiles and has nothing to draw yet — the plugin
+    // overlay paints the animated 8-bit loader over this bbox meanwhile. Writes bounds
+    // and returns true only when loading.
+    bool loading_extent(double& w, double& s, double& e, double& n) const {
+        if (!loading_.load(std::memory_order_acquire)) return false;
+        w = bounds_west_; s = bounds_south_; e = bounds_east_; n = bounds_north_;
+        return true;
+    }
+
 private:
     // Extract bbox / native scale / M_COVR coverage from an open chart handle into
     // this chart's members (GetChartExtent / m_Chart_Scale / GetCOVR*).
     void apply_info(tile57_chart* h, const tile57_chart_info& info);
     // The on-disk per-cell tile cache path (keyed by cell + freshest mtime + update
-    // count + zoom + bake version), so the slow bake is one-time across runs. Also
-    // sweeps this cell's now-stale cache siblings.
-    std::string cache_path(const std::string& cell_path, uint8_t maxz);
+    // count + zoom + bake version), so the slow bake is one-time across runs.
+    std::string cache_path(const std::string& cell_path, uint8_t maxz) const;
     // Background bake (full init): bake the quick native band then the full range,
     // handing each result to the render thread via pending_chart_. See tile57_chart.cpp
     // for the thread-safety contract (single-writer chart_, atomic handoff, warmup).
@@ -151,6 +159,7 @@ private:
     // bake only READS them; the allocator is thread-safe and portrayal is threadlocal.
     std::atomic<bool> ready_{false};
     std::atomic<bool> cancel_{false};
+    std::atomic<bool> loading_{false};   // baking, nothing to draw yet -> show the loader
     std::atomic<tile57_chart*> pending_chart_{nullptr};
     std::thread bake_thread_;
     std::string bake_path_;             // resolved .000 path (set before the thread starts)

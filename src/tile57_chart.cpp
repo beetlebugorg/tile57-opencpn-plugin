@@ -1,5 +1,6 @@
 // tile57_chart.cpp — see tile57_chart.h.
 #include "tile57_chart.h"
+#include "bake_manager.h"
 #include "gl.h"
 #include <wx/fileconf.h>
 #include <wx/filename.h>
@@ -10,7 +11,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <string>
 #include <sys/stat.h>
 #include <unordered_set>
@@ -147,9 +147,9 @@ static constexpr int kBakeVersion = 1;
 // cell path, the freshest mtime across the .000 + its .001.. updates, the update
 // count, the bake zoom, and kBakeVersion — so a re-issued cell, an added/edited
 // update, a zoom change, or a format bump all miss and re-bake. The stable pathhash
-// lets us sweep THIS cell's now-stale siblings (a different keyhash, same path) so old
-// bakes don't pile up in the cache.
-std::string ChartTile57::cache_path(const std::string& cell_path, uint8_t maxz) {
+// prefix lets the baker later sweep THIS cell's now-stale siblings. Pure/computation
+// only (called during the DB scan, once per cell) — no I/O beyond ensuring the dir.
+std::string ChartTile57::cache_path(const std::string& cell_path, uint8_t maxz) const {
     namespace fs = std::filesystem;
     const char* xdg = std::getenv("XDG_CACHE_HOME");
     const char* home = std::getenv("HOME");
@@ -178,15 +178,8 @@ std::string ChartTile57::cache_path(const std::string& cell_path, uint8_t maxz) 
     char ph[12], kh[20];
     std::snprintf(ph, sizeof ph, "%08zx", std::hash<std::string>{}(cell_path) & 0xffffffffu);
     std::snprintf(kh, sizeof kh, "%016zx", std::hash<std::string>{}(key));
-    std::string prefix = fs::path(cell_path).stem().string() + "-" + ph + "-";
-    std::string current = prefix + kh + ".pmtiles";
-
-    // Sweep this cell's stale bakes (same path prefix, different key).
-    for (const auto& e : fs::directory_iterator(dir, ec)) {
-        std::string fn = e.path().filename().string();
-        if (fn.rfind(prefix, 0) == 0 && fn != current) fs::remove(e.path(), ec);
-    }
-    return (dir / current).string();
+    std::string name = fs::path(cell_path).stem().string() + "-" + ph + "-" + kh + ".pmtiles";
+    return (dir / name).string();
 }
 
 int ChartTile57::Init(const wxString& full_path, int init_flags) {
@@ -227,6 +220,23 @@ int ChartTile57::Init(const wxString& full_path, int init_flags) {
     apply_info(h, info);
     tile57_chart_close(h);
 
+    // Native zoom + cache path. Cap the bake at the cell's NATIVE zoom (from the
+    // CSCL): baking finer overzooms the data and the tile count (hence bake time) blows
+    // up (a 1:80k coastal cell is ~11s to native z13, ~34s to z14); the GL renderer
+    // overzooms native tiles past that, so nothing is lost.
+    bake_path_ = path;
+    int zn = info.native_scale > 0
+                 ? (int)std::lround(std::log2(559082264.0 / (double)info.native_scale))
+                 : 14;
+    zn = std::max(4, std::min(zn, 16));
+    bake_full_max_ = (uint8_t)zn;
+    bake_quick_max_ = (uint8_t)std::max(5, zn - 3);
+    cache_file_ = cache_path(path, bake_full_max_);
+
+    // Pre-bake EVERY cell in the background (this runs during the DB scan too) so a
+    // cell is cached before it is ever viewed — no per-cell stall while navigating.
+    t57::BakeManager::instance().enqueue(path, bake_full_max_, cache_file_);
+
     wxLogMessage("tile57 Init: %s bounds[W%.5f S%.5f E%.5f N%.5f] zoom[%d..%d] "
                  "scale=1:%d flags=%d", m_FullPath.c_str(), info.west, info.south,
                  info.east, info.north, (int)info.min_zoom, (int)info.max_zoom,
@@ -238,20 +248,6 @@ int ChartTile57::Init(const wxString& full_path, int init_flags) {
         m_bReadyToRender = true;
         return PI_INIT_OK;
     }
-
-    // Full init: bake the tiles on a background thread (progressive — a coarse band
-    // for first paint, then up to the cell's NATIVE zoom). We cap at the native zoom
-    // because baking finer overzooms the data and the tile count (hence bake time)
-    // blows up (e.g. a 1:80k coastal cell: ~11s to native z13, ~34s to z14); the GL
-    // renderer already overzooms native tiles past that, so nothing is lost.
-    bake_path_ = path;
-    int zn = info.native_scale > 0
-                 ? (int)std::lround(std::log2(559082264.0 / (double)info.native_scale))
-                 : 14;
-    zn = std::max(4, std::min(zn, 16));
-    bake_full_max_ = (uint8_t)zn;
-    bake_quick_max_ = (uint8_t)std::max(5, zn - 3);
-    cache_file_ = cache_path(path, bake_full_max_);
 
     // Cache hit: the full bake already lives on disk — open it directly (fast) and
     // render straight away, no background bake.
@@ -270,6 +266,7 @@ int ChartTile57::Init(const wxString& full_path, int init_flags) {
     canvas_ = GetOCPNCanvasWindow();
     ready_.store(false, std::memory_order_release);
     cancel_.store(false, std::memory_order_release);
+    loading_.store(true, std::memory_order_release);   // show the loader over this cell
     m_bReadyToRender = false;
     start_bake();
     return PI_INIT_OK;
@@ -286,21 +283,11 @@ void ChartTile57::start_bake() {
         if (cancel_.load(std::memory_order_acquire)) { if (ov) tile57_chart_close(ov); return; }
         if (ov) publish(ov);
 
-        // Full band -> bytes -> PERSIST to the disk cache (atomic tmp+rename) -> open
-        // the written bundle, so the next run/restart is a cache hit.
+        // Full band -> the shared bake manager persists it to the disk cache
+        // (coordinated so the background sweep can't also bake this cell), then open
+        // the written bundle so the next run/restart is a cache hit.
         if (cancel_.load(std::memory_order_acquire)) return;
-        uint8_t* bytes = nullptr;
-        size_t len = 0;
-        if (tile57_bake_cell_bytes(bake_path_.c_str(), 0, bake_full_max_, &bytes, &len) != 1)
-            return;
-        std::string tmp = cache_file_ + ".tmp";
-        { std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-          f.write(reinterpret_cast<const char*>(bytes), (std::streamsize)len); }
-        std::error_code ec;
-        std::filesystem::rename(tmp, cache_file_, ec);
-        tile57_free(bytes, len);
-        if (ec) std::filesystem::remove(tmp, ec);   // write failed -> leave no partial
-
+        if (!t57::BakeManager::instance().bake_now(bake_path_, bake_full_max_, cache_file_)) return;
         if (cancel_.load(std::memory_order_acquire)) return;
         tile57_chart* full = tile57_chart_open_pmtiles(cache_file_.c_str());
         if (cancel_.load(std::memory_order_acquire)) { if (full) tile57_chart_close(full); return; }
@@ -319,8 +306,10 @@ void ChartTile57::publish(tile57_chart* c) {
 
 // Render thread: adopt a freshly baked chart if one is waiting (sole owner of chart_).
 void ChartTile57::adopt_pending() {
-    if (tile57_chart* c = pending_chart_.exchange(nullptr, std::memory_order_acq_rel))
+    if (tile57_chart* c = pending_chart_.exchange(nullptr, std::memory_order_acq_rel)) {
         renderer_.set_chart(c);
+        loading_.store(false, std::memory_order_release);   // a band landed -> loader off
+    }
 }
 
 void ChartTile57::SetColorScheme(int cs, bool /*bApplyImmediate*/) {
@@ -452,8 +441,8 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
                              bool stencil_clip) {
     if (!vp.bValid) return false;
     // Adopt a freshly baked chart if the background thread has one waiting (main-thread
-    // owner of chart_). Until the first band lands there's nothing to draw yet — report
-    // success (a blank patch) so OpenCPN doesn't treat it as a failed render.
+    // owner of chart_). Until the first band lands, draw nothing here — the plugin's GL
+    // overlay paints the animated 8-bit loader over this cell's bbox (loading_extent).
     adopt_pending();
     if (!renderer_.has_chart()) return true;
     if (!renderer_.ensure_gl()) return false;
