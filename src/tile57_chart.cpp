@@ -535,17 +535,20 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
         (csf > 1.0 && fbw == (uint32_t)std::lround(vp.pix_width * csf)) ? csf : 1.0;
     double zoom = zoom_for_ppm(ppm);   // geographic (un-bumped)
     last_zoom_ = zoom;   // remembered for the object-query pick tolerance / SCAMIN
-    // SCAMIN cull bias: symbols/text are enlarged on HiDPI (size_scale ×= csf), so drop
-    // them out log2(csf) mercator levels earlier to keep decluttering while zoomed out.
-    // Keyed off csf — the SAME factor that enlarges them — NOT device_scale, which is 1.0
-    // here (OpenCPN hands a physical-px ViewPort) and left the old compensation inert.
+    // SCAMIN cull bias: symbols/text are enlarged on HiDPI by the FULL size_scale (the
+    // physical px/mm chain AND the ×csf nudge), so drop features out log2(size_scale)
+    // mercator levels earlier — the SCAMIN thresholds are calibrated at size_scale=1, so
+    // the correct compensation is the actual on-screen enlargement, size_scale (NOT csf,
+    // which only covered part of it and under-culled -> the "SCAMIN isn't culling enough"
+    // clustering). NOTE: this only thins features that HAVE a SCAMIN; undecluttered
+    // soundings + labels need the dep's declutter path (that is a separate fix).
     // TILE57_DECLUTTER=<levels> overrides: 0 = match native (no compensation), higher = more.
     static const double declutter_override = [] {
         const char* e = std::getenv("TILE57_DECLUTTER");
-        return e ? std::atof(e) : -1.0;   // <0 sentinel: use the csf-derived default
+        return e ? std::atof(e) : -1.0;   // <0 sentinel: use the size_scale-derived default
     }();
     double cull_bias = declutter_override >= 0.0 ? declutter_override
-                                                 : std::log2(std::max(1.0, csf));
+                                                 : std::log2(std::max(1.0, mariner_.size_scale));
     // TILE57_DEBUG: one line per zoom step exposing the HiDPI coupling — cull_zoom is what
     // the SCAMIN shader test uses (show if cull_zoom >= feature threshold). gate = fbw vs
     // pix_width*csf shows why device_scale resolves to 1 (physical-px ViewPort).
