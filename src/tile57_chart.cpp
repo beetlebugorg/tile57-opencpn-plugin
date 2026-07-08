@@ -47,8 +47,13 @@ static double size_cal_factor() {
 double display_size_scale() {
     double mm = PlugInGetDisplaySizeMM();
     int sw = wxGetDisplaySize().GetWidth();
-    if (mm < 1.0 || sw <= 0) return size_cal_factor();
-    double s = (sw / mm) / kTile57RefPxPerMm * size_cal_factor();
+    double csf = OCPN_GetDisplayContentScaleFactor();
+    if (!(csf > 0.5 && csf < 6.0)) csf = 1.0;
+    if (mm < 1.0 || sw <= 0) return csf * size_cal_factor();
+    // Enlarge symbols/text by the content scale (bigger on a HiDPI display). The
+    // matching cull-zoom reduction (renderer: cull_zoom = zoom - log2(device_scale))
+    // makes the extra size drop features out earlier so it doesn't over-crowd.
+    double s = (sw / mm) / kTile57RefPxPerMm * csf * size_cal_factor();
     return (s > 0.1 && s < 12.0) ? s : 1.0;
 }
 // Pixels per metre of a nominal 96-DPI display; turns a ground resolution into

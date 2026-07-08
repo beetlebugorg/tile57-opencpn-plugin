@@ -905,6 +905,10 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     double scale_px = 256.0 * std::pow(2.0, zoom) * device_scale;   // px per world[0,1]
     double ox = (ref_wx_ - vwx) * scale_px + w * 0.5;
     double oy = (ref_wy_ - vwy) * scale_px + h * 0.5;
+    // SCAMIN cull zoom: symbols/text are enlarged by device_scale (content scale), so
+    // pull the cull zoom DOWN by log2(device_scale) — bigger symbols drop out one
+    // (mercator) level earlier, keeping decluttering while zoomed out.
+    float cull_zoom = (float)(zoom - std::log2(std::max(1.0, device_scale)));
 
     (void)stencil_clip;
     // Render the scene into the SS FBO (at kSS× res), then composite it back
@@ -939,7 +943,7 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     glUniform2fv(u_origin_, 1, origin);
     float vp[2] = { (float)w, (float)h };
     glUniform2fv(u_vp_, 1, vp);
-    glUniform1f(u_zoom_, (float)zoom);
+    glUniform1f(u_zoom_, cull_zoom);
 
     if (pass != Pass::kText) {
         draw_range(vbo_area_, n_area_);
@@ -948,7 +952,7 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
             glUniform1f(pu_scale_, (float)scale_px);
             glUniform2fv(pu_origin_, 1, origin);
             glUniform2fv(pu_vp_, 1, vp);
-            glUniform1f(pu_zoom_, (float)zoom);
+            glUniform1f(pu_zoom_, cull_zoom);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, g_atlas.tex);
             glUniform1i(pu_atlas_, 0);
@@ -974,7 +978,7 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
             glUniform1f(su_scale_, (float)scale_px);
             glUniform2fv(su_origin_, 1, origin);
             glUniform2fv(su_vp_, 1, vp);
-            glUniform1f(su_zoom_, (float)zoom);
+            glUniform1f(su_zoom_, cull_zoom);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, g_atlas.tex);
             glUniform1i(su_atlas_, 0);
@@ -1001,7 +1005,7 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
             glUniform1f(gu_scale_, (float)scale_px);
             glUniform2fv(gu_origin_, 1, origin);
             glUniform2fv(gu_vp_, 1, vp);
-            glUniform1f(gu_zoom_, (float)zoom);
+            glUniform1f(gu_zoom_, cull_zoom);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, g_glyph.tex);
             glUniform1i(gu_atlas_, 0);
