@@ -48,7 +48,6 @@ private:
 
     // --- widgets ---
     wxDirPickerCtrl* encPicker_ = nullptr;
-    wxDirPickerCtrl* destPicker_ = nullptr;
     wxChoice*        detailChoice_ = nullptr;   // native / native-1 / native-2 zoom cap
     wxButton*        buildBtn_ = nullptr;
     wxButton*        rebuildBtn_ = nullptr;      // force re-bake (ignore existing outputs)
@@ -59,7 +58,9 @@ private:
     wxTimer          timer_;
 
     // --- bake state (shared with workers) ---
-    std::atomic<int>  total_{0}, done_{0}, failed_{0};
+    // done_ = cells processed (incl. skipped already-baked); baked_ = cells actually
+    // baked THIS run (drives the rate/ETA so a resume's instant skips don't skew it).
+    std::atomic<int>  total_{0}, done_{0}, baked_{0}, failed_{0};
     std::atomic<bool> cancel_{false}, running_{false}, finished_{false};
     std::mutex        status_mtx_;
     std::string       current_cell_;

@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 
@@ -48,21 +49,28 @@ wxString ConfigPath() {
                       _T("tile57_pi.ini")).GetFullPath();
 }
 
-void LoadPaths(wxString& enc, wxString& dest, int& detail) {
+// Baked charts always land in a FIXED XDG-cache dir (no picker) — the plugin reads its
+// OWN *.pmtiles from here (never the raw .000), which is the whole "load tiles only" win.
+std::string FixedDest() {
+    const char* xdg = std::getenv("XDG_CACHE_HOME");
+    const char* home = std::getenv("HOME");
+    fs::path base = (xdg && *xdg) ? fs::path(xdg) : fs::path(home ? home : "/tmp") / ".cache";
+    return (base / "tile57" / "charts").string();
+}
+
+void LoadPaths(wxString& enc, int& detail) {
     wxFileConfig cfg(wxEmptyString, wxEmptyString, ConfigPath(), wxEmptyString,
                      wxCONFIG_USE_LOCAL_FILE);
     cfg.SetPath(_T("/tile57"));
     cfg.Read(_T("EncSource"), &enc, wxEmptyString);
-    cfg.Read(_T("Dest"), &dest, wxEmptyString);
     cfg.Read(_T("Detail"), &detail, 1);
 }
 
-void SavePaths(const wxString& enc, const wxString& dest, int detail) {
+void SavePaths(const wxString& enc, int detail) {
     wxFileConfig cfg(wxEmptyString, wxEmptyString, ConfigPath(), wxEmptyString,
                      wxCONFIG_USE_LOCAL_FILE);
     cfg.SetPath(_T("/tile57"));
     cfg.Write(_T("EncSource"), enc);
-    cfg.Write(_T("Dest"), dest);
     cfg.Write(_T("Detail"), detail);
     cfg.Flush();
 }
@@ -110,14 +118,6 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     row(encPicker_);
 
     top->AddSpacer(16);
-    label(_T("Destination folder (baked charts):"));
-    destPicker_ = new wxDirPickerCtrl(this, wxID_ANY, wxEmptyString,
-                                      _T("Select destination folder"),
-                                      wxDefaultPosition, wxDefaultSize,
-                                      wxDIRP_USE_TEXTCTRL);
-    row(destPicker_);
-
-    top->AddSpacer(16);
     label(_T("Detail (max zoom vs bake time):"));
     detailChoice_ = new wxChoice(this, wxID_ANY);
     // The GL renderer overzooms native tiles, so a level below native is barely
@@ -127,6 +127,11 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     detailChoice_->Append(_T("Native −2 (fastest — ~3× faster)"));
     detailChoice_->SetSelection(1);
     row(detailChoice_);
+
+    top->AddSpacer(16);
+    row(new wxStaticText(this, wxID_ANY,
+                         wxString::Format(_T("Output: %s"),
+                                          wxString::FromUTF8(FixedDest().c_str()))));
 
     top->AddSpacer(24);
     gauge_ = new wxGauge(this, wxID_ANY, 100);
@@ -157,13 +162,12 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     SetSize(wxSize(600, GetSize().GetHeight()));   // widen for readable paths
     SetMinSize(GetSize());
 
-    // Restore persisted paths.
+    // Restore persisted settings.
     wxLogMessage("tile57: BuildChartsDialog loading config");
-    wxString enc, dest;
+    wxString enc;
     int detail = 1;
-    LoadPaths(enc, dest, detail);
+    LoadPaths(enc, detail);
     if (!enc.IsEmpty()) encPicker_->SetPath(enc);
-    if (!dest.IsEmpty()) destPicker_->SetPath(dest);
     if (detail >= 0 && detail <= 2) detailChoice_->SetSelection(detail);
 
     buildBtn_->Bind(wxEVT_BUTTON, &BuildChartsDialog::OnBuild, this);
@@ -191,7 +195,6 @@ void BuildChartsDialog::SetRunningUI(bool running) {
     rebuildBtn_->Enable(!running);
     cancelBtn_->Enable(running);
     encPicker_->Enable(!running);
-    destPicker_->Enable(!running);
     detailChoice_->Enable(!running);
 }
 
@@ -199,26 +202,22 @@ void BuildChartsDialog::StartBuild(bool force) {
     if (running_.load()) return;
 
     const std::string enc = std::string(encPicker_->GetPath().mb_str());
-    const std::string dest = std::string(destPicker_->GetPath().mb_str());
+    const std::string dest = FixedDest();   // always the fixed XDG-cache charts dir
 
     std::error_code ec;
     if (enc.empty() || !fs::is_directory(enc, ec)) {
         status_->SetLabel(_T("ENC source folder does not exist"));
         return;
     }
-    if (dest.empty()) {
-        status_->SetLabel(_T("Pick a destination folder"));
-        return;
-    }
     fs::create_directories(dest, ec);
     if (ec || !fs::is_directory(dest, ec)) {
-        status_->SetLabel(_T("Destination folder is not creatable"));
+        status_->SetLabel(_T("Cannot create the output cache folder"));
         return;
     }
 
     const int detail = detailChoice_->GetSelection();
     zoom_reduce_.store(detail >= 0 ? detail : 1);
-    SavePaths(encPicker_->GetPath(), destPicker_->GetPath(), zoom_reduce_.load());
+    SavePaths(encPicker_->GetPath(), zoom_reduce_.load());
 
     // Enumerate .000 cells (case-insensitive) recursively under enc.
     std::vector<std::string> cells;
@@ -240,6 +239,7 @@ void BuildChartsDialog::StartBuild(bool force) {
     force_.store(force);
     total_.store((int)cells.size());
     done_.store(0);
+    baked_.store(0);
     failed_.store(0);
     cancel_.store(false);
     finished_.store(false);
@@ -331,6 +331,7 @@ void BuildChartsDialog::StartWorkers(std::vector<std::string> cells) {
                     if (bytes) tile57_free(bytes, len);
                     failed_.fetch_add(1);
                 }
+                baked_.fetch_add(1);   // actually baked this run (drives the rate)
                 done_.fetch_add(1);
             }
         };
@@ -360,9 +361,12 @@ void BuildChartsDialog::OnTimer(wxTimerEvent&) {
                                        force_.load() ? _T("Rebuilding") : _T("Baking"),
                                        wxString::FromUTF8(cur.c_str()), done, total));
 
+    // Rate/ETA count ONLY cells actually baked this run (baked_), not the instant skips
+    // of a resume — otherwise hundreds of near-zero-time skips inflate cells/s wildly.
+    const int baked = baked_.load();
     const double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time_).count();
-    const double rate = elapsed > 0.3 ? done / elapsed : 0.0;             // cells/s
+    const double rate = (baked > 0 && elapsed > 0.3) ? baked / elapsed : 0.0;   // baked/s
     const double eta = rate > 1e-6 ? (total - done) / rate : -1.0;
     stats_->SetLabel(wxString::Format(_T("elapsed %s   ·   %.1f cells/s   ·   ETA %s"),
                                       FmtDur(elapsed), rate, FmtDur(eta)));
@@ -380,9 +384,10 @@ void BuildChartsDialog::Finish() {
     const int total = total_.load();
     const int failed = failed_.load();
     const int done = done_.load();
+    const int baked = baked_.load();
     const double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time_).count();
-    const double rate = elapsed > 0.1 ? done / elapsed : 0.0;
+    const double rate = (baked > 0 && elapsed > 0.1) ? baked / elapsed : 0.0;
     if (cancel_.load()) {
         status_->SetLabel(_T("Cancelled"));
         stats_->SetLabel(wxString::Format(_T("stopped after %s · %d/%d cells"),
@@ -390,17 +395,20 @@ void BuildChartsDialog::Finish() {
         return;
     }
 
-    // Main thread: register the destination as a chart directory and rescan.
+    // Main thread: register the fixed cache dir as a chart directory and rescan.
     wxString destWx = wxString::FromUTF8(dest_.c_str());
     AddChartDirectory(destWx);
     ForceChartDBUpdate();
 
     const int added = total - failed;
-    wxString msg = wxString::Format(_T("Done — added %d charts"), added);
+    wxString msg = wxString::Format(_T("Done — %d charts"), added);
     if (failed > 0) msg += wxString::Format(_T(" (%d failed)"), failed);
     status_->SetLabel(msg);
-    stats_->SetLabel(wxString::Format(_T("built %d cells in %s   ·   %.1f cells/s avg"),
-                                      total - failed, FmtDur(elapsed), rate));
+    const int skipped = total - baked;
+    wxString st = wxString::Format(_T("baked %d cells in %s   ·   %.1f cells/s avg"),
+                                   baked - failed, FmtDur(elapsed), rate);
+    if (skipped > 0) st += wxString::Format(_T("   ·   %d already cached"), skipped);
+    stats_->SetLabel(st);
 }
 
 void BuildChartsDialog::OnCancel(wxCommandEvent&) {

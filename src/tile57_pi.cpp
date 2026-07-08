@@ -171,12 +171,12 @@ public:
                                                         "rendered on the GPU. Add the folder holding a baked bundle's "
                                                         "chart.pmtiles as a chart directory. EXPERIMENTAL / NOT FOR NAVIGATION."); }
 
-    // Register both chart classes so OpenCPN scans baked bundles (*.pmtiles) and live
-    // cells (*.t57) — one dynamic class per extension (see the ChartTile57 subclasses).
+    // pmtiles-ONLY: OpenCPN scans our pre-baked *.pmtiles (opened directly, fast) and
+    // never the raw *.000 cells (the *.t57 live-cell class is deliberately NOT registered
+    // so nothing triggers a slow per-view bake). Prepare charts via the Build Charts panel.
     wxArrayString GetDynamicChartClassNameArray() override {
         wxArrayString a;
         a.Add(_T("ChartTile57Pmtiles"));
-        a.Add(_T("ChartTile57Cell"));
         return a;
     }
 
