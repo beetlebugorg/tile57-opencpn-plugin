@@ -32,10 +32,14 @@ public:
     void set_chart(tile57_chart* c);
     bool ensure_gl();
     // Portray (if needed) for this view, then draw into the current framebuffer.
-    // lon/lat = view centre, zoom = fractional web-mercator zoom, w/h = the GL
-    // viewport, m = mariner. `pass` selects base geometry / text / both.
+    // lon/lat = view centre, zoom = the GEOGRAPHIC (chart-scale) web-mercator zoom —
+    // used for tile detail + the SCAMIN cull, so those track the physical chart scale
+    // regardless of display density. w/h = the GL viewport (physical px). device_scale
+    // = the framebuffer/logical px ratio (contentScale on HiDPI): the projection
+    // scales by it so geometry fills the physical framebuffer while SCAMIN does not.
     void render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
-                const tile57_mariner& m, Pass pass, bool stencil_clip);
+                const tile57_mariner& m, Pass pass, bool stencil_clip,
+                double device_scale = 1.0);
     void shutdown();
     bool has_chart() const { return chart_ != nullptr; }
     bool get_info(tile57_chart_info& out) const;

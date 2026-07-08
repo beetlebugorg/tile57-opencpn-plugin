@@ -33,17 +33,22 @@ constexpr double kPi = 3.14159265358979323846;
 // derives its own symbol scale from the same display width. Without this, dense
 // modern displays render everything at a fraction of size ("2x density").
 constexpr double kTile57RefPxPerMm = 2.8346;
+// Optional manual calibration: TILE57_SIZE=<factor> multiplies the symbol/text scale,
+// so if the CHKSYM01 square (TILE57_CALIB=1) doesn't measure 5mm you can dial it in
+// without a rebuild (e.g. measures 6.5mm -> TILE57_SIZE=0.77).
+static double size_cal_factor() {
+    static double f = [] {
+        const char* e = std::getenv("TILE57_SIZE");
+        double v = e ? std::atof(e) : 1.0;
+        return (v > 0.1 && v < 10.0) ? v : 1.0;
+    }();
+    return f;
+}
 double display_size_scale() {
     double mm = PlugInGetDisplaySizeMM();
     int sw = wxGetDisplaySize().GetWidth();
-    if (mm < 1.0 || sw <= 0) return 1.0;
-    // We render into the PHYSICAL framebuffer (glViewport = contentScale * logical px),
-    // and symbols are sized in those pixels. wxGetDisplaySize is LOGICAL px on a HiDPI
-    // display, so without the content-scale factor a 5mm symbol (CHKSYM01) comes out at
-    // ~2.5mm on a 2x screen. Fold in contentScale to get true physical px/mm.
-    double csf = OCPN_GetDisplayContentScaleFactor();
-    if (!(csf > 0.5 && csf < 6.0)) csf = 1.0;
-    double s = (sw * csf / mm) / kTile57RefPxPerMm;
+    if (mm < 1.0 || sw <= 0) return size_cal_factor();
+    double s = (sw / mm) / kTile57RefPxPerMm * size_cal_factor();
     return (s > 0.1 && s < 12.0) ? s : 1.0;
 }
 // Pixels per metre of a nominal 96-DPI display; turns a ground resolution into
@@ -514,10 +519,16 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     // == contentScale * pix_width), correct ppm by that factor.
     double ppm = (vp.view_scale_ppm > 0) ? vp.view_scale_ppm : 0.01;
     double csf = OCPN_GetDisplayContentScaleFactor();
-    if (csf > 1.0 && fbw == (uint32_t)std::lround(vp.pix_width * csf)) ppm *= csf;
-    double zoom = zoom_for_ppm(ppm);
+    // When OpenCPN hands a LOGICAL-unit ViewPort against a HiDPI framebuffer, the raw
+    // ppm is logical. Instead of bumping the zoom by contentScale (which also shifts
+    // tile detail + SCAMIN, over-crowding when zoomed out on a 2x display), keep the
+    // zoom GEOGRAPHIC and pass contentScale as device_scale so ONLY the projection
+    // scales up to fill the physical framebuffer.
+    double device_scale =
+        (csf > 1.0 && fbw == (uint32_t)std::lround(vp.pix_width * csf)) ? csf : 1.0;
+    double zoom = zoom_for_ppm(ppm);   // geographic (un-bumped)
     last_zoom_ = zoom;   // remembered for the object-query pick tolerance / SCAMIN
-    renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip);
+    renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip, device_scale);
     if (pass != t57::ChartRenderer::Pass::kText) draw_calibration();
     return true;
 }

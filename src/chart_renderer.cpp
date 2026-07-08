@@ -846,7 +846,8 @@ void ChartRenderer::draw_range(uint32_t vbo, uint32_t count) {
 }
 
 void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
-                           const tile57_mariner& m, Pass pass, bool stencil_clip) {
+                           const tile57_mariner& m, Pass pass, bool stencil_clip,
+                           double device_scale) {
     if (!chart_ || !ensure_gl()) return;
     if (!have_range_) {
         tile57_chart_info info{};
@@ -880,7 +881,7 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         double cwx, cwy, vwx, vwy;
         lonlat_to_world(cam_lon_, cam_lat_, cwx, cwy);
         lonlat_to_world(lon, lat, vwx, vwy);
-        double scale_px = 256.0 * std::pow(2.0, cam_zoom_);
+        double scale_px = 256.0 * std::pow(2.0, cam_zoom_) * device_scale;
         double dx = std::fabs(vwx - cwx) * scale_px, dy = std::fabs(vwy - cwy) * scale_px;
         if (dx + w * 0.5 > cam_w_ * 0.5 || dy + h * 0.5 > cam_h_ * 0.5) need = true;
     }
@@ -898,7 +899,10 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     // Per-frame transform: screen = aWorld*uScale + uOrigin + aPost.
     double vwx, vwy;
     lonlat_to_world(lon, lat, vwx, vwy);
-    double scale_px = 256.0 * std::pow(2.0, zoom);   // px per world[0,1] unit
+    // Projection at the PHYSICAL framebuffer: geographic zoom scaled by device_scale
+    // (so e.g. a 2x HiDPI framebuffer gets 2x px per world unit, while zoom — and thus
+    // the SCAMIN cull below — stays geographic).
+    double scale_px = 256.0 * std::pow(2.0, zoom) * device_scale;   // px per world[0,1]
     double ox = (ref_wx_ - vwx) * scale_px + w * 0.5;
     double oy = (ref_wy_ - vwy) * scale_px + h * 0.5;
 

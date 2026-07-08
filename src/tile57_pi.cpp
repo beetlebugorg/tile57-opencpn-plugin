@@ -12,11 +12,12 @@
 #include "bake_manager.h"
 #include "gl.h"
 #include <chrono>
+#include <cmath>
 #include <wx/wx.h>
 #include <wx/html/htmlwin.h>
 
 // While cells bake in the background, force periodic canvas redraws so the pre-bake
-// progress bar + the per-cell 8-bit loader animate (a background bake doesn't itself
+// progress bar + the per-cell loading hint animate (a background bake doesn't itself
 // trigger a redraw). Idle (no baking) => a cheap check, no redraw.
 class BakeRefreshTimer : public wxTimer {
 public:
@@ -51,7 +52,8 @@ public:
     }
 
     // Two unobtrusive indicators, both fixed-function so they compose with OpenCPN's GL:
-    //   * an animated 8-bit "still baking" loader over each cell that has no tiles yet;
+    //   * a subtle "still baking" hint (soft veil + pulsing dots) over each cell with
+    //     no tiles yet;
     //   * a slim pre-bake progress bar bottom-left while the background sweep runs.
     bool RenderGLOverlay(wxGLContext* /*ctx*/, PlugIn_ViewPort* vp) override {
         if (!vp) return false;
@@ -81,18 +83,13 @@ public:
             glEnd();
         };
 
-        // --- 8-bit loader over each baking cell's on-screen bbox (opaque, scrolling) ---
+        // --- subtle "still baking" hint over each loading cell's bbox: a soft static
+        //     veil + three quietly pulsing dots at the centre (reads as "loading",
+        //     not a replacement for the map) ---
         if (any_loading) {
-            static const float pal[][3] = {
-                {0.05f, 0.07f, 0.32f}, {0.09f, 0.18f, 0.58f}, {0.15f, 0.50f, 0.85f},
-                {0.45f, 0.82f, 1.00f}, {0.88f, 0.96f, 1.00f}, {0.15f, 0.50f, 0.85f},
-            };
-            const int nc = 6;
-            const float barH = 10.f;
             const double t = std::chrono::duration<double>(
                                  std::chrono::steady_clock::now().time_since_epoch()).count();
-            const int off = (int)(t * 13.0);   // scroll speed
-            glDisable(GL_BLEND);
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             for (ChartTile57* c : ChartTile57::instances()) {
                 double bw, bs, be, bn;
                 if (!c || !c->loading_extent(bw, bs, be, bn)) continue;
@@ -104,11 +101,15 @@ public:
                 float x1 = std::min(W, (float)std::max(nw.x, se.x));
                 float y1 = std::min(H, (float)std::max(nw.y, se.y));
                 if (x1 <= x0 || y1 <= y0) continue;   // off-screen
-                int row = 0;
-                for (float y = y0; y < y1; y += barH, ++row) {
-                    const int ci = ((row + off) % nc + nc) % nc;
-                    glColor3f(pal[ci][0], pal[ci][1], pal[ci][2]);
-                    rect(x0, y, x1 - x0, std::min(y + barH, y1) - y);
+                glColor4f(0.55f, 0.60f, 0.66f, 0.14f);   // soft veil
+                rect(x0, y0, x1 - x0, y1 - y0);
+                // three dots pulsing in sequence at the cell centre
+                const float cx = 0.5f * (x0 + x1), cy = 0.5f * (y0 + y1);
+                const float dr = 3.f, gap = 11.f;
+                for (int i = 0; i < 3; ++i) {
+                    float ph = 0.5f + 0.5f * (float)std::sin(t * 3.0 - i * 0.8);
+                    glColor4f(0.93f, 0.95f, 0.98f, 0.18f + 0.55f * ph);
+                    rect(cx + (i - 1) * gap - dr, cy - dr, 2 * dr, 2 * dr);
                 }
             }
         }
