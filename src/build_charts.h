@@ -22,6 +22,7 @@ class wxDirPickerCtrl;
 class wxButton;
 class wxGauge;
 class wxStaticText;
+class wxChoice;
 
 class BuildChartsDialog : public wxDialog {
 public:
@@ -44,6 +45,7 @@ private:
     // --- widgets ---
     wxDirPickerCtrl* encPicker_ = nullptr;
     wxDirPickerCtrl* destPicker_ = nullptr;
+    wxChoice*        detailChoice_ = nullptr;   // native / native-1 / native-2 zoom cap
     wxButton*        buildBtn_ = nullptr;
     wxButton*        cancelBtn_ = nullptr;
     wxGauge*         gauge_ = nullptr;
@@ -56,6 +58,7 @@ private:
     std::mutex        status_mtx_;
     std::string       current_cell_;
     std::string       dest_;
+    std::atomic<int>  zoom_reduce_{1};   // levels below native to bake (0=native,1,2)
 
     // Work queue + worker pool, driven by a single coordinator thread.
     std::deque<std::string>  queue_;

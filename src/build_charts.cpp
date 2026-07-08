@@ -17,6 +17,7 @@
 
 #include <wx/filepicker.h>
 #include <wx/button.h>
+#include <wx/choice.h>
 #include <wx/gauge.h>
 #include <wx/stattext.h>
 #include <wx/sizer.h>
@@ -46,20 +47,22 @@ wxString ConfigPath() {
                       _T("tile57_pi.ini")).GetFullPath();
 }
 
-void LoadPaths(wxString& enc, wxString& dest) {
+void LoadPaths(wxString& enc, wxString& dest, int& detail) {
     wxFileConfig cfg(wxEmptyString, wxEmptyString, ConfigPath(), wxEmptyString,
                      wxCONFIG_USE_LOCAL_FILE);
     cfg.SetPath(_T("/tile57"));
     cfg.Read(_T("EncSource"), &enc, wxEmptyString);
     cfg.Read(_T("Dest"), &dest, wxEmptyString);
+    cfg.Read(_T("Detail"), &detail, 1);
 }
 
-void SavePaths(const wxString& enc, const wxString& dest) {
+void SavePaths(const wxString& enc, const wxString& dest, int detail) {
     wxFileConfig cfg(wxEmptyString, wxEmptyString, ConfigPath(), wxEmptyString,
                      wxCONFIG_USE_LOCAL_FILE);
     cfg.SetPath(_T("/tile57"));
     cfg.Write(_T("EncSource"), enc);
     cfg.Write(_T("Dest"), dest);
+    cfg.Write(_T("Detail"), detail);
     cfg.Flush();
 }
 
@@ -97,6 +100,18 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
                                       wxDIRP_USE_TEXTCTRL);
     top->Add(destPicker_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 4);
 
+    top->AddSpacer(10);
+    top->Add(new wxStaticText(this, wxID_ANY, _T("Detail (max zoom vs bake time):")),
+             0, wxLEFT | wxRIGHT, B);
+    detailChoice_ = new wxChoice(this, wxID_ANY);
+    // The GL renderer overzooms native tiles, so a level below native is barely
+    // distinguishable but bakes ~2x faster (measured 1.02s -> 0.59s/cell).
+    detailChoice_->Append(_T("Native (crispest, slowest)"));
+    detailChoice_->Append(_T("Native −1 (recommended — ~2× faster)"));
+    detailChoice_->Append(_T("Native −2 (fastest — ~3× faster)"));
+    detailChoice_->SetSelection(1);
+    top->Add(detailChoice_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 4);
+
     top->AddSpacer(16);
     gauge_ = new wxGauge(this, wxID_ANY, 100);
     top->Add(gauge_, 0, wxEXPAND | wxLEFT | wxRIGHT, B);
@@ -122,9 +137,11 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     // Restore persisted paths.
     wxLogMessage("tile57: BuildChartsDialog loading config");
     wxString enc, dest;
-    LoadPaths(enc, dest);
+    int detail = 1;
+    LoadPaths(enc, dest, detail);
     if (!enc.IsEmpty()) encPicker_->SetPath(enc);
     if (!dest.IsEmpty()) destPicker_->SetPath(dest);
+    if (detail >= 0 && detail <= 2) detailChoice_->SetSelection(detail);
 
     buildBtn_->Bind(wxEVT_BUTTON, &BuildChartsDialog::OnBuild, this);
     cancelBtn_->Bind(wxEVT_BUTTON, &BuildChartsDialog::OnCancel, this);
@@ -160,7 +177,9 @@ void BuildChartsDialog::OnBuild(wxCommandEvent&) {
         return;
     }
 
-    SavePaths(encPicker_->GetPath(), destPicker_->GetPath());
+    const int detail = detailChoice_->GetSelection();
+    zoom_reduce_.store(detail >= 0 ? detail : 1);
+    SavePaths(encPicker_->GetPath(), destPicker_->GetPath(), zoom_reduce_.load());
 
     // Enumerate .000 cells (case-insensitive) recursively under enc.
     std::vector<std::string> cells;
@@ -206,8 +225,12 @@ void BuildChartsDialog::StartWorkers(std::vector<std::string> cells) {
     }
 
     coordinator_ = std::thread([this]() {
-        unsigned n = std::thread::hardware_concurrency();
-        n = n > 2 ? n - 2 : 1;
+        // tile57_bake_cell_bytes is ALREADY internally parallel (~cores threads via
+        // its tile parallelFor). Profiling showed an outer pool beyond ~2 concurrent
+        // cells barely helps (the internal pools contend) while spawning cores×N
+        // threads, so cap the outer fan-out low rather than at hardware_concurrency-2.
+        unsigned hw = std::thread::hardware_concurrency();
+        unsigned n = hw > 2 ? std::min(4u, hw - 2) : 1;
 
         auto worker = [this]() {
             for (;;) {
@@ -242,7 +265,9 @@ void BuildChartsDialog::StartWorkers(std::vector<std::string> cells) {
                 int zn = info.native_scale > 0
                              ? (int)std::lround(std::log2(559082264.0 / (double)info.native_scale))
                              : 14;
-                zn = std::max(4, std::min(zn, 16));
+                // Cap at native, then drop the user's detail levels (the GL renderer
+                // overzooms, so a level below native bakes ~2x faster, barely visible).
+                zn = std::max(4, std::min(zn, 16) - zoom_reduce_.load());
 
                 {
                     std::lock_guard<std::mutex> lk(status_mtx_);
