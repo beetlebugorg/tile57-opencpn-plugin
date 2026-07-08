@@ -7,6 +7,7 @@
 // chart class; the "NOT FOR NAVIGATION" warning (tile57 is experimental) rides
 // in the chart's name and description, where OpenCPN surfaces it.
 #include <cstdint>  // ocpn_plugin.h (api-18) references uint8_t before including it
+#include <cstdlib>  // getenv (startup build/debug marker)
 #include "ocpn_plugin.h"
 #include "tile57_chart.h"
 #include "bake_manager.h"
@@ -33,7 +34,8 @@ public:
     explicit Tile57Plugin(void* pmgr) : opencpn_plugin_118(pmgr) {}
 
     int Init() override {
-        wxLogMessage("tile57_pi: initialised");
+        wxLogMessage("tile57_pi: initialised [build " __DATE__ " " __TIME__ ", TILE57_DEBUG=%s]",
+                     std::getenv("TILE57_DEBUG") ? std::getenv("TILE57_DEBUG") : "(unset)");
         // Populate tile57's process-global read-only registries (S-100 catalogue +
         // linestyles) on this, the main thread, BEFORE any chart spawns a background
         // bake thread — thereafter they're read-only, so concurrent bake/render is

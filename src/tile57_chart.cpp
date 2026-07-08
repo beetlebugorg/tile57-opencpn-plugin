@@ -533,6 +533,20 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
         (csf > 1.0 && fbw == (uint32_t)std::lround(vp.pix_width * csf)) ? csf : 1.0;
     double zoom = zoom_for_ppm(ppm);   // geographic (un-bumped)
     last_zoom_ = zoom;   // remembered for the object-query pick tolerance / SCAMIN
+    // TILE57_DEBUG: one line per zoom step exposing the HiDPI coupling — does the SCAMIN
+    // cull actually engage? device_scale==1 (a physical-unit ViewPort) means cull_zoom==zoom
+    // (no compensation) even though symbols are enlarged by csf. gate = fbw vs pix_width*csf.
+    if (std::getenv("TILE57_DEBUG") && pass != t57::ChartRenderer::Pass::kText) {
+        static double dbg_last = 1e9;
+        if (std::fabs(zoom - dbg_last) > 0.02) {
+            dbg_last = zoom;
+            double cull = zoom - std::log2(std::max(1.0, device_scale));
+            wxLogMessage("tile57 DBG: zoom=%.3f cull_zoom=%.3f dev_scale=%.2f csf=%.2f "
+                         "pixW=%d fbW=%u gate(pixW*csf)=%ld size_scale=%.3f ppm=%.5f",
+                         zoom, cull, device_scale, csf, vp.pix_width, fbw,
+                         std::lround(vp.pix_width * csf), mariner_.size_scale, ppm);
+        }
+    }
     renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip, device_scale);
     if (pass != t57::ChartRenderer::Pass::kText) draw_calibration();
     return true;
