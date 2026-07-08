@@ -167,7 +167,10 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     Bind(wxEVT_CLOSE_WINDOW, &BuildChartsDialog::OnClose, this);
     timer_.SetOwner(this);
     Bind(wxEVT_TIMER, &BuildChartsDialog::OnTimer, this);
-    wxLogMessage("tile57: BuildChartsDialog ctor end");
+    // Size in the log confirms which build is loaded: this (padded) build fits to ~600
+    // wide with a Rebuild All button; an older build reads ~560 or ~520 and no Rebuild.
+    wxLogMessage("tile57: BuildChartsDialog ctor end, size=%dx%d",
+                 GetSize().GetWidth(), GetSize().GetHeight());
 }
 
 BuildChartsDialog::~BuildChartsDialog() {
