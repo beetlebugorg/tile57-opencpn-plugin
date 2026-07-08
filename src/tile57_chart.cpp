@@ -157,7 +157,9 @@ void ChartTile57::apply_info(tile57_chart* h, const tile57_chart_info& info) {
 }
 
 // Bump when the bake format or portrayal changes so stale caches are ignored.
-static constexpr int kBakeVersion = 1;
+// v2: complex linestyles bake as un-tessellated ls_style-tagged runs (re-walked at
+// render, display-scaled) instead of pre-tessellated dash segments + native bricks.
+static constexpr int kBakeVersion = 2;
 
 // <cache>/tile57/cells/<stem>-<pathhash>-<keyhash>.pmtiles. The keyhash covers the
 // cell path, the freshest mtime across the .000 + its .001.. updates, the update
