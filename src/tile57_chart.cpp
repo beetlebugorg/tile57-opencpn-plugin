@@ -533,21 +533,32 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
         (csf > 1.0 && fbw == (uint32_t)std::lround(vp.pix_width * csf)) ? csf : 1.0;
     double zoom = zoom_for_ppm(ppm);   // geographic (un-bumped)
     last_zoom_ = zoom;   // remembered for the object-query pick tolerance / SCAMIN
-    // TILE57_DEBUG: one line per zoom step exposing the HiDPI coupling — does the SCAMIN
-    // cull actually engage? device_scale==1 (a physical-unit ViewPort) means cull_zoom==zoom
-    // (no compensation) even though symbols are enlarged by csf. gate = fbw vs pix_width*csf.
+    // SCAMIN cull bias: symbols/text are enlarged on HiDPI (size_scale ×= csf), so drop
+    // them out log2(csf) mercator levels earlier to keep decluttering while zoomed out.
+    // Keyed off csf — the SAME factor that enlarges them — NOT device_scale, which is 1.0
+    // here (OpenCPN hands a physical-px ViewPort) and left the old compensation inert.
+    // TILE57_DECLUTTER=<levels> overrides: 0 = match native (no compensation), higher = more.
+    static const double declutter_override = [] {
+        const char* e = std::getenv("TILE57_DECLUTTER");
+        return e ? std::atof(e) : -1.0;   // <0 sentinel: use the csf-derived default
+    }();
+    double cull_bias = declutter_override >= 0.0 ? declutter_override
+                                                 : std::log2(std::max(1.0, csf));
+    // TILE57_DEBUG: one line per zoom step exposing the HiDPI coupling — cull_zoom is what
+    // the SCAMIN shader test uses (show if cull_zoom >= feature threshold). gate = fbw vs
+    // pix_width*csf shows why device_scale resolves to 1 (physical-px ViewPort).
     if (std::getenv("TILE57_DEBUG") && pass != t57::ChartRenderer::Pass::kText) {
         static double dbg_last = 1e9;
         if (std::fabs(zoom - dbg_last) > 0.02) {
             dbg_last = zoom;
-            double cull = zoom - std::log2(std::max(1.0, device_scale));
-            wxLogMessage("tile57 DBG: zoom=%.3f cull_zoom=%.3f dev_scale=%.2f csf=%.2f "
-                         "pixW=%d fbW=%u gate(pixW*csf)=%ld size_scale=%.3f ppm=%.5f",
-                         zoom, cull, device_scale, csf, vp.pix_width, fbw,
-                         std::lround(vp.pix_width * csf), mariner_.size_scale, ppm);
+            wxLogMessage("tile57 DBG: zoom=%.3f cull_zoom=%.3f cull_bias=%.2f dev_scale=%.2f "
+                         "csf=%.2f pixW=%d fbW=%u gate(pixW*csf)=%ld size_scale=%.3f ppm=%.5f",
+                         zoom, zoom - cull_bias, cull_bias, device_scale, csf, vp.pix_width,
+                         fbw, std::lround(vp.pix_width * csf), mariner_.size_scale, ppm);
         }
     }
-    renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip, device_scale);
+    renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip,
+                     device_scale, cull_bias);
     if (pass != t57::ChartRenderer::Pass::kText) draw_calibration();
     return true;
 }

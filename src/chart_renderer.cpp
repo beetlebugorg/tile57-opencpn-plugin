@@ -847,7 +847,7 @@ void ChartRenderer::draw_range(uint32_t vbo, uint32_t count) {
 
 void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                            const tile57_mariner& m, Pass pass, bool stencil_clip,
-                           double device_scale) {
+                           double device_scale, double cull_bias) {
     if (!chart_ || !ensure_gl()) return;
     if (!have_range_) {
         tile57_chart_info info{};
@@ -905,10 +905,12 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     double scale_px = 256.0 * std::pow(2.0, zoom) * device_scale;   // px per world[0,1]
     double ox = (ref_wx_ - vwx) * scale_px + w * 0.5;
     double oy = (ref_wy_ - vwy) * scale_px + h * 0.5;
-    // SCAMIN cull zoom: symbols/text are enlarged by device_scale (content scale), so
-    // pull the cull zoom DOWN by log2(device_scale) — bigger symbols drop out one
-    // (mercator) level earlier, keeping decluttering while zoomed out.
-    float cull_zoom = (float)(zoom - std::log2(std::max(1.0, device_scale)));
+    // SCAMIN cull zoom: symbols/text are enlarged (content scale on HiDPI), so pull the
+    // cull zoom DOWN by cull_bias — bigger symbols drop out that many mercator levels
+    // earlier, keeping decluttering while zoomed out. Driven by the SAME content-scale
+    // that enlarges the symbols (NOT the projection's device_scale, which is 1.0 when
+    // OpenCPN hands a physical-px ViewPort — decoupling the cull from the enlargement).
+    float cull_zoom = (float)(zoom - cull_bias);
 
     (void)stencil_clip;
     // Render the scene into the SS FBO (at kSS× res), then composite it back

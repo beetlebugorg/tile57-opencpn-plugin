@@ -37,9 +37,11 @@ public:
     // regardless of display density. w/h = the GL viewport (physical px). device_scale
     // = the framebuffer/logical px ratio (contentScale on HiDPI): the projection
     // scales by it so geometry fills the physical framebuffer while SCAMIN does not.
+    // cull_bias = zoom levels subtracted from the SCAMIN cull zoom: enlarged symbols
+    // (on HiDPI, or via TILE57_DECLUTTER) drop out that many mercator levels earlier.
     void render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                 const tile57_mariner& m, Pass pass, bool stencil_clip,
-                double device_scale = 1.0);
+                double device_scale = 1.0, double cull_bias = 0.0);
     void shutdown();
     bool has_chart() const { return chart_ != nullptr; }
     bool get_info(tile57_chart_info& out) const;
