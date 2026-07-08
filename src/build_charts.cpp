@@ -90,31 +90,35 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
                wxDefaultPosition, wxSize(520, 260),
                wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER) {
     wxLogMessage("tile57: BuildChartsDialog ctor begin");
-    const int B = 18;   // outer margin
-    const int LBL = 3;  // label -> control gap
+    // ONE left/right margin for every row (labels AND inputs) so they align; all
+    // vertical spacing is explicit AddSpacer — the earlier mix of a wide label margin
+    // and a narrow input margin made the inputs run to the edges and read as cramped.
+    const int B = 18;
     auto* top = new wxBoxSizer(wxVERTICAL);
-    top->AddSpacer(B);
+    auto label = [&](const wxString& t) {
+        top->Add(new wxStaticText(this, wxID_ANY, t), 0, wxLEFT | wxRIGHT, B);
+        top->AddSpacer(5);
+    };
+    auto row = [&](wxWindow* w) { top->Add(w, 0, wxEXPAND | wxLEFT | wxRIGHT, B); };
 
-    top->Add(new wxStaticText(this, wxID_ANY, _T("ENC source (ENC_ROOT):")),
-             0, wxLEFT | wxRIGHT, B);
+    top->AddSpacer(B);
+    label(_T("ENC source (ENC_ROOT):"));
     encPicker_ = new wxDirPickerCtrl(this, wxID_ANY, wxEmptyString,
                                      _T("Select ENC source folder"),
                                      wxDefaultPosition, wxDefaultSize,
                                      wxDIRP_USE_TEXTCTRL | wxDIRP_DIR_MUST_EXIST);
-    top->Add(encPicker_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, LBL);
+    row(encPicker_);
 
-    top->AddSpacer(14);
-    top->Add(new wxStaticText(this, wxID_ANY, _T("Destination folder (baked charts):")),
-             0, wxLEFT | wxRIGHT, B);
+    top->AddSpacer(16);
+    label(_T("Destination folder (baked charts):"));
     destPicker_ = new wxDirPickerCtrl(this, wxID_ANY, wxEmptyString,
                                       _T("Select destination folder"),
                                       wxDefaultPosition, wxDefaultSize,
                                       wxDIRP_USE_TEXTCTRL);
-    top->Add(destPicker_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, LBL);
+    row(destPicker_);
 
-    top->AddSpacer(14);
-    top->Add(new wxStaticText(this, wxID_ANY, _T("Detail (max zoom vs bake time):")),
-             0, wxLEFT | wxRIGHT, B);
+    top->AddSpacer(16);
+    label(_T("Detail (max zoom vs bake time):"));
     detailChoice_ = new wxChoice(this, wxID_ANY);
     // The GL renderer overzooms native tiles, so a level below native is barely
     // distinguishable but bakes ~2x faster (measured 1.02s -> 0.59s/cell).
@@ -122,26 +126,28 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     detailChoice_->Append(_T("Native −1 (recommended — ~2× faster)"));
     detailChoice_->Append(_T("Native −2 (fastest — ~3× faster)"));
     detailChoice_->SetSelection(1);
-    top->Add(detailChoice_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, LBL);
+    row(detailChoice_);
 
-    top->AddSpacer(22);
+    top->AddSpacer(24);
     gauge_ = new wxGauge(this, wxID_ANY, 100);
-    top->Add(gauge_, 0, wxEXPAND | wxLEFT | wxRIGHT, B);
+    row(gauge_);
+    top->AddSpacer(10);
     status_ = new wxStaticText(this, wxID_ANY, _T("Idle"));
-    top->Add(status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
+    row(status_);
+    top->AddSpacer(4);
     stats_ = new wxStaticText(this, wxID_ANY, wxEmptyString);
-    top->Add(stats_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 3);
+    row(stats_);
 
-    top->AddSpacer(22);
+    top->AddSpacer(24);
     auto* btns = new wxBoxSizer(wxHORIZONTAL);
     buildBtn_ = new wxButton(this, wxID_ANY, _T("Build Charts"));
     rebuildBtn_ = new wxButton(this, wxID_ANY, _T("Rebuild All"));
     cancelBtn_ = new wxButton(this, wxID_ANY, _T("Cancel"));
     cancelBtn_->Enable(false);
     auto* closeBtn = new wxButton(this, wxID_CLOSE, _T("Close"));
-    btns->Add(buildBtn_, 0, wxRIGHT, 8);
-    btns->Add(rebuildBtn_, 0, wxRIGHT, 8);
-    btns->Add(cancelBtn_, 0, wxRIGHT, 8);
+    btns->Add(buildBtn_, 0, wxRIGHT, 10);
+    btns->Add(rebuildBtn_, 0, wxRIGHT, 10);
+    btns->Add(cancelBtn_, 0, wxRIGHT, 10);
     btns->AddStretchSpacer();
     btns->Add(closeBtn, 0);
     top->Add(btns, 0, wxEXPAND | wxLEFT | wxRIGHT, B);
