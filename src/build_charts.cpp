@@ -27,6 +27,7 @@
 #include <wx/log.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -73,6 +74,15 @@ bool IsDotZeroZeroZero(const fs::path& p) {
     return ext == ".000";
 }
 
+// Seconds -> "M:SS" (or "H:MM:SS" past an hour) for the timing readout.
+wxString FmtDur(double secs) {
+    if (secs < 0 || !std::isfinite(secs)) return _T("—");
+    long s = (long)(secs + 0.5);
+    long h = s / 3600, m = (s % 3600) / 60, sec = s % 60;
+    return h > 0 ? wxString::Format(_T("%ld:%02ld:%02ld"), h, m, sec)
+                 : wxString::Format(_T("%ld:%02ld"), m, sec);
+}
+
 }  // namespace
 
 BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
@@ -80,27 +90,29 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
                wxDefaultPosition, wxSize(520, 260),
                wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER) {
     wxLogMessage("tile57: BuildChartsDialog ctor begin");
-    const int B = 12;   // outer margin
+    const int B = 18;   // outer margin
+    const int LBL = 3;  // label -> control gap
     auto* top = new wxBoxSizer(wxVERTICAL);
+    top->AddSpacer(B);
 
     top->Add(new wxStaticText(this, wxID_ANY, _T("ENC source (ENC_ROOT):")),
-             0, wxLEFT | wxRIGHT | wxTOP, B);
+             0, wxLEFT | wxRIGHT, B);
     encPicker_ = new wxDirPickerCtrl(this, wxID_ANY, wxEmptyString,
                                      _T("Select ENC source folder"),
                                      wxDefaultPosition, wxDefaultSize,
                                      wxDIRP_USE_TEXTCTRL | wxDIRP_DIR_MUST_EXIST);
-    top->Add(encPicker_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 4);
+    top->Add(encPicker_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, LBL);
 
-    top->AddSpacer(10);
+    top->AddSpacer(14);
     top->Add(new wxStaticText(this, wxID_ANY, _T("Destination folder (baked charts):")),
              0, wxLEFT | wxRIGHT, B);
     destPicker_ = new wxDirPickerCtrl(this, wxID_ANY, wxEmptyString,
                                       _T("Select destination folder"),
                                       wxDefaultPosition, wxDefaultSize,
                                       wxDIRP_USE_TEXTCTRL);
-    top->Add(destPicker_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 4);
+    top->Add(destPicker_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, LBL);
 
-    top->AddSpacer(10);
+    top->AddSpacer(14);
     top->Add(new wxStaticText(this, wxID_ANY, _T("Detail (max zoom vs bake time):")),
              0, wxLEFT | wxRIGHT, B);
     detailChoice_ = new wxChoice(this, wxID_ANY);
@@ -110,28 +122,33 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     detailChoice_->Append(_T("Native −1 (recommended — ~2× faster)"));
     detailChoice_->Append(_T("Native −2 (fastest — ~3× faster)"));
     detailChoice_->SetSelection(1);
-    top->Add(detailChoice_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 4);
+    top->Add(detailChoice_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, LBL);
 
-    top->AddSpacer(16);
+    top->AddSpacer(22);
     gauge_ = new wxGauge(this, wxID_ANY, 100);
     top->Add(gauge_, 0, wxEXPAND | wxLEFT | wxRIGHT, B);
     status_ = new wxStaticText(this, wxID_ANY, _T("Idle"));
-    top->Add(status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 6);
+    top->Add(status_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
+    stats_ = new wxStaticText(this, wxID_ANY, wxEmptyString);
+    top->Add(stats_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 3);
 
-    top->AddSpacer(16);
+    top->AddSpacer(22);
     auto* btns = new wxBoxSizer(wxHORIZONTAL);
     buildBtn_ = new wxButton(this, wxID_ANY, _T("Build Charts"));
+    rebuildBtn_ = new wxButton(this, wxID_ANY, _T("Rebuild All"));
     cancelBtn_ = new wxButton(this, wxID_ANY, _T("Cancel"));
     cancelBtn_->Enable(false);
     auto* closeBtn = new wxButton(this, wxID_CLOSE, _T("Close"));
     btns->Add(buildBtn_, 0, wxRIGHT, 8);
+    btns->Add(rebuildBtn_, 0, wxRIGHT, 8);
     btns->Add(cancelBtn_, 0, wxRIGHT, 8);
     btns->AddStretchSpacer();
     btns->Add(closeBtn, 0);
-    top->Add(btns, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, B);
+    top->Add(btns, 0, wxEXPAND | wxLEFT | wxRIGHT, B);
+    top->AddSpacer(B);
 
     SetSizerAndFit(top);
-    SetSize(wxSize(560, GetSize().GetHeight()));   // widen for readable paths
+    SetSize(wxSize(600, GetSize().GetHeight()));   // widen for readable paths
     SetMinSize(GetSize());
 
     // Restore persisted paths.
@@ -144,6 +161,7 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     if (detail >= 0 && detail <= 2) detailChoice_->SetSelection(detail);
 
     buildBtn_->Bind(wxEVT_BUTTON, &BuildChartsDialog::OnBuild, this);
+    rebuildBtn_->Bind(wxEVT_BUTTON, &BuildChartsDialog::OnRebuild, this);
     cancelBtn_->Bind(wxEVT_BUTTON, &BuildChartsDialog::OnCancel, this);
     closeBtn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { Close(); });
     Bind(wxEVT_CLOSE_WINDOW, &BuildChartsDialog::OnClose, this);
@@ -156,7 +174,19 @@ BuildChartsDialog::~BuildChartsDialog() {
     StopBake();
 }
 
-void BuildChartsDialog::OnBuild(wxCommandEvent&) {
+void BuildChartsDialog::OnBuild(wxCommandEvent&) { StartBuild(false); }
+void BuildChartsDialog::OnRebuild(wxCommandEvent&) { StartBuild(true); }
+
+void BuildChartsDialog::SetRunningUI(bool running) {
+    buildBtn_->Enable(!running);
+    rebuildBtn_->Enable(!running);
+    cancelBtn_->Enable(running);
+    encPicker_->Enable(!running);
+    destPicker_->Enable(!running);
+    detailChoice_->Enable(!running);
+}
+
+void BuildChartsDialog::StartBuild(bool force) {
     if (running_.load()) return;
 
     const std::string enc = std::string(encPicker_->GetPath().mb_str());
@@ -198,21 +228,24 @@ void BuildChartsDialog::OnBuild(wxCommandEvent&) {
 
     // Arm shared state, flip the UI to "running", and hand the work off.
     dest_ = dest;
+    force_.store(force);
     total_.store((int)cells.size());
     done_.store(0);
     failed_.store(0);
     cancel_.store(false);
     finished_.store(false);
     running_.store(true);
+    start_time_ = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lk(status_mtx_);
         current_cell_.clear();
     }
     gauge_->SetRange((int)cells.size());
     gauge_->SetValue(0);
-    buildBtn_->Enable(false);
-    cancelBtn_->Enable(true);
-    status_->SetLabel(_T("Baking…"));
+    SetRunningUI(true);
+    status_->SetLabel(force ? wxString::Format(_T("Rebuilding %d cells…"), (int)cells.size())
+                            : wxString::Format(_T("Baking %d cells…"), (int)cells.size()));
+    stats_->SetLabel(wxEmptyString);
 
     StartWorkers(std::move(cells));
     timer_.Start(kTimerMs);
@@ -247,7 +280,7 @@ void BuildChartsDialog::StartWorkers(std::vector<std::string> cells) {
                 const fs::path out = fs::path(dest_) / (in.stem().string() + ".pmtiles");
 
                 std::error_code ec;
-                if (fs::exists(out, ec)) {   // idempotent resume
+                if (!force_.load() && fs::exists(out, ec)) {   // idempotent resume (Build)
                     {
                         std::lock_guard<std::mutex> lk(status_mtx_);
                         current_cell_ = in.stem().string();
@@ -314,8 +347,16 @@ void BuildChartsDialog::OnTimer(wxTimerEvent&) {
         std::lock_guard<std::mutex> lk(status_mtx_);
         cur = current_cell_;
     }
-    status_->SetLabel(wxString::Format(_T("Baking %s (%d/%d)…"),
+    status_->SetLabel(wxString::Format(_T("%s %s (%d/%d)…"),
+                                       force_.load() ? _T("Rebuilding") : _T("Baking"),
                                        wxString::FromUTF8(cur.c_str()), done, total));
+
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time_).count();
+    const double rate = elapsed > 0.3 ? done / elapsed : 0.0;             // cells/s
+    const double eta = rate > 1e-6 ? (total - done) / rate : -1.0;
+    stats_->SetLabel(wxString::Format(_T("elapsed %s   ·   %.1f cells/s   ·   ETA %s"),
+                                      FmtDur(elapsed), rate, FmtDur(eta)));
 }
 
 void BuildChartsDialog::Finish() {
@@ -325,13 +366,18 @@ void BuildChartsDialog::Finish() {
     if (coordinator_.joinable()) coordinator_.join();
 
     running_.store(false);
-    buildBtn_->Enable(true);
-    cancelBtn_->Enable(false);
+    SetRunningUI(false);
 
     const int total = total_.load();
     const int failed = failed_.load();
+    const int done = done_.load();
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time_).count();
+    const double rate = elapsed > 0.1 ? done / elapsed : 0.0;
     if (cancel_.load()) {
         status_->SetLabel(_T("Cancelled"));
+        stats_->SetLabel(wxString::Format(_T("stopped after %s · %d/%d cells"),
+                                          FmtDur(elapsed), done, total));
         return;
     }
 
@@ -344,6 +390,8 @@ void BuildChartsDialog::Finish() {
     wxString msg = wxString::Format(_T("Done — added %d charts"), added);
     if (failed > 0) msg += wxString::Format(_T(" (%d failed)"), failed);
     status_->SetLabel(msg);
+    stats_->SetLabel(wxString::Format(_T("built %d cells in %s   ·   %.1f cells/s avg"),
+                                      total - failed, FmtDur(elapsed), rate));
 }
 
 void BuildChartsDialog::OnCancel(wxCommandEvent&) {
@@ -352,10 +400,13 @@ void BuildChartsDialog::OnCancel(wxCommandEvent&) {
     StopBake();
     // StopBake joins everything; reflect the cancelled end-state now.
     running_.store(false);
-    buildBtn_->Enable(true);
-    cancelBtn_->Enable(false);
+    SetRunningUI(false);
     gauge_->SetValue(done_.load());
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time_).count();
     status_->SetLabel(_T("Cancelled"));
+    stats_->SetLabel(wxString::Format(_T("stopped after %s · %d/%d cells"),
+                                      FmtDur(elapsed), done_.load(), total_.load()));
 }
 
 void BuildChartsDialog::OnClose(wxCloseEvent& e) {

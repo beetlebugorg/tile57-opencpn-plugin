@@ -12,6 +12,7 @@
 #include <wx/timer.h>
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -35,21 +36,26 @@ public:
 
 private:
     void OnBuild(wxCommandEvent&);
+    void OnRebuild(wxCommandEvent&);
     void OnCancel(wxCommandEvent&);
     void OnClose(wxCloseEvent&);
     void OnTimer(wxTimerEvent&);
 
+    void StartBuild(bool force);   // shared by Build (resume) + Rebuild (force)
     void StartWorkers(std::vector<std::string> cells);
     void Finish();   // main-thread completion: register dir, reset UI
+    void SetRunningUI(bool running);
 
     // --- widgets ---
     wxDirPickerCtrl* encPicker_ = nullptr;
     wxDirPickerCtrl* destPicker_ = nullptr;
     wxChoice*        detailChoice_ = nullptr;   // native / native-1 / native-2 zoom cap
     wxButton*        buildBtn_ = nullptr;
+    wxButton*        rebuildBtn_ = nullptr;      // force re-bake (ignore existing outputs)
     wxButton*        cancelBtn_ = nullptr;
     wxGauge*         gauge_ = nullptr;
     wxStaticText*    status_ = nullptr;
+    wxStaticText*    stats_ = nullptr;           // elapsed / rate / ETA
     wxTimer          timer_;
 
     // --- bake state (shared with workers) ---
@@ -59,6 +65,8 @@ private:
     std::string       current_cell_;
     std::string       dest_;
     std::atomic<int>  zoom_reduce_{1};   // levels below native to bake (0=native,1,2)
+    std::atomic<bool> force_{false};     // Rebuild: overwrite existing outputs
+    std::chrono::steady_clock::time_point start_time_;   // set when a run begins
 
     // Work queue + worker pool, driven by a single coordinator thread.
     std::deque<std::string>  queue_;
