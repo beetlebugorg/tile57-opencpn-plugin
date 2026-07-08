@@ -11,6 +11,7 @@
 #include "ocpn_plugin.h"
 #include "tile57_chart.h"
 #include "bake_manager.h"
+#include "build_charts.h"
 #include "gl.h"
 #include <chrono>
 #include <cmath>
@@ -44,13 +45,25 @@ public:
         bake_timer_.Start(110);   // ~9 fps redraws while baking (loader + progress bar)
         return INSTALLS_PLUGIN_CHART | INSTALLS_PLUGIN_CHART_GL
              | WANTS_MOUSE_EVENTS | WANTS_CURSOR_LATLON
+             | WANTS_PREFERENCES              // the "Build Charts" settings panel
              | WANTS_OPENGL_OVERLAY_CALLBACK;   // for the unobtrusive pre-bake indicator
     }
     bool DeInit() override {
         bake_timer_.Stop();
         t57::BakeManager::instance().stop();   // stop + join the pre-bake worker
         if (query_dlg_) { query_dlg_->Destroy(); query_dlg_ = nullptr; }
+        if (prefs_dlg_) { prefs_dlg_->StopBake(); prefs_dlg_->Destroy(); prefs_dlg_ = nullptr; }
         return true;
+    }
+
+    // Settings panel: lazily create the modeless "Build Charts" dialog and
+    // surface it. It bakes an ENC_ROOT to per-cell *.pmtiles and registers the
+    // destination as a chart directory (see build_charts.*).
+    void ShowPreferencesDialog(wxWindow* parent) override {
+        if (!prefs_dlg_)
+            prefs_dlg_ = new BuildChartsDialog(parent ? parent : GetOCPNCanvasWindow());
+        prefs_dlg_->Show();
+        prefs_dlg_->Raise();
     }
 
     // Two unobtrusive indicators, both fixed-function so they compose with OpenCPN's GL:
@@ -182,6 +195,7 @@ private:
     double cur_lat_ = 0, cur_lon_ = 0;
     wxDialog* query_dlg_ = nullptr;
     wxHtmlWindow* query_html_ = nullptr;
+    BuildChartsDialog* prefs_dlg_ = nullptr;
     BakeRefreshTimer bake_timer_;
 
     void show_query(const wxString& body) {
