@@ -71,6 +71,16 @@ public:
         }
         if (!any_loading && (total <= 0 || pending <= 0)) return false;
 
+        // glUseProgram (below) is a GLEW entry point — null until glewInit, which the
+        // renderer runs in ensure_gl(). But this overlay can fire before ANY chart has
+        // rendered (startup while every cell re-bakes: all loading, nothing drawn yet),
+        // so load the entry points here too (idempotent; the overlay's GL context is
+        // current) and skip this frame rather than call through a null pointer — that
+        // was a crash: RenderGLOverlay -> glUseProgram == 0x0.
+        static bool gl_ready = false;
+        if (!gl_ready) gl_ready = t57_gl_loader_init();
+        if (!gl_ready) return false;
+
         const float W = (float)vp->pix_width, H = (float)vp->pix_height;
         glUseProgram(0);   // drop any shader so fixed-function immediate mode draws
         glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
