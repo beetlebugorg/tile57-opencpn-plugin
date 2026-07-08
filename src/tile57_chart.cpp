@@ -16,6 +16,10 @@
 // wxWidgets can create ChartTile57 by class name; OpenCPN uses this to
 // instantiate the chart for each matching file it finds in a chart directory.
 wxIMPLEMENT_DYNAMIC_CLASS(ChartTile57, PlugInChartBaseExtended);
+// The two concrete classes OpenCPN instantiates by name (baked bundles + live cells);
+// they differ only in GetFileSearchMask, everything else is the shared base.
+wxIMPLEMENT_DYNAMIC_CLASS(ChartTile57Pmtiles, ChartTile57);
+wxIMPLEMENT_DYNAMIC_CLASS(ChartTile57Cell, ChartTile57);
 
 namespace {
 constexpr double kEarthR = 6378137.0;
@@ -144,6 +148,23 @@ int ChartTile57::Init(const wxString& full_path, int init_flags) {
     std::string path = std::string(full_path.mb_str());
     if (char* rp = realpath(path.c_str(), nullptr)) { path = rp; std::free(rp); }
 
+    auto ends_with = [&](const char* suf) {
+        std::string s(suf);
+        return path.size() >= s.size() && path.compare(path.size() - s.size(), s.size(), s) == 0;
+    };
+
+    // A pre-baked *.pmtiles bundle opens directly (cheap archive peek) and renders
+    // straight away — no cell parse, no background bake. Metadata comes from the
+    // archive (its coverage is the bounding box; a baked bundle has no M_COVR).
+    if (ends_with(".pmtiles")) {
+        if (!renderer_.open_chart(path)) return PI_INIT_FAIL_REMOVE;
+        tile57_chart_info pinfo{};
+        if (!renderer_.get_info(pinfo) || !pinfo.has_bounds) return PI_INIT_FAIL_REMOVE;
+        apply_info(renderer_.chart_handle(), pinfo);
+        m_bReadyToRender = true;
+        return PI_INIT_OK;
+    }
+
     // Metadata via a cheap header PARSE (bbox + native scale + coverage) — no tile
     // bake, so a chart-DB scan over hundreds of cells stays fast.
     tile57_chart* h = tile57_chart_open_header(path.c_str());
@@ -166,14 +187,18 @@ int ChartTile57::Init(const wxString& full_path, int init_flags) {
         return PI_INIT_OK;
     }
 
-    // Full init: bake the tiles on a background thread (progressive — a quick native
-    // band for first paint, then the full zoom range). IsReadyToRender() stays false
-    // until the first band lands, so OpenCPN skips this chart meanwhile.
+    // Full init: bake the tiles on a background thread (progressive — a coarse band
+    // for first paint, then up to the cell's NATIVE zoom). We cap at the native zoom
+    // because baking finer overzooms the data and the tile count (hence bake time)
+    // blows up (e.g. a 1:80k coastal cell: ~11s to native z13, ~34s to z14); the GL
+    // renderer already overzooms native tiles past that, so nothing is lost.
     bake_path_ = path;
     int zn = info.native_scale > 0
                  ? (int)std::lround(std::log2(559082264.0 / (double)info.native_scale))
                  : 14;
-    bake_quick_max_ = (uint8_t)std::max(6, std::min(15, zn - 3));
+    zn = std::max(4, std::min(zn, 16));
+    bake_full_max_ = (uint8_t)zn;
+    bake_quick_max_ = (uint8_t)std::max(5, zn - 3);
     canvas_ = GetOCPNCanvasWindow();
     ready_.store(false, std::memory_order_release);
     cancel_.store(false, std::memory_order_release);
@@ -193,7 +218,7 @@ void ChartTile57::start_bake() {
         if (ov) publish(ov);
 
         if (cancel_.load(std::memory_order_acquire)) return;
-        tile57_chart* full = tile57_chart_open(bake_path_.c_str());
+        tile57_chart* full = tile57_chart_open_zoom(bake_path_.c_str(), 0, bake_full_max_);
         if (cancel_.load(std::memory_order_acquire)) { if (full) tile57_chart_close(full); return; }
         if (full) publish(full);
     });

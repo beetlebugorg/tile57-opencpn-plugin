@@ -150,8 +150,29 @@ private:
     std::atomic<tile57_chart*> pending_chart_{nullptr};
     std::thread bake_thread_;
     std::string bake_path_;             // resolved .000 path (set before the thread starts)
-    uint8_t bake_quick_max_ = 14;       // quick-phase max zoom (native band)
+    uint8_t bake_quick_max_ = 12;       // quick-phase max zoom (coarse first paint)
+    uint8_t bake_full_max_ = 16;        // full-phase max zoom = the cell's native zoom
+                                        // (baking past it overzooms => tile-count blowup)
     wxWindow* canvas_ = nullptr;        // for a thread-safe CallAfter refresh
 
     wxDECLARE_DYNAMIC_CLASS(ChartTile57);
+};
+
+// Two concrete chart classes so OpenCPN scans BOTH extensions and the user can switch
+// renderers by which folder is added: baked bundles (*.pmtiles, ENC_ROOT_TILES) or
+// live cells (*.t57, ENC_ROOT_CELLS). GetFileSearchMask can't return multiple masks
+// (OpenCPN uses the whole string as one wildcard), so each is its own dynamic class;
+// all behaviour lives in the shared base (Init branches on the file extension).
+class ChartTile57Pmtiles : public ChartTile57 {
+public:
+    wxString GetFileSearchMask(void) override { return _T("*.pmtiles"); }
+private:
+    wxDECLARE_DYNAMIC_CLASS(ChartTile57Pmtiles);
+};
+
+class ChartTile57Cell : public ChartTile57 {
+public:
+    wxString GetFileSearchMask(void) override { return _T("*.t57"); }
+private:
+    wxDECLARE_DYNAMIC_CLASS(ChartTile57Cell);
 };

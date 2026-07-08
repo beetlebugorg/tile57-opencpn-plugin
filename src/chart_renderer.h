@@ -51,10 +51,6 @@ public:
     // + SCAMIN (text drawn as SDF quads from the glyph atlas).
     struct GlyphVtx { float wx, wy, px, py, u, v; uint8_t r, g, b, a; float thresh; };
 
-    // TEMP diagnostic snapshot of the last render().
-    struct Dbg { uint32_t area, line, symbol, text; bool rebuilt; double cam_zoom; };
-    Dbg dbg() const { return { n_area_, n_line_, n_symbol_, n_text_, last_rebuilt_, cam_zoom_ }; }
-
     // Geometry sinks the C surface callbacks append to (public for the
     // trampolines). Grouped by paint layer so we draw area->line->symbol->text.
     std::vector<Vtx> area_, line_, symbol_, text_;
@@ -120,7 +116,6 @@ private:
     double cam_lon_ = 0, cam_lat_ = 0, cam_zoom_ = 0;
     double last_zoom_ = -1;   // previous frame's view zoom (settle detection)
     double last_lon_ = 1e9, last_lat_ = 1e9, last_zoom_r_ = 1e9;  // last render view
-    bool last_rebuilt_ = false;   // TEMP diagnostic
     uint32_t cam_w_ = 0, cam_h_ = 0;
     uint64_t cam_mhash_ = 0;
 };

@@ -42,11 +42,12 @@ public:
                                                         "rendered on the GPU. Add the folder holding a baked bundle's "
                                                         "chart.pmtiles as a chart directory. EXPERIMENTAL / NOT FOR NAVIGATION."); }
 
-    // Register the plugin chart class so OpenCPN instantiates ChartTile57 for
-    // every *.pmtiles it finds (see ChartTile57::GetFileSearchMask).
+    // Register both chart classes so OpenCPN scans baked bundles (*.pmtiles) and live
+    // cells (*.t57) — one dynamic class per extension (see the ChartTile57 subclasses).
     wxArrayString GetDynamicChartClassNameArray() override {
         wxArrayString a;
-        a.Add(_T("ChartTile57"));
+        a.Add(_T("ChartTile57Pmtiles"));
+        a.Add(_T("ChartTile57Cell"));
         return a;
     }
 

@@ -2,7 +2,6 @@
 #include "chart_renderer.h"
 #include "gl.h"
 #include <array>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -784,7 +783,6 @@ void ChartRenderer::composite_ss() {
 
 void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                             const tile57_mariner& m) {
-    auto t0 = std::chrono::steady_clock::now();
     area_.clear(); line_.clear(); symbol_.clear(); text_.clear(); sprite_.clear(); pattern_.clear(); glyph_.clear();
     // World reference: the view centre, so vertex offsets stay tiny (f32-precise).
     lonlat_to_world(lon, lat, ref_wx_, ref_wy_);
@@ -804,20 +802,8 @@ void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uin
     // not load, draw_text_str stays null and text tessellates via draw_text.
     if (g_glyph.ok) cb.draw_text_str = tr_text_str;
     int rc = tile57_chart_render_surface_cb(chart_, lon, lat, zoom, w, h, &m, &cb);
-    if (rc != 0) std::fprintf(stderr, "t57 render_surface_cb rc=%d\n", rc);
-    auto t1 = std::chrono::steady_clock::now();
+    if (rc != 0) std::fprintf(stderr, "tile57: render_surface_cb rc=%d\n", rc);
     upload();
-    auto t2 = std::chrono::steady_clock::now();
-    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    static FILE* pf = std::fopen("/tmp/t57_perf.log", "w");
-    if (pf) {
-        std::fprintf(pf,
-                     "rebuild z=%.1f %ux%u: portray+tess=%.1fms upload=%.1fms | "
-                     "verts area=%zu line=%zu sym=%zu txt=%zu glyph=%zu spr=%zu pat=%zu\n",
-                     zoom, w, h, ms(t0, t1), ms(t1, t2),
-                     area_.size(), line_.size(), symbol_.size(), text_.size(), glyph_.size(), sprite_.size(), pattern_.size());
-        std::fflush(pf);
-    }
 }
 
 void ChartRenderer::upload() {
