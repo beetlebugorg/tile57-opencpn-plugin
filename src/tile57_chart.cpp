@@ -442,7 +442,11 @@ void ChartTile57::refresh_mariner() {
         bool soundings = true, text = true, ldis = false, imp_only = false;
         cfg->Read("bShowSoundg", &soundings, true);
         cfg->Read("bShowS57Text", &text, true);
-        cfg->Read("bShowLdisText", &ldis, false);
+        // KEY is "bShowLightDescription" (OpenCPN's config key) — NOT "bShowLdisText"
+        // (that's the g_bShowLdisText VARIABLE name). The wrong key always missed, so
+        // Read kept the default (false) and light descriptions never emitted, however
+        // the mariner toggled them in OpenCPN.
+        cfg->Read("bShowLightDescription", &ldis, false);
         cfg->Read("bShowS57ImportantTextOnly", &imp_only, false);
         mariner_.text_names = text;
         mariner_.text_other = text && !imp_only;
