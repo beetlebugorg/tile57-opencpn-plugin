@@ -17,6 +17,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "tile57.h"
 
@@ -86,12 +87,37 @@ public:
                           size_t len, float size_px, tile57_rgba color, tile57_rgba halo,
                           float thresh);
 
+    // ---- tiled path (MapLibre model): portray+tessellate each baked tile ONCE,
+    // cache its GPU geometry, compose the view from cached tiles. Enabled by
+    // TILE57_TILED; the whole-view rebuild() path above is the fallback.
+    // One tile's tessellated GPU geometry (its own VBOs) + the world origin its
+    // verts are relative to (the tile's NW corner, so aWorld stays f32-tiny).
+    struct TileGeom {
+        uint32_t vbo[7] = {0,0,0,0,0,0,0};   // area,line,symbol,text,sprite,pat,glyph
+        uint32_t n[7]   = {0,0,0,0,0,0,0};
+        double ref_wx = 0, ref_wy = 0;
+        int64_t used_ms = 0;                 // last frame this tile was drawn (LRU evict)
+    };
+
 private:
     void rebuild(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                  const tile57_mariner& m);
     void upload();
-    void draw_range(uint32_t vbo, uint32_t count);
+    void draw_range(uint32_t vbo, uint32_t count);        // Vtx layout (prog_)
+    void draw_pat_range(uint32_t vbo, uint32_t count);    // PatVtx layout (prog_pat_)
+    void draw_sprite_range(uint32_t vbo, uint32_t count); // SpriteVtx layout (prog_sprite_)
+    void draw_glyph_range(uint32_t vbo, uint32_t count);  // GlyphVtx layout (prog_glyph_)
     void composite_ss();   // draw the resolved MSAA texture over OpenCPN's FBO
+
+    // Tiled path helpers (chart_renderer.cpp).
+    void render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, Pass pass,
+                      float cull_zoom, double vwx, double vwy, double scale_px, int z,
+                      uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1);
+    TileGeom& ensure_tile(int z, uint32_t x, uint32_t y, const tile57_mariner& m);
+    void clear_tiles();
+    static uint64_t tile_key(int z, uint32_t x, uint32_t y) {
+        return ((uint64_t)(z & 0x1f) << 58) | ((uint64_t)(x & 0x1fffffff) << 29) | (y & 0x1fffffff);
+    }
 
     tile57_chart* chart_ = nullptr;
     uint32_t prog_ = 0, vbo_area_ = 0, vbo_line_ = 0, vbo_symbol_ = 0, vbo_text_ = 0;
@@ -115,6 +141,8 @@ private:
 
     bool have_range_ = false;
     double min_zoom_ = 0, max_zoom_ = 0;
+    bool have_bounds_ = false;
+    double b_w_ = 0, b_s_ = 0, b_e_ = 0, b_n_ = 0;   // chart coverage bbox (deg)
 
     // Cached portrayal camera: the geometry is valid for views inside this
     // world window; leaving it (pan) or a big zoom step re-portrays.
@@ -124,6 +152,11 @@ private:
     uint32_t cam_w_ = 0, cam_h_ = 0;
     uint64_t cam_mhash_ = 0;
     int64_t last_portray_ms_ = 0;   // steady-clock ms of the last re-portray (motion throttle)
+
+    // Tiled path state.
+    std::unordered_map<uint64_t, TileGeom> tiles_;   // (z,x,y) -> cached tile geometry
+    uint64_t tiles_mhash_ = 0;                        // mariner hash the cache was portrayed at
+    bool tiled_ = false;                              // TILE57_TILED
 };
 
 } // namespace t57

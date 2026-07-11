@@ -1,6 +1,7 @@
 // chart_renderer.cpp — see chart_renderer.h.
 #include "chart_renderer.h"
 #include "gl.h"
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -488,7 +489,9 @@ void ChartRenderer::set_chart(tile57_chart* c) {
     if (c == chart_) return;
     if (chart_) tile57_chart_close(chart_);
     chart_ = c;
-    have_cam_ = false;   // force a re-portray against the newly swapped-in chart
+    have_cam_ = false;    // force a re-portray against the newly swapped-in chart
+    have_range_ = false;  // re-fetch zoom range + coverage bounds for the new chart
+    if (gl_ready_) clear_tiles();   // the cached tiles belonged to the old chart
 }
 bool ChartRenderer::get_info(tile57_info& out) const {
     if (!chart_) return false;
@@ -723,6 +726,11 @@ bool ChartRenderer::ensure_gl() {
     load_sprite_atlas();
     load_glyph_atlas();
 
+    // TILE57_TILED: portray+tessellate each baked tile once, cache its GPU geometry,
+    // and compose the view from cached tiles (the MapLibre model) instead of
+    // re-portraying the whole view. Off by default; the whole-view path is the fallback.
+    tiled_ = std::getenv("TILE57_TILED") != nullptr;
+
     gl_ready_ = true;
     return true;
 }
@@ -805,6 +813,21 @@ void ChartRenderer::composite_ss() {
     glUseProgram(0);
 }
 
+// Wire the surface callbacks to this renderer's tessellation sinks. Shared by the
+// whole-view rebuild() and the tiled per-tile portray.
+static void fill_surface_cb(tile57_surface_cb& cb, ChartRenderer* self) {
+    cb.ctx = self;
+    cb.fill_area = tr_fill;
+    cb.stroke_line = tr_stroke;
+    cb.draw_symbol = tr_symbol;
+    cb.draw_text = tr_text;
+    // Point symbols/patterns draw from the atlas when it loaded; else tessellate.
+    if (g_atlas.ok) { cb.draw_sprite = tr_sprite; cb.draw_pattern = tr_pattern; }
+    // SDF glyph atlas: send text as strings (skips glyph tessellation). If it did
+    // not load, draw_text_str stays null and text tessellates via draw_text.
+    if (g_glyph.ok) cb.draw_text_str = tr_text_str;
+}
+
 void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                             const tile57_mariner& m) {
     area_.clear(); line_.clear(); symbol_.clear(); text_.clear(); sprite_.clear(); pattern_.clear(); glyph_.clear();
@@ -815,19 +838,112 @@ void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uin
     size_scale_ = m.size_scale > 0 ? m.size_scale : 1.0;
 
     tile57_surface_cb cb{};
-    cb.ctx = this;
-    cb.fill_area = tr_fill;
-    cb.stroke_line = tr_stroke;
-    cb.draw_symbol = tr_symbol;
-    cb.draw_text = tr_text;
-    // Point symbols/patterns draw from the atlas when it loaded; else tessellate.
-    if (g_atlas.ok) { cb.draw_sprite = tr_sprite; cb.draw_pattern = tr_pattern; }
-    // SDF glyph atlas: send text as strings (skips glyph tessellation). If it did
-    // not load, draw_text_str stays null and text tessellates via draw_text.
-    if (g_glyph.ok) cb.draw_text_str = tr_text_str;
+    fill_surface_cb(cb, this);
     tile57_status rc = tile57_chart_surface(chart_, lon, lat, zoom, w, h, &m, &cb, nullptr);
     if (rc != TILE57_OK) std::fprintf(stderr, "tile57: chart_surface: %s\n", tile57_status_str(rc));
     upload();
+}
+
+// ---- tiled path: portray + cache + compose per tile (see chart_renderer.h) -----
+// Portray a single (z,x,y) tile into its own VBOs, ONCE, and cache it. Verts are
+// stored relative to the tile's NW world corner (ref), so aWorld stays f32-tiny and
+// the cached geometry is view-independent — compose places it via a per-tile uOrigin.
+ChartRenderer::TileGeom& ChartRenderer::ensure_tile(int z, uint32_t x, uint32_t y, const tile57_mariner& m) {
+    uint64_t key = tile_key(z, x, y);
+    auto it = tiles_.find(key);
+    if (it != tiles_.end()) return it->second;
+
+    TileGeom t{};
+    double n = std::pow(2.0, z);
+    t.ref_wx = (double)x / n;                 // tile NW corner in web-mercator [0,1]
+    t.ref_wy = (double)y / n;
+
+    // Portray this tile through the shared tessellation sinks (reuse the member
+    // scratch vectors), referenced to the tile origin, decimated at the tile zoom.
+    area_.clear(); line_.clear(); symbol_.clear(); text_.clear(); sprite_.clear(); pattern_.clear(); glyph_.clear();
+    ref_wx_ = t.ref_wx; ref_wy_ = t.ref_wy;
+    decimate_eps_ = 0.5 / (256.0 * n);
+    size_scale_ = m.size_scale > 0 ? m.size_scale : 1.0;
+    tile57_surface_cb cb{};
+    fill_surface_cb(cb, this);
+    tile57_chart_tile_surface(chart_, (uint8_t)z, x, y, &m, &cb, nullptr);
+
+    // Upload each layer to its own VBO (empty layers keep vbo==0, n==0).
+    struct LayerSrc { const void* data; size_t bytes; uint32_t count; };
+    const LayerSrc src[7] = {
+        { area_.data(),    area_.size()*sizeof(Vtx),       (uint32_t)area_.size() },
+        { line_.data(),    line_.size()*sizeof(Vtx),       (uint32_t)line_.size() },
+        { symbol_.data(),  symbol_.size()*sizeof(Vtx),     (uint32_t)symbol_.size() },
+        { text_.data(),    text_.size()*sizeof(Vtx),       (uint32_t)text_.size() },
+        { sprite_.data(),  sprite_.size()*sizeof(SpriteVtx),(uint32_t)sprite_.size() },
+        { pattern_.data(), pattern_.size()*sizeof(PatVtx), (uint32_t)pattern_.size() },
+        { glyph_.data(),   glyph_.size()*sizeof(GlyphVtx), (uint32_t)glyph_.size() },
+    };
+    for (int i = 0; i < 7; ++i) {
+        t.n[i] = src[i].count;
+        if (!t.n[i]) continue;
+        glGenBuffers(1, &t.vbo[i]);
+        glBindBuffer(GL_ARRAY_BUFFER, t.vbo[i]);
+        glBufferData(GL_ARRAY_BUFFER, src[i].bytes, src[i].data, GL_STATIC_DRAW);
+    }
+    return tiles_.emplace(key, t).first->second;
+}
+
+void ChartRenderer::clear_tiles() {
+    for (auto& kv : tiles_)
+        for (int i = 0; i < 7; ++i)
+            if (kv.second.vbo[i]) glDeleteBuffers(1, &kv.second.vbo[i]);
+    tiles_.clear();
+}
+
+// Compose the view from cached tiles: ensure each visible tile is portrayed (once)
+// then draw the cached tile VBOs in paint order, each with its own per-tile origin
+// uniform. Layer indices: 0 area, 1 line, 2 symbol, 3 text, 4 sprite, 5 pattern,
+// 6 glyph. Batched by program (one program bind per layer, inner loop over tiles).
+void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, Pass pass,
+                                 float cull_zoom, double vwx, double vwy, double scale_px, int z,
+                                 uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1) {
+    // unordered_map references stay valid across inserts, so pointers gathered while
+    // portraying missing tiles remain good for the draw loop below.
+    std::vector<const TileGeom*> vis;
+    vis.reserve((size_t)(x1 - x0 + 1) * (y1 - y0 + 1));
+    for (uint32_t ty = y0; ty <= y1; ++ty)
+        for (uint32_t tx = x0; tx <= x1; ++tx) {
+            const TileGeom& t = ensure_tile(z, tx, ty, m);
+            for (int i = 0; i < 7; ++i) if (t.n[i]) { vis.push_back(&t); break; }
+        }
+    if (vis.empty()) return;
+
+    const float vp[2] = { (float)w, (float)h };
+    auto set_origin = [&](int uloc, const TileGeom* t) {
+        float o[2] = { (float)((t->ref_wx - vwx) * scale_px + w * 0.5),
+                       (float)((t->ref_wy - vwy) * scale_px + h * 0.5) };
+        glUniform2fv(uloc, 1, o);
+    };
+    auto layer = [&](int prog, int u_scale, int u_vp, int u_zoom, int u_origin, int idx,
+                     void (ChartRenderer::*drawfn)(uint32_t, uint32_t), uint32_t tex, int u_atlas) {
+        glUseProgram(prog);
+        glUniform1f(u_scale, (float)scale_px); glUniform2fv(u_vp, 1, vp); glUniform1f(u_zoom, cull_zoom);
+        if (tex) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex); glUniform1i(u_atlas, 0); }
+        for (auto* t : vis) if (t->n[idx]) { set_origin(u_origin, t); (this->*drawfn)(t->vbo[idx], t->n[idx]); }
+        if (tex) glBindTexture(GL_TEXTURE_2D, 0);
+    };
+
+    if (pass != Pass::kText) {
+        layer(prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 0, &ChartRenderer::draw_range, 0, -1);          // area
+        if (g_atlas.ok)
+            layer(prog_pat_, pu_scale_, pu_vp_, pu_zoom_, pu_origin_, 5, &ChartRenderer::draw_pat_range, g_atlas.tex, pu_atlas_);  // pattern
+        layer(prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 1, &ChartRenderer::draw_range, 0, -1);          // line
+        layer(prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 2, &ChartRenderer::draw_range, 0, -1);          // symbol (tessellated)
+        if (g_atlas.ok)
+            layer(prog_sprite_, su_scale_, su_vp_, su_zoom_, su_origin_, 4, &ChartRenderer::draw_sprite_range, g_atlas.tex, su_atlas_);  // sprite
+    }
+    if (pass != Pass::kBase) {
+        layer(prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 3, &ChartRenderer::draw_range, 0, -1);          // text (tessellated fallback)
+        if (g_glyph.ok)
+            layer(prog_glyph_, gu_scale_, gu_vp_, gu_zoom_, gu_origin_, 6, &ChartRenderer::draw_glyph_range, g_glyph.tex, gu_atlas_);   // glyph (SDF)
+    }
+    glUseProgram(0);
 }
 
 void ChartRenderer::upload() {
@@ -869,6 +985,59 @@ void ChartRenderer::draw_range(uint32_t vbo, uint32_t count) {
     glDisableVertexAttribArray(3);
 }
 
+// Draw one PatVtx buffer (prog_pat_ must be bound + uniforms/atlas set by caller).
+void ChartRenderer::draw_pat_range(uint32_t vbo, uint32_t count) {
+    if (!count) return;
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, wx));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, u0));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, tw));
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, thresh));
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)count);
+    glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
+    glDisableVertexAttribArray(2); glDisableVertexAttribArray(3);
+}
+
+// Draw one SpriteVtx buffer (prog_sprite_ bound + uniforms/atlas set by caller).
+void ChartRenderer::draw_sprite_range(uint32_t vbo, uint32_t count) {
+    if (!count) return;
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx), (void*)offsetof(SpriteVtx, wx));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx), (void*)offsetof(SpriteVtx, px));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx), (void*)offsetof(SpriteVtx, u));
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx), (void*)offsetof(SpriteVtx, thresh));
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)count);
+    glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
+    glDisableVertexAttribArray(2); glDisableVertexAttribArray(3);
+}
+
+// Draw one GlyphVtx buffer (prog_glyph_ bound + uniforms/atlas set by caller).
+void ChartRenderer::draw_glyph_range(uint32_t vbo, uint32_t count) {
+    if (!count) return;
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, wx));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, px));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, u));
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, r));
+    glEnableVertexAttribArray(4);
+    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, thresh));
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)count);
+    glDisableVertexAttribArray(0); glDisableVertexAttribArray(1); glDisableVertexAttribArray(2);
+    glDisableVertexAttribArray(3); glDisableVertexAttribArray(4);
+}
+
 void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                            const tile57_mariner& m, Pass pass, bool stencil_clip,
                            double device_scale, double cull_bias) {
@@ -877,6 +1046,14 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         tile57_info info{};
         tile57_chart_get_info(chart_, &info);
         min_zoom_ = info.min_zoom; max_zoom_ = info.max_zoom; have_range_ = true;
+        have_bounds_ = info.has_bounds;
+        b_w_ = info.west; b_s_ = info.south; b_e_ = info.east; b_n_ = info.north;
+    }
+    // Tiled path: portray+cache+compose per tile (MapLibre model). Invalidate the
+    // tile cache when the mariner settings change (they change the portrayal).
+    if (tiled_) {
+        uint64_t mhx = mariner_hash(m);
+        if (mhx != tiles_mhash_) { clear_tiles(); tiles_mhash_ = mhx; }
     }
     // Portray at the view zoom clamped to the baked band (tile selection); the
     // GPU then transforms to ANY zoom, so pan and zoom are re-portray-free.
@@ -959,7 +1136,7 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     static const bool prof = std::getenv("TILE57_PROF") != nullptr;
     static long prof_frames = 0, prof_rebuilds = 0, prof_last_frame = 0;
     if (prof && pass != Pass::kText) ++prof_frames;
-    if (need) {
+    if (need && !tiled_) {
         cam_lon_ = lon; cam_lat_ = lat; cam_zoom_ = cz;
         cam_w_ = cam_dim(w); cam_h_ = cam_dim(h); cam_mhash_ = mh;
         last_portray_ms_ = now_ms;
@@ -1040,7 +1217,36 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     glUniform2fv(u_vp_, 1, vp);
     glUniform1f(u_zoom_, cull_zoom);
 
-    if (pass != Pass::kText) {
+    if (tiled_) {
+        // Pick the tile zoom (the baked band the view falls in) and the visible tile
+        // x/y range, clamped to the chart's coverage so a zoomed-out view doesn't
+        // enumerate a sea of empty tiles. render_tiled portrays any missing tile ONCE
+        // and composes the cached tiles.
+        int z = (int)std::lround(zoom);
+        if (z < (int)min_zoom_) z = (int)min_zoom_;
+        if (z > (int)max_zoom_) z = (int)max_zoom_;
+        double n = std::pow(2.0, z);
+        double half_wx = (w * 0.5) / scale_px, half_wy = (h * 0.5) / scale_px;
+        double wminx = vwx - half_wx, wmaxx = vwx + half_wx;
+        double wminy = vwy - half_wy, wmaxy = vwy + half_wy;
+        if (have_bounds_) {
+            double nwx, nwy, sex, sey;
+            lonlat_to_world(b_w_, b_n_, nwx, nwy);   // NW -> (min x, min y)
+            lonlat_to_world(b_e_, b_s_, sex, sey);   // SE -> (max x, max y)
+            wminx = std::max(wminx, nwx); wmaxx = std::min(wmaxx, sex);
+            wminy = std::max(wminy, nwy); wmaxy = std::min(wmaxy, sey);
+        }
+        double maxt = n - 1.0;
+        long x0 = (long)std::floor(std::clamp(wminx * n, 0.0, maxt));
+        long x1 = (long)std::floor(std::clamp(wmaxx * n, 0.0, maxt));
+        long y0 = (long)std::floor(std::clamp(wminy * n, 0.0, maxt));
+        long y1 = (long)std::floor(std::clamp(wmaxy * n, 0.0, maxt));
+        if (wmaxx >= wminx && wmaxy >= wminy && (x1 - x0 + 1) * (y1 - y0 + 1) <= 4096)
+            render_tiled(w, h, m, pass, cull_zoom, vwx, vwy, scale_px, z,
+                         (uint32_t)x0, (uint32_t)x1, (uint32_t)y0, (uint32_t)y1);
+    }
+
+    if (!tiled_ && pass != Pass::kText) {
         draw_range(vbo_area_, n_area_);
         if (n_pat_ && g_atlas.ok) {
             glUseProgram(prog_pat_);
@@ -1093,7 +1299,7 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
             glUseProgram(prog_);
         }
     }
-    if (pass != Pass::kBase) {
+    if (!tiled_ && pass != Pass::kBase) {
         draw_range(vbo_text_, n_text_);   // tessellated fallback (empty when SDF text is active)
         if (n_glyph_ && g_glyph.ok) {
             glUseProgram(prog_glyph_);
@@ -1151,6 +1357,7 @@ void ChartRenderer::shutdown() {
     vbo_area_ = vbo_line_ = vbo_symbol_ = vbo_text_ = vbo_sprite_ = vbo_pat_ = vbo_glyph_ = vbo_quad_ = 0;
     n_area_ = n_line_ = n_symbol_ = n_text_ = n_sprite_ = n_pat_ = n_glyph_ = 0;
     have_cam_ = false; have_range_ = false;
+    tiles_.clear(); tiles_mhash_ = 0;   // GL buffers die with the context on shutdown
     if (chart_) { tile57_chart_close(chart_); chart_ = nullptr; }
 }
 
