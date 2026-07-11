@@ -12,20 +12,20 @@
 // every thread is joined before this dialog (which owns the shared state) dies.
 #include "build_charts.h"
 
-#include <cstdint>
 #include "ocpn_plugin.h"
 #include "tile57.h"
+#include <cstdint>
 
-#include <wx/filepicker.h>
 #include <wx/button.h>
 #include <wx/choice.h>
-#include <wx/gauge.h>
-#include <wx/stattext.h>
-#include <wx/sizer.h>
 #include <wx/fileconf.h>
 #include <wx/filename.h>
-#include <wx/stdpaths.h>
+#include <wx/filepicker.h>
+#include <wx/gauge.h>
 #include <wx/log.h>
+#include <wx/sizer.h>
+#include <wx/stattext.h>
+#include <wx/stdpaths.h>
 
 #include <algorithm>
 #include <chrono>
@@ -46,8 +46,7 @@ constexpr int kTimerMs = 200;
 // it jumps to a bad address and crashes the moment the dialog is constructed. A
 // self-owned wxFileConfig depends only on the wx libs the plugin already links.
 wxString ConfigPath() {
-    return wxFileName(wxStandardPaths::Get().GetUserConfigDir(),
-                      _T("tile57_pi.ini")).GetFullPath();
+    return wxFileName(wxStandardPaths::Get().GetUserConfigDir(), _T("tile57_pi.ini")).GetFullPath();
 }
 
 // Baked charts always land in a FIXED XDG-cache dir (no picker) — the plugin reads its
@@ -83,18 +82,18 @@ bool IsDotZeroZeroZero(const fs::path& p) {
 
 // Seconds -> "M:SS" (or "H:MM:SS" past an hour) for the timing readout.
 wxString FmtDur(double secs) {
-    if (secs < 0 || !std::isfinite(secs)) return _T("—");
+    if (secs < 0 || !std::isfinite(secs))
+        return _T("—");
     long s = (long)(secs + 0.5);
     long h = s / 3600, m = (s % 3600) / 60, sec = s % 60;
     return h > 0 ? wxString::Format(_T("%ld:%02ld:%02ld"), h, m, sec)
                  : wxString::Format(_T("%ld:%02ld"), m, sec);
 }
 
-}  // namespace
+} // namespace
 
 BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
-    : wxDialog(parent, wxID_ANY, _T("Build Charts — tile57"),
-               wxDefaultPosition, wxSize(520, 260),
+    : wxDialog(parent, wxID_ANY, _T("Build Charts — tile57"), wxDefaultPosition, wxSize(520, 260),
                wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER) {
     wxLogMessage("tile57: BuildChartsDialog ctor begin");
     // ONE left/right margin for every row (labels AND inputs) so they align; all
@@ -110,16 +109,15 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
 
     top->AddSpacer(B);
     label(_T("ENC source (ENC_ROOT):"));
-    encPicker_ = new wxDirPickerCtrl(this, wxID_ANY, wxEmptyString,
-                                     _T("Select ENC source folder"),
+    encPicker_ = new wxDirPickerCtrl(this, wxID_ANY, wxEmptyString, _T("Select ENC source folder"),
                                      wxDefaultPosition, wxDefaultSize,
                                      wxDIRP_USE_TEXTCTRL | wxDIRP_DIR_MUST_EXIST);
     row(encPicker_);
 
     top->AddSpacer(16);
-    row(new wxStaticText(this, wxID_ANY,
-                         wxString::Format(_T("Output: %s"),
-                                          wxString::FromUTF8(FixedDest().c_str()))));
+    row(new wxStaticText(
+        this, wxID_ANY,
+        wxString::Format(_T("Output: %s"), wxString::FromUTF8(FixedDest().c_str()))));
 
     top->AddSpacer(24);
     gauge_ = new wxGauge(this, wxID_ANY, 100);
@@ -147,14 +145,15 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     top->AddSpacer(B);
 
     SetSizerAndFit(top);
-    SetSize(wxSize(600, GetSize().GetHeight()));   // widen for readable paths
+    SetSize(wxSize(600, GetSize().GetHeight())); // widen for readable paths
     SetMinSize(GetSize());
 
     // Restore persisted settings.
     wxLogMessage("tile57: BuildChartsDialog loading config");
     wxString enc;
     LoadPaths(enc);
-    if (!enc.IsEmpty()) encPicker_->SetPath(enc);
+    if (!enc.IsEmpty())
+        encPicker_->SetPath(enc);
 
     buildBtn_->Bind(wxEVT_BUTTON, &BuildChartsDialog::OnBuild, this);
     rebuildBtn_->Bind(wxEVT_BUTTON, &BuildChartsDialog::OnRebuild, this);
@@ -165,13 +164,11 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     Bind(wxEVT_TIMER, &BuildChartsDialog::OnTimer, this);
     // Size in the log confirms which build is loaded: this (padded) build fits to ~600
     // wide with a Rebuild All button; an older build reads ~560 or ~520 and no Rebuild.
-    wxLogMessage("tile57: BuildChartsDialog ctor end, size=%dx%d",
-                 GetSize().GetWidth(), GetSize().GetHeight());
+    wxLogMessage("tile57: BuildChartsDialog ctor end, size=%dx%d", GetSize().GetWidth(),
+                 GetSize().GetHeight());
 }
 
-BuildChartsDialog::~BuildChartsDialog() {
-    StopBake();
-}
+BuildChartsDialog::~BuildChartsDialog() { StopBake(); }
 
 void BuildChartsDialog::OnBuild(wxCommandEvent&) { StartBuild(false); }
 void BuildChartsDialog::OnRebuild(wxCommandEvent&) { StartBuild(true); }
@@ -184,10 +181,11 @@ void BuildChartsDialog::SetRunningUI(bool running) {
 }
 
 void BuildChartsDialog::StartBuild(bool force) {
-    if (running_.load()) return;
+    if (running_.load())
+        return;
 
     const std::string enc = std::string(encPicker_->GetPath().mb_str());
-    const std::string dest = FixedDest();   // always the fixed XDG-cache charts dir
+    const std::string dest = FixedDest(); // always the fixed XDG-cache charts dir
 
     std::error_code ec;
     if (enc.empty() || !fs::is_directory(enc, ec)) {
@@ -207,7 +205,10 @@ void BuildChartsDialog::StartBuild(bool force) {
     for (auto it = fs::recursive_directory_iterator(
              enc, fs::directory_options::skip_permission_denied, ec);
          it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (ec) { ec.clear(); continue; }
+        if (ec) {
+            ec.clear();
+            continue;
+        }
         if (it->is_regular_file(ec) && IsDotZeroZeroZero(it->path()))
             cells.push_back(it->path().string());
     }
@@ -260,11 +261,13 @@ void BuildChartsDialog::StartWorkers(std::vector<std::string> cells) {
 
         auto worker = [this]() {
             for (;;) {
-                if (cancel_.load()) break;
+                if (cancel_.load())
+                    break;
                 std::string path;
                 {
                     std::lock_guard<std::mutex> lk(queue_mtx_);
-                    if (queue_.empty()) break;
+                    if (queue_.empty())
+                        break;
                     path = std::move(queue_.front());
                     queue_.pop_front();
                 }
@@ -273,7 +276,7 @@ void BuildChartsDialog::StartWorkers(std::vector<std::string> cells) {
                 const fs::path out = fs::path(dest_) / (in.stem().string() + ".pmtiles");
 
                 std::error_code ec;
-                if (!force_.load() && fs::exists(out, ec)) {   // idempotent resume (Build)
+                if (!force_.load() && fs::exists(out, ec)) { // idempotent resume (Build)
                     {
                         std::lock_guard<std::mutex> lk(status_mtx_);
                         current_cell_ = in.stem().string();
@@ -291,7 +294,8 @@ void BuildChartsDialog::StartWorkers(std::vector<std::string> cells) {
                 // the zoom cap the plugin used to compute per cell).
                 uint8_t* bytes = nullptr;
                 size_t len = 0;
-                if (tile57_bake_chart_bytes(path.c_str(), &bytes, &len, nullptr) == TILE57_OK && bytes) {
+                if (tile57_bake_chart_bytes(path.c_str(), &bytes, &len, nullptr) == TILE57_OK &&
+                    bytes) {
                     const fs::path tmp = out.string() + ".tmp";
                     {
                         std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
@@ -299,19 +303,25 @@ void BuildChartsDialog::StartWorkers(std::vector<std::string> cells) {
                     }
                     tile57_free(bytes);
                     fs::rename(tmp, out, ec);
-                    if (ec) { fs::remove(tmp, ec); failed_.fetch_add(1); }
+                    if (ec) {
+                        fs::remove(tmp, ec);
+                        failed_.fetch_add(1);
+                    }
                 } else {
-                    if (bytes) tile57_free(bytes);
+                    if (bytes)
+                        tile57_free(bytes);
                     failed_.fetch_add(1);
                 }
-                baked_.fetch_add(1);   // actually baked this run (drives the rate)
+                baked_.fetch_add(1); // actually baked this run (drives the rate)
                 done_.fetch_add(1);
             }
         };
 
         workers_.reserve(n);
-        for (unsigned i = 0; i < n; ++i) workers_.emplace_back(worker);
-        for (auto& t : workers_) t.join();
+        for (unsigned i = 0; i < n; ++i)
+            workers_.emplace_back(worker);
+        for (auto& t : workers_)
+            t.join();
         workers_.clear();
         finished_.store(true);
     });
@@ -323,7 +333,10 @@ void BuildChartsDialog::OnTimer(wxTimerEvent&) {
     gauge_->SetRange(std::max(1, total));
     gauge_->SetValue(std::min(done, total));
 
-    if (finished_.load()) { Finish(); return; }
+    if (finished_.load()) {
+        Finish();
+        return;
+    }
 
     std::string cur;
     {
@@ -339,7 +352,7 @@ void BuildChartsDialog::OnTimer(wxTimerEvent&) {
     const int baked = baked_.load();
     const double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time_).count();
-    const double rate = (baked > 0 && elapsed > 0.3) ? baked / elapsed : 0.0;   // baked/s
+    const double rate = (baked > 0 && elapsed > 0.3) ? baked / elapsed : 0.0; // baked/s
     const double eta = rate > 1e-6 ? (total - done) / rate : -1.0;
     stats_->SetLabel(wxString::Format(_T("elapsed %s   ·   %.1f cells/s   ·   ETA %s"),
                                       FmtDur(elapsed), rate, FmtDur(eta)));
@@ -349,7 +362,8 @@ void BuildChartsDialog::Finish() {
     // Timer is still on the main thread; stop it before joining so it can't
     // re-enter while the coordinator winds down.
     timer_.Stop();
-    if (coordinator_.joinable()) coordinator_.join();
+    if (coordinator_.joinable())
+        coordinator_.join();
 
     running_.store(false);
     SetRunningUI(false);
@@ -363,8 +377,8 @@ void BuildChartsDialog::Finish() {
     const double rate = (baked > 0 && elapsed > 0.1) ? baked / elapsed : 0.0;
     if (cancel_.load()) {
         status_->SetLabel(_T("Cancelled"));
-        stats_->SetLabel(wxString::Format(_T("stopped after %s · %d/%d cells"),
-                                          FmtDur(elapsed), done, total));
+        stats_->SetLabel(
+            wxString::Format(_T("stopped after %s · %d/%d cells"), FmtDur(elapsed), done, total));
         return;
     }
 
@@ -375,17 +389,20 @@ void BuildChartsDialog::Finish() {
 
     const int added = total - failed;
     wxString msg = wxString::Format(_T("Done — %d charts"), added);
-    if (failed > 0) msg += wxString::Format(_T(" (%d failed)"), failed);
+    if (failed > 0)
+        msg += wxString::Format(_T(" (%d failed)"), failed);
     status_->SetLabel(msg);
     const int skipped = total - baked;
     wxString st = wxString::Format(_T("baked %d cells in %s   ·   %.1f cells/s avg"),
                                    baked - failed, FmtDur(elapsed), rate);
-    if (skipped > 0) st += wxString::Format(_T("   ·   %d already cached"), skipped);
+    if (skipped > 0)
+        st += wxString::Format(_T("   ·   %d already cached"), skipped);
     stats_->SetLabel(st);
 }
 
 void BuildChartsDialog::OnCancel(wxCommandEvent&) {
-    if (!running_.load()) return;
+    if (!running_.load())
+        return;
     status_->SetLabel(_T("Cancelling…"));
     StopBake();
     // StopBake joins everything; reflect the cancelled end-state now.
@@ -395,8 +412,8 @@ void BuildChartsDialog::OnCancel(wxCommandEvent&) {
     const double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time_).count();
     status_->SetLabel(_T("Cancelled"));
-    stats_->SetLabel(wxString::Format(_T("stopped after %s · %d/%d cells"),
-                                      FmtDur(elapsed), done_.load(), total_.load()));
+    stats_->SetLabel(wxString::Format(_T("stopped after %s · %d/%d cells"), FmtDur(elapsed),
+                                      done_.load(), total_.load()));
 }
 
 void BuildChartsDialog::OnClose(wxCloseEvent& e) {
@@ -408,8 +425,9 @@ void BuildChartsDialog::OnClose(wxCloseEvent& e) {
 }
 
 void BuildChartsDialog::StopBake() {
-    timer_.Stop();               // never let the timer touch state mid-teardown
+    timer_.Stop(); // never let the timer touch state mid-teardown
     cancel_.store(true);
-    if (coordinator_.joinable()) coordinator_.join();   // joins workers, then returns
+    if (coordinator_.joinable())
+        coordinator_.join(); // joins workers, then returns
     running_.store(false);
 }

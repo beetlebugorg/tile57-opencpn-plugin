@@ -20,12 +20,14 @@
 // so it never caches a bad result.
 static inline bool t57_gl_loader_init() {
     static bool loaded = false;
-    if (loaded) return true;
+    if (loaded)
+        return true;
     glewExperimental = GL_TRUE;
     GLenum e = glewInit();
     // GLEW can report GLEW_ERROR_NO_GLX_DISPLAY under some setups yet still load every
     // entry point; accept that as long as the functions we use are present.
-    if (e != GLEW_OK) glGetError();
+    if (e != GLEW_OK)
+        glGetError();
     loaded = (e == GLEW_OK) || (glCreateProgram != nullptr && glGenBuffers != nullptr);
     return loaded;
 }

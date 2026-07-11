@@ -1,0 +1,10 @@
+# Style for the plugin's OWN C++ (src/ only). Vendored code — third_party/ and the
+# opencpn-libs submodule — is never reformatted (the CI check globs src/ only).
+# Pinned to clang-format 22.1.x so local and CI produce identical output (see the
+# format job in .github/workflows/ci.yml).
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+PointerAlignment: Left
+ReflowComments: false
+AlignTrailingComments: true

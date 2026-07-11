@@ -9,6 +9,16 @@ on:
 # OpenCPN api-18 submodule. macOS is intentionally NOT built here (it needs an
 # OpenCPN.app to retarget/re-sign wxWidgets against — see cmake/fix-macos-libs.sh).
 jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pin the exact clang-format so the check matches local formatting byte-for-byte
+      # (clang-format output drifts between versions). Only our own src/ — vendored
+      # third_party/ and the opencpn-libs submodule are left alone.
+      - name: clang-format check
+        run: pipx run --spec "clang-format==22.1.8" clang-format --dry-run --Werror src/*.cpp src/*.h
+
   linux:
     runs-on: ubuntu-latest
     steps:

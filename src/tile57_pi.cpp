@@ -6,16 +6,16 @@
 // bar and scale transitions included. The plugin itself only advertises the
 // chart class; the "NOT FOR NAVIGATION" warning (tile57 is experimental) rides
 // in the chart's name and description, where OpenCPN surfaces it.
-#include <cstdint>  // ocpn_plugin.h (api-18) references uint8_t before including it
-#include <cstdlib>  // getenv (startup build/debug marker)
+#include "build_charts.h"
 #include "ocpn_plugin.h"
 #include "tile57_chart.h"
-#include "build_charts.h"
-#include <wx/wx.h>
+#include <cstdint> // ocpn_plugin.h (api-18) references uint8_t before including it
+#include <cstdlib> // getenv (startup build/debug marker)
 #include <wx/html/htmlwin.h>
+#include <wx/wx.h>
 
 class Tile57Plugin : public opencpn_plugin_118 {
-public:
+  public:
     explicit Tile57Plugin(void* pmgr) : opencpn_plugin_118(pmgr) {}
 
     int Init() override {
@@ -25,13 +25,19 @@ public:
         // linestyles) on this, the main thread, before the chart-DB scan creates any
         // ChartTile57 and the GL thread first renders.
         tile57_warmup();
-        return INSTALLS_PLUGIN_CHART | INSTALLS_PLUGIN_CHART_GL
-             | WANTS_MOUSE_EVENTS | WANTS_CURSOR_LATLON
-             | WANTS_PREFERENCES;             // the "Build Charts" settings panel
+        return INSTALLS_PLUGIN_CHART | INSTALLS_PLUGIN_CHART_GL | WANTS_MOUSE_EVENTS |
+               WANTS_CURSOR_LATLON | WANTS_PREFERENCES; // the "Build Charts" settings panel
     }
     bool DeInit() override {
-        if (query_dlg_) { query_dlg_->Destroy(); query_dlg_ = nullptr; }
-        if (prefs_dlg_) { prefs_dlg_->StopBake(); prefs_dlg_->Destroy(); prefs_dlg_ = nullptr; }
+        if (query_dlg_) {
+            query_dlg_->Destroy();
+            query_dlg_ = nullptr;
+        }
+        if (prefs_dlg_) {
+            prefs_dlg_->StopBake();
+            prefs_dlg_->Destroy();
+            prefs_dlg_ = nullptr;
+        }
         return true;
     }
 
@@ -55,12 +61,19 @@ public:
     int GetAPIVersionMinor() override { return 18; }
     int GetPlugInVersionMajor() override { return 0; }
     int GetPlugInVersionMinor() override { return 1; }
-    wxBitmap* GetPlugInBitmap() override { static wxBitmap b(32, 32); return &b; }
-    wxString GetCommonName() override      { return _T("tile57 Vector Chart (EXPERIMENTAL)"); }
-    wxString GetShortDescription() override { return _T("S-57/S-101 vector chart via tile57 — NOT FOR NAVIGATION"); }
-    wxString GetLongDescription() override  { return _T("Installs an ENC chart driven by tile57's live S-52 portrayal, "
-                                                        "rendered on the GPU. Add the folder holding a baked bundle's "
-                                                        "chart.pmtiles as a chart directory. EXPERIMENTAL / NOT FOR NAVIGATION."); }
+    wxBitmap* GetPlugInBitmap() override {
+        static wxBitmap b(32, 32);
+        return &b;
+    }
+    wxString GetCommonName() override { return _T("tile57 Vector Chart (EXPERIMENTAL)"); }
+    wxString GetShortDescription() override {
+        return _T("S-57/S-101 vector chart via tile57 — NOT FOR NAVIGATION");
+    }
+    wxString GetLongDescription() override {
+        return _T("Installs an ENC chart driven by tile57's live S-52 portrayal, "
+                  "rendered on the GPU. Add the folder holding a baked bundle's "
+                  "chart.pmtiles as a chart directory. EXPERIMENTAL / NOT FOR NAVIGATION.");
+    }
 
     // OpenCPN scans our pre-baked *.pmtiles bundles (opened directly, fast). Prepare
     // charts (bake ENC cells -> *.pmtiles) via the Build Charts panel.
@@ -71,23 +84,29 @@ public:
     }
 
     // OpenCPN feeds us the cursor position in lat/lon as it moves.
-    void SetCursorLatLon(double lat, double lon) override { cur_lat_ = lat; cur_lon_ = lon; }
+    void SetCursorLatLon(double lat, double lon) override {
+        cur_lat_ = lat;
+        cur_lon_ = lon;
+    }
 
     // Object query on a single click (a press+release that did NOT drag, so
     // panning is unaffected): query the charts under the cursor and show the
     // result in a floating, non-modal panel that updates on each click. We do NOT
     // consume the click, so normal chart interaction still works.
     bool MouseEventHook(wxMouseEvent& event) override {
-        if (!event.LeftDClick()) return false;   // double-click = the OpenCPN pick gesture
+        if (!event.LeftDClick())
+            return false; // double-click = the OpenCPN pick gesture
         wxString body;
         for (auto* c : ChartTile57::instances())
-            if (c->covers(cur_lon_, cur_lat_)) body += c->QueryDescription(cur_lon_, cur_lat_);
-        if (body.IsEmpty()) return false;        // nothing here — let OpenCPN handle it
+            if (c->covers(cur_lon_, cur_lat_))
+                body += c->QueryDescription(cur_lon_, cur_lat_);
+        if (body.IsEmpty())
+            return false; // nothing here — let OpenCPN handle it
         show_query(body);
-        return true;   // consume: suppress OpenCPN's own query and its center-on-double-click
+        return true; // consume: suppress OpenCPN's own query and its center-on-double-click
     }
 
-private:
+  private:
     double cur_lat_ = 0, cur_lon_ = 0;
     wxDialog* query_dlg_ = nullptr;
     wxHtmlWindow* query_html_ = nullptr;
@@ -95,9 +114,10 @@ private:
 
     void show_query(const wxString& body) {
         if (!query_dlg_) {
-            query_dlg_ = new wxDialog(GetOCPNCanvasWindow(), wxID_ANY, _T("Object Query — tile57"),
-                                      wxDefaultPosition, wxSize(440, 500),
-                                      wxCAPTION | wxCLOSE_BOX | wxRESIZE_BORDER | wxFRAME_FLOAT_ON_PARENT);
+            query_dlg_ =
+                new wxDialog(GetOCPNCanvasWindow(), wxID_ANY, _T("Object Query — tile57"),
+                             wxDefaultPosition, wxSize(440, 500),
+                             wxCAPTION | wxCLOSE_BOX | wxRESIZE_BORDER | wxFRAME_FLOAT_ON_PARENT);
             auto* sizer = new wxBoxSizer(wxVERTICAL);
             query_html_ = new wxHtmlWindow(query_dlg_);
             sizer->Add(query_html_, 1, wxEXPAND | wxALL, 4);

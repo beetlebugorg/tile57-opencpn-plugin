@@ -26,7 +26,7 @@ class wxStaticText;
 class wxChoice;
 
 class BuildChartsDialog : public wxDialog {
-public:
+  public:
     explicit BuildChartsDialog(wxWindow* parent);
     ~BuildChartsDialog() override;
 
@@ -34,42 +34,42 @@ public:
     // dialog's own close handler and from the plugin's DeInit before Destroy().
     void StopBake();
 
-private:
+  private:
     void OnBuild(wxCommandEvent&);
     void OnRebuild(wxCommandEvent&);
     void OnCancel(wxCommandEvent&);
     void OnClose(wxCloseEvent&);
     void OnTimer(wxTimerEvent&);
 
-    void StartBuild(bool force);   // shared by Build (resume) + Rebuild (force)
+    void StartBuild(bool force); // shared by Build (resume) + Rebuild (force)
     void StartWorkers(std::vector<std::string> cells);
-    void Finish();   // main-thread completion: register dir, reset UI
+    void Finish(); // main-thread completion: register dir, reset UI
     void SetRunningUI(bool running);
 
     // --- widgets ---
     wxDirPickerCtrl* encPicker_ = nullptr;
-    wxButton*        buildBtn_ = nullptr;
-    wxButton*        rebuildBtn_ = nullptr;      // force re-bake (ignore existing outputs)
-    wxButton*        cancelBtn_ = nullptr;
-    wxGauge*         gauge_ = nullptr;
-    wxStaticText*    status_ = nullptr;
-    wxStaticText*    stats_ = nullptr;           // elapsed / rate / ETA
-    wxTimer          timer_;
+    wxButton* buildBtn_ = nullptr;
+    wxButton* rebuildBtn_ = nullptr; // force re-bake (ignore existing outputs)
+    wxButton* cancelBtn_ = nullptr;
+    wxGauge* gauge_ = nullptr;
+    wxStaticText* status_ = nullptr;
+    wxStaticText* stats_ = nullptr; // elapsed / rate / ETA
+    wxTimer timer_;
 
     // --- bake state (shared with workers) ---
     // done_ = cells processed (incl. skipped already-baked); baked_ = cells actually
     // baked THIS run (drives the rate/ETA so a resume's instant skips don't skew it).
-    std::atomic<int>  total_{0}, done_{0}, baked_{0}, failed_{0};
+    std::atomic<int> total_{0}, done_{0}, baked_{0}, failed_{0};
     std::atomic<bool> cancel_{false}, running_{false}, finished_{false};
-    std::mutex        status_mtx_;
-    std::string       current_cell_;
-    std::string       dest_;
-    std::atomic<bool> force_{false};     // Rebuild: overwrite existing outputs
-    std::chrono::steady_clock::time_point start_time_;   // set when a run begins
+    std::mutex status_mtx_;
+    std::string current_cell_;
+    std::string dest_;
+    std::atomic<bool> force_{false};                   // Rebuild: overwrite existing outputs
+    std::chrono::steady_clock::time_point start_time_; // set when a run begins
 
     // Work queue + worker pool, driven by a single coordinator thread.
-    std::deque<std::string>  queue_;
-    std::mutex               queue_mtx_;
-    std::thread              coordinator_;
+    std::deque<std::string> queue_;
+    std::mutex queue_mtx_;
+    std::thread coordinator_;
     std::vector<std::thread> workers_;
 };

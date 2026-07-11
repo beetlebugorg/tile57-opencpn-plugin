@@ -20,18 +20,18 @@
 // create instances by name (the name it returns from
 // Tile57Plugin::GetDynamicChartClassNameArray).
 #pragma once
-#include <cstdint>  // ocpn_plugin.h (api-18) references uint8_t before including it
-#include <vector>
-#include <string>
-#include "ocpn_plugin.h"
 #include "chart_renderer.h"
+#include "ocpn_plugin.h"
+#include <cstdint> // ocpn_plugin.h (api-18) references uint8_t before including it
+#include <string>
+#include <vector>
 #include <wx/bitmap.h>
 #include <wx/object.h>
 
 extern "C" void tile57_mariner_defaults(tile57_mariner*);
 
 class ChartTile57 : public PlugInChartBaseExtended {
-public:
+  public:
     ChartTile57();
     virtual ~ChartTile57();
 
@@ -81,7 +81,8 @@ public:
     // DC fallback (non-GL canvas). This plugin needs OpenGL to draw; on the DC
     // canvas it returns a transparent bitmap so nothing is clobbered.
     wxBitmap& RenderRegionView(const PlugIn_ViewPort& VPoint, const wxRegion& Region) override;
-    wxBitmap& RenderRegionViewOnDCNoText(const PlugIn_ViewPort& VPoint, const wxRegion& Region) override;
+    wxBitmap& RenderRegionViewOnDCNoText(const PlugIn_ViewPort& VPoint,
+                                         const wxRegion& Region) override;
     bool RenderRegionViewOnDCTextOnly(wxMemoryDC& dc, const PlugIn_ViewPort& VPoint,
                                       const wxRegion& Region) override;
 
@@ -96,7 +97,7 @@ public:
     bool covers(double lon, double lat) const;
     static const std::vector<ChartTile57*>& instances();
 
-private:
+  private:
     // Extract bbox / native scale / M_COVR coverage from an open chart handle into
     // this chart's members (GetChartExtent / m_Chart_Scale / GetCOVR*).
     void apply_info(tile57_chart* h, const tile57_info& info);
@@ -107,8 +108,7 @@ private:
     void draw_calibration() const;
 
     // Shared per-pass render: ViewPort -> tile57 camera -> draw `pass` buffers.
-    int render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
-                    bool stencil_clip);
+    int render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass, bool stencil_clip);
     wxBitmap& transparent_bitmap(const PlugIn_ViewPort& vp);
     // Pull OpenCPN's S52/vector-chart options (soundings, display category,
     // text, contours, …) into the tile57 mariner. Cheap: re-reads only when
@@ -117,23 +117,23 @@ private:
 
     t57::ChartRenderer renderer_;
     tile57_mariner mariner_{};
-    double last_zoom_ = 0;   // last rendered view zoom, for the object-query pick
-    double size_scale_csf_ = -1.0;   // content-scale mariner_.size_scale was computed at
+    double last_zoom_ = 0;         // last rendered view zoom, for the object-query pick
+    double size_scale_csf_ = -1.0; // content-scale mariner_.size_scale was computed at
 
     double center_lat_ = 0.0;
     double bounds_west_ = 0.0, bounds_south_ = 0.0, bounds_east_ = 0.0, bounds_north_ = 0.0;
     int min_zoom_ = 0, max_zoom_ = 0;
     bool covr_valid_ = false;
-    float covr_[8] = {0};   // bbox fallback: 4 points, each (lat, lon), float_2Dpt order
+    float covr_[8] = {0}; // bbox fallback: 4 points, each (lat, lon), float_2Dpt order
     // Real M_COVR coverage: one entry per polygon, a flat (lat,lon) float array. Empty
     // => fall back to covr_ (the bbox), e.g. for a baked pmtiles chart.
     std::vector<std::vector<float>> covr_tables_;
 
-    wxBitmap dc_bmp_;       // backing store for the DC fallback
+    wxBitmap dc_bmp_; // backing store for the DC fallback
 
-    int plib_hash_ = -1;    // last PI_GetPLIBStateHash() folded into mariner_
+    int plib_hash_ = -1; // last PI_GetPLIBStateHash() folded into mariner_
 
-    wxWindow* canvas_ = nullptr;   // canvas for CallAfter(Refresh) (progressive-tile redraw)
+    wxWindow* canvas_ = nullptr; // canvas for CallAfter(Refresh) (progressive-tile redraw)
 
     wxDECLARE_DYNAMIC_CLASS(ChartTile57);
 };
@@ -142,8 +142,9 @@ private:
 // GetFileSearchMask can return only one wildcard (OpenCPN uses the whole string as one),
 // so the mask lives on this subclass while all behaviour stays in the shared base.
 class ChartTile57Pmtiles : public ChartTile57 {
-public:
+  public:
     wxString GetFileSearchMask(void) override { return _T("*.pmtiles"); }
-private:
+
+  private:
     wxDECLARE_DYNAMIC_CLASS(ChartTile57Pmtiles);
 };

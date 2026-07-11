@@ -1,10 +1,6 @@
 // tile57_chart.cpp — see tile57_chart.h.
 #include "tile57_chart.h"
 #include "gl.h"
-#include <wx/fileconf.h>
-#include <wx/filename.h>
-#include <wx/image.h>
-#include <wx/log.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -13,6 +9,10 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include <wx/fileconf.h>
+#include <wx/filename.h>
+#include <wx/image.h>
+#include <wx/log.h>
 
 // wxWidgets can create ChartTile57 by class name; OpenCPN uses this to
 // instantiate the chart for each matching file it finds in a chart directory.
@@ -44,7 +44,8 @@ static double size_cal_factor() {
 double display_size_scale(double csf) {
     double mm = PlugInGetDisplaySizeMM();
     int sw = wxGetDisplaySize().GetWidth();
-    if (mm < 1.0 || sw <= 0) return size_cal_factor();
+    if (mm < 1.0 || sw <= 0)
+        return size_cal_factor();
     // S-52 sizes symbology in physical mm, so we need the display's PHYSICAL px/mm.
     // wxGetDisplaySize() returns LOGICAL points on macOS (DIPs generally), so scale by
     // the content-scale factor (csf) to recover physical pixels first. Without this, a
@@ -54,7 +55,8 @@ double display_size_scale(double csf) {
     // value — at construction OCPN_GetDisplayContentScaleFactor() returns 1 (the chart's
     // canvas isn't on its display yet), so render_pass recomputes this when csf is known.
     // cull_bias = log2(size_scale) (render_pass) tracks the result. TILE57_SIZE trims.
-    if (!(csf > 0.0)) csf = 1.0;
+    if (!(csf > 0.0))
+        csf = 1.0;
     double s = (sw * csf / mm) / kTile57RefPxPerMm * size_cal_factor();
     return (s > 0.1 && s < 12.0) ? s : 1.0;
 }
@@ -94,7 +96,7 @@ int scale_denom(double zoom, double lat_deg) {
     return (int)std::llround(resolution_m_per_px(zoom, lat_deg) * kPxPerMetre);
 }
 
-}  // namespace
+} // namespace
 
 ChartTile57::ChartTile57() {
     m_ChartType = PI_CHART_TYPE_PLUGIN;
@@ -120,37 +122,45 @@ void ChartTile57::apply_info(tile57_chart* h, const tile57_info& info) {
     // A cell reports its real compilation scale (CSCL); fall back to the finest baked
     // zoom band otherwise. Using the CSCL is essential — the raw zoom range is 0..18,
     // which would yield an absurd 1:~1700 and OpenCPN would deselect the chart.
-    m_Chart_Scale = info.native_scale > 0 ? info.native_scale
-                                          : scale_denom(info.max_zoom, center_lat_);
+    m_Chart_Scale =
+        info.native_scale > 0 ? info.native_scale : scale_denom(info.max_zoom, center_lat_);
     m_Chart_Skew = 0.0;
     m_depth_unit_id = PI_DEPTH_UNIT_METERS;
     m_DepthUnits = _T("Meters");
 
     // Coverage rectangle fallback: OpenCPN COVR points are float_2Dpt (lat, lon).
-    covr_[0] = (float)info.north; covr_[1] = (float)info.west;   // NW
-    covr_[2] = (float)info.north; covr_[3] = (float)info.east;   // NE
-    covr_[4] = (float)info.south; covr_[5] = (float)info.east;   // SE
-    covr_[6] = (float)info.south; covr_[7] = (float)info.west;   // SW
+    covr_[0] = (float)info.north;
+    covr_[1] = (float)info.west; // NW
+    covr_[2] = (float)info.north;
+    covr_[3] = (float)info.east; // NE
+    covr_[4] = (float)info.south;
+    covr_[5] = (float)info.east; // SE
+    covr_[6] = (float)info.south;
+    covr_[7] = (float)info.west; // SW
     covr_valid_ = true;
 
     // Real M_COVR data-coverage polygons: report these so OpenCPN quilts gaps to
     // coarser cells instead of over-claiming the bbox above.
     covr_tables_.clear();
-    tile57_coverage_cb ccb{ &covr_tables_, [](void* ctx, const double* ll, size_t n) {
-        auto* tables = static_cast<std::vector<std::vector<float>>*>(ctx);
-        std::vector<float> ring;
-        ring.reserve(n * 2);
-        for (size_t i = 0; i < n; ++i) {   // tile57 gives lon,lat; OpenCPN wants lat,lon
-            ring.push_back((float)ll[2 * i + 1]);
-            ring.push_back((float)ll[2 * i]);
-        }
-        tables->push_back(std::move(ring));
-    } };
+    tile57_coverage_cb ccb{&covr_tables_, [](void* ctx, const double* ll, size_t n) {
+                               auto* tables = static_cast<std::vector<std::vector<float>>*>(ctx);
+                               std::vector<float> ring;
+                               ring.reserve(n * 2);
+                               for (size_t i = 0; i < n;
+                                    ++i) { // tile57 gives lon,lat; OpenCPN wants lat,lon
+                                   ring.push_back((float)ll[2 * i + 1]);
+                                   ring.push_back((float)ll[2 * i]);
+                               }
+                               tables->push_back(std::move(ring));
+                           }};
     tile57_chart_coverage(h, &ccb, nullptr);
 
-    bounds_west_ = info.west; bounds_south_ = info.south;
-    bounds_east_ = info.east; bounds_north_ = info.north;
-    min_zoom_ = info.min_zoom; max_zoom_ = info.max_zoom;
+    bounds_west_ = info.west;
+    bounds_south_ = info.south;
+    bounds_east_ = info.east;
+    bounds_north_ = info.north;
+    min_zoom_ = info.min_zoom;
+    max_zoom_ = info.max_zoom;
 }
 
 int ChartTile57::Init(const wxString& full_path, int init_flags) {
@@ -165,9 +175,11 @@ int ChartTile57::Init(const wxString& full_path, int init_flags) {
     // from the archive itself. Cells are baked to *.pmtiles up front via the Build
     // Charts dialog (see build_charts.cpp).
     std::string path = std::string(full_path.mb_str());
-    if (!renderer_.open_chart(path)) return PI_INIT_FAIL_REMOVE;
+    if (!renderer_.open_chart(path))
+        return PI_INIT_FAIL_REMOVE;
     tile57_info info{};
-    if (!renderer_.get_info(info) || !info.has_bounds) return PI_INIT_FAIL_REMOVE;
+    if (!renderer_.get_info(info) || !info.has_bounds)
+        return PI_INIT_FAIL_REMOVE;
     apply_info(renderer_.chart_handle(), info);
     wxLogMessage("tile57 Init: %s bounds[W%.5f S%.5f E%.5f N%.5f] zoom[%d..%d] scale=1:%d flags=%d",
                  m_FullPath.c_str(), info.west, info.south, info.east, info.north,
@@ -178,9 +190,15 @@ int ChartTile57::Init(const wxString& full_path, int init_flags) {
 
 void ChartTile57::SetColorScheme(int cs, bool /*bApplyImmediate*/) {
     switch (cs) {
-        case PI_GLOBAL_COLOR_SCHEME_DUSK:  mariner_.scheme = TILE57_SCHEME_DUSK;  break;
-        case PI_GLOBAL_COLOR_SCHEME_NIGHT: mariner_.scheme = TILE57_SCHEME_NIGHT; break;
-        default:                           mariner_.scheme = TILE57_SCHEME_DAY;   break;
+    case PI_GLOBAL_COLOR_SCHEME_DUSK:
+        mariner_.scheme = TILE57_SCHEME_DUSK;
+        break;
+    case PI_GLOBAL_COLOR_SCHEME_NIGHT:
+        mariner_.scheme = TILE57_SCHEME_NIGHT;
+        break;
+    default:
+        mariner_.scheme = TILE57_SCHEME_DAY;
+        break;
     }
 }
 
@@ -201,11 +219,12 @@ double ChartTile57::GetNormalScaleMax(double /*canvas_scale_factor*/, int /*canv
 }
 
 double ChartTile57::GetNearestPreferredScalePPM(double target_scale_ppm) {
-    return target_scale_ppm;  // continuous scale support
+    return target_scale_ppm; // continuous scale support
 }
 
 bool ChartTile57::GetChartExtent(ExtentPI* pext) {
-    if (!pext || !covr_valid_) return false;
+    if (!pext || !covr_valid_)
+        return false;
     pext->NLAT = bounds_north_;
     pext->SLAT = bounds_south_;
     pext->WLON = bounds_west_;
@@ -216,14 +235,16 @@ bool ChartTile57::GetChartExtent(ExtentPI* pext) {
 void ChartTile57::GetValidCanvasRegion(const PlugIn_ViewPort& vp, wxRegion* pValidRegion) {
     // The chart paints the whole view; OpenCPN clips to the COVR coverage during
     // quilting. Report the full canvas as valid.
-    if (pValidRegion) *pValidRegion = wxRegion(0, 0, vp.pix_width, vp.pix_height);
+    if (pValidRegion)
+        *pValidRegion = wxRegion(0, 0, vp.pix_width, vp.pix_height);
 }
 
 void ChartTile57::refresh_mariner() {
     // PI_GetPLIBStateHash changes whenever an S52/vector-chart option changes;
     // between changes this is a single int compare per render.
     int hash = PI_GetPLIBStateHash();
-    if (hash == plib_hash_) return;
+    if (hash == plib_hash_)
+        return;
     plib_hash_ = hash;
 
     mariner_.safety_contour = PI_GetPLIBMarinerSafetyContour();
@@ -232,10 +253,9 @@ void ChartTile57::refresh_mariner() {
     mariner_.simplified_points = (PI_GetPLIBSymbolStyle() == 'L');
     // Area boundaries: 'O' symbolized (richer edge symbology) / 'N' plain. Was
     // hardcoded to symbolized, so OpenCPN's Plain/Symbolized toggle did nothing.
-    mariner_.boundary_style = (PI_GetPLIBBoundaryStyle() == 'O') ? TILE57_BOUNDARY_SYMBOLIZED
-                                                                 : TILE57_BOUNDARY_PLAIN;
-    mariner_.depth_unit = (PI_GetPLIBDepthUnitInt() == 0) ? TILE57_DEPTH_FEET
-                                                          : TILE57_DEPTH_METERS;
+    mariner_.boundary_style =
+        (PI_GetPLIBBoundaryStyle() == 'O') ? TILE57_BOUNDARY_SYMBOLIZED : TILE57_BOUNDARY_PLAIN;
+    mariner_.depth_unit = (PI_GetPLIBDepthUnitInt() == 0) ? TILE57_DEPTH_FEET : TILE57_DEPTH_METERS;
     // Information callouts (INFORM/TXTDSC balloons) clutter the chart — keep them
     // off unconditionally (set here, not in the config block below which may be
     // skipped when GetOCPNConfigObject() is null).
@@ -279,12 +299,17 @@ void ChartTile57::refresh_mariner() {
         double v;
         // Prefer the stored contour values (the mariner's set depths) over the
         // PI getter, which can hand back the snapped/displayed safety contour.
-        if (cfg->Read("S52_MAR_SAFETY_CONTOUR", &v)) mariner_.safety_contour = v;
-        if (cfg->Read("S52_MAR_SHALLOW_CONTOUR", &v)) mariner_.shallow_contour = v;
-        if (cfg->Read("S52_MAR_DEEP_CONTOUR", &v)) mariner_.deep_contour = v;
-        if (cfg->Read("S52_MAR_SAFETY_DEPTH", &v)) mariner_.safety_depth = v;
+        if (cfg->Read("S52_MAR_SAFETY_CONTOUR", &v))
+            mariner_.safety_contour = v;
+        if (cfg->Read("S52_MAR_SHALLOW_CONTOUR", &v))
+            mariner_.shallow_contour = v;
+        if (cfg->Read("S52_MAR_DEEP_CONTOUR", &v))
+            mariner_.deep_contour = v;
+        if (cfg->Read("S52_MAR_SAFETY_DEPTH", &v))
+            mariner_.safety_depth = v;
         long two_shades = 0;
-        if (cfg->Read("S52_MAR_TWO_SHADES", &two_shades)) mariner_.four_shade_water = !two_shades;
+        if (cfg->Read("S52_MAR_TWO_SHADES", &two_shades))
+            mariner_.four_shade_water = !two_shades;
 
         // Full-length light sector lines (OpenCPN "Extended light sectors").
         bool full_sectors = true;
@@ -307,11 +332,13 @@ void ChartTile57::refresh_mariner() {
 
 void ChartTile57::draw_calibration() const {
     static const bool on = std::getenv("TILE57_CALIB") != nullptr;
-    if (!on) return;
+    if (!on)
+        return;
     GLint gvp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, gvp);
     const float W = (float)gvp[2], H = (float)gvp[3];
-    if (W <= 0.f || H <= 0.f) return;
+    if (W <= 0.f || H <= 0.f)
+        return;
 
     // A 5mm square at the SAME effective px/mm the chart symbols use (kTile57RefPxPerMm
     // is tile57's size_scale=1 density; mariner_.size_scale carries the display + HiDPI
@@ -322,41 +349,57 @@ void ChartTile57::draw_calibration() const {
     if (!logged) {
         logged = true;
         wxLogMessage("tile57 CALIB: 5mm square = %.1f px  (size_scale=%.3f, %.2f px/mm, "
-                     "displayMM=%.1f, csf=%.2f)", side, mariner_.size_scale,
-                     kTile57RefPxPerMm * mariner_.size_scale, PlugInGetDisplaySizeMM(),
-                     OCPN_GetDisplayContentScaleFactor());
+                     "displayMM=%.1f, csf=%.2f)",
+                     side, mariner_.size_scale, kTile57RefPxPerMm * mariner_.size_scale,
+                     PlugInGetDisplaySizeMM(), OCPN_GetDisplayContentScaleFactor());
     }
 
     glUseProgram(0);
-    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
     glOrtho(0, W, H, 0, -1, 1);
-    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
-    glDisable(GL_TEXTURE_2D); glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND);
-    glColor3f(0.f, 0.f, 0.f);           // filled black 5mm square (like CHKSYM01)
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glColor3f(0.f, 0.f, 0.f); // filled black 5mm square (like CHKSYM01)
     glBegin(GL_QUADS);
-    glVertex2f(cx - hs, cy - hs); glVertex2f(cx + hs, cy - hs);
-    glVertex2f(cx + hs, cy + hs); glVertex2f(cx - hs, cy + hs);
+    glVertex2f(cx - hs, cy - hs);
+    glVertex2f(cx + hs, cy - hs);
+    glVertex2f(cx + hs, cy + hs);
+    glVertex2f(cx - hs, cy + hs);
     glEnd();
-    glColor3f(1.f, 0.25f, 0.25f);       // crisp red edge for measuring
+    glColor3f(1.f, 0.25f, 0.25f); // crisp red edge for measuring
     glLineWidth(1.f);
     glBegin(GL_LINE_LOOP);
-    glVertex2f(cx - hs, cy - hs); glVertex2f(cx + hs, cy - hs);
-    glVertex2f(cx + hs, cy + hs); glVertex2f(cx - hs, cy + hs);
+    glVertex2f(cx - hs, cy - hs);
+    glVertex2f(cx + hs, cy - hs);
+    glVertex2f(cx + hs, cy + hs);
+    glVertex2f(cx - hs, cy + hs);
     glEnd();
-    glMatrixMode(GL_PROJECTION); glPopMatrix();
-    glMatrixMode(GL_MODELVIEW); glPopMatrix();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
 }
 
 int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
                              bool stencil_clip) {
-    if (!vp.bValid) return false;
-    if (!renderer_.has_chart()) return true;
-    if (!renderer_.ensure_gl()) return false;
+    if (!vp.bValid)
+        return false;
+    if (!renderer_.has_chart())
+        return true;
+    if (!renderer_.ensure_gl())
+        return false;
     refresh_mariner();
     // Remember the canvas (on the GL thread, where it's valid) for the deferred-tile
     // CallAfter(Refresh) below — a settled view with cold tiles still pending asks for
     // one more redraw so they fill in.
-    if (!canvas_) canvas_ = GetOCPNCanvasWindow();
+    if (!canvas_)
+        canvas_ = GetOCPNCanvasWindow();
 
     // Render into the CURRENT GL viewport — that is what NDC maps to, and it is
     // OpenCPN's choice of target (canvas FBO, or a sub-rect of it). Do NOT size
@@ -391,8 +434,8 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     // scales up to fill the physical framebuffer.
     double device_scale =
         (csf > 1.0 && fbw == (uint32_t)std::lround(vp.pix_width * csf)) ? csf : 1.0;
-    double zoom = zoom_for_ppm(ppm);   // geographic (un-bumped)
-    last_zoom_ = zoom;   // remembered for the object-query pick tolerance / SCAMIN
+    double zoom = zoom_for_ppm(ppm); // geographic (un-bumped)
+    last_zoom_ = zoom;               // remembered for the object-query pick tolerance / SCAMIN
     // SCAMIN cull bias: symbols are drawn at true physical size by size_scale (the px/mm
     // chain, incl. the HiDPI csf), while the SCAMIN thresholds are calibrated at
     // size_scale=1 — so drop SCAMIN'd features out log2(size_scale) mercator levels
@@ -405,7 +448,7 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     // TILE57_DECLUTTER=<levels> overrides: 0 = match native (no compensation), higher = more.
     static const double declutter_override = [] {
         const char* e = std::getenv("TILE57_DECLUTTER");
-        return e ? std::atof(e) : -1.0;   // <0 sentinel: use the size_scale-derived default
+        return e ? std::atof(e) : -1.0; // <0 sentinel: use the size_scale-derived default
     }();
     double cull_bias = declutter_override >= 0.0 ? declutter_override
                                                  : std::log2(std::max(1.0, mariner_.size_scale));
@@ -419,12 +462,12 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
             dbg_last = zoom;
             wxLogMessage("tile57 DBG: zoom=%.3f cull_zoom=%.3f cull_bias=%.2f dev_scale=%.2f "
                          "csf=%.2f pixW=%d fbW=%u gate(pixW*csf)=%ld size_scale=%.3f ppm=%.5f",
-                         zoom, zoom - cull_bias, cull_bias, device_scale, csf, vp.pix_width,
-                         fbw, std::lround(vp.pix_width * csf), mariner_.size_scale, ppm);
+                         zoom, zoom - cull_bias, cull_bias, device_scale, csf, vp.pix_width, fbw,
+                         std::lround(vp.pix_width * csf), mariner_.size_scale, ppm);
         }
     }
-    renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip,
-                     device_scale, cull_bias);
+    renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip, device_scale,
+                     cull_bias);
     // The tiled renderer portrays only a budget of new tiles per frame (so a big
     // first-visit burst doesn't freeze one frame). If it deferred some, schedule
     // another redraw so they fill in progressively.
@@ -440,7 +483,8 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
             refresh_inflight.store(false);
             w->Refresh(false);
         });
-    if (pass != t57::ChartRenderer::Pass::kText) draw_calibration();
+    if (pass != t57::ChartRenderer::Pass::kText)
+        draw_calibration();
     return true;
 }
 
@@ -466,7 +510,9 @@ int ChartTile57::RenderRegionViewOnGLTextOnly(const wxGLContext& /*glc*/, const 
 
 // ---- object query (S-52 §10.8 pick) ----------------------------------------
 namespace {
-struct QueryHit { std::string cls, s57, cell; };
+struct QueryHit {
+    std::string cls, s57, cell;
+};
 void collect_hit(void* ctx, const char* cls, size_t cl, const char* s57, size_t sl,
                  const char* cell, size_t cel) {
     static_cast<std::vector<QueryHit>*>(ctx)->push_back(
@@ -476,24 +522,45 @@ void collect_hit(void* ctx, const char* cls, size_t cl, const char* s57, size_t 
 // Append a flat JSON object {"KEY":"VAL",...} (the pick blob) as HTML table rows.
 void json_rows(const std::string& j, wxString& out) {
     size_t i = 0, n = j.size();
-    auto ws = [&] { while (i < n && (j[i]==' '||j[i]=='\n'||j[i]=='\t'||j[i]=='\r')) ++i; };
+    auto ws = [&] {
+        while (i < n && (j[i] == ' ' || j[i] == '\n' || j[i] == '\t' || j[i] == '\r'))
+            ++i;
+    };
     auto str = [&](std::string& s) -> bool {
-        if (i >= n || j[i] != '"') return false;
-        ++i; s.clear();
-        while (i < n && j[i] != '"') { if (j[i] == '\\' && i + 1 < n) ++i; s += j[i++]; }
-        if (i < n) ++i;
+        if (i >= n || j[i] != '"')
+            return false;
+        ++i;
+        s.clear();
+        while (i < n && j[i] != '"') {
+            if (j[i] == '\\' && i + 1 < n)
+                ++i;
+            s += j[i++];
+        }
+        if (i < n)
+            ++i;
         return true;
     };
-    ws(); if (i < n && j[i] == '{') ++i;
+    ws();
+    if (i < n && j[i] == '{')
+        ++i;
     while (i < n) {
-        ws(); if (i < n && j[i] == '}') break;
+        ws();
+        if (i < n && j[i] == '}')
+            break;
         std::string k, v;
-        if (!str(k)) break;
-        ws(); if (i < n && j[i] == ':') ++i; ws();
-        if (!str(v)) break;
-        out += "<tr><td valign=top><b>" + wxString::FromUTF8(k.c_str()) +
-               "</b></td><td>" + wxString::FromUTF8(v.c_str()) + "</td></tr>";
-        ws(); if (i < n && j[i] == ',') ++i;
+        if (!str(k))
+            break;
+        ws();
+        if (i < n && j[i] == ':')
+            ++i;
+        ws();
+        if (!str(v))
+            break;
+        out += "<tr><td valign=top><b>" + wxString::FromUTF8(k.c_str()) + "</b></td><td>" +
+               wxString::FromUTF8(v.c_str()) + "</td></tr>";
+        ws();
+        if (i < n && j[i] == ',')
+            ++i;
     }
 }
 
@@ -504,7 +571,8 @@ wxString build_query_html(const std::vector<QueryHit>& hits) {
     wxString h;
     std::unordered_set<std::string> seen;
     for (const auto& f : hits) {
-        if (!seen.insert(f.cls + '\0' + f.s57 + '\0' + f.cell).second) continue;
+        if (!seen.insert(f.cls + '\0' + f.s57 + '\0' + f.cell).second)
+            continue;
         h += "<font size=+1><b>" + wxString::FromUTF8(f.cls.c_str()) + "</b></font>";
         if (!f.cell.empty())
             h += "  <font size=-1 color=#808080>" + wxString::FromUTF8(f.cell.c_str()) + "</font>";
@@ -514,23 +582,25 @@ wxString build_query_html(const std::vector<QueryHit>& hits) {
     }
     return h;
 }
-}  // namespace
+} // namespace
 
 const std::vector<ChartTile57*>& ChartTile57::instances() { return chart_registry(); }
 
 wxString ChartTile57::QueryDescription(double lon, double lat) const {
     tile57_chart* ch = renderer_.chart_handle();
-    if (!ch) return wxEmptyString;
+    if (!ch)
+        return wxEmptyString;
     std::vector<QueryHit> hits;
-    tile57_query_cb cb{ &hits, collect_hit };
+    tile57_query_cb cb{&hits, collect_hit};
     tile57_chart_query(ch, lon, lat, last_zoom_, &cb, nullptr);
-    if (hits.empty()) return wxEmptyString;
+    if (hits.empty())
+        return wxEmptyString;
     return build_query_html(hits);
 }
 
 bool ChartTile57::covers(double lon, double lat) const {
-    return covr_valid_ && lon >= bounds_west_ && lon <= bounds_east_
-        && lat >= bounds_south_ && lat <= bounds_north_;
+    return covr_valid_ && lon >= bounds_west_ && lon <= bounds_east_ && lat >= bounds_south_ &&
+           lat <= bounds_north_;
 }
 
 wxBitmap& ChartTile57::transparent_bitmap(const PlugIn_ViewPort& vp) {
@@ -538,7 +608,7 @@ wxBitmap& ChartTile57::transparent_bitmap(const PlugIn_ViewPort& vp) {
     int h = vp.pix_height > 0 ? vp.pix_height : 1;
     wxImage img(w, h);
     img.InitAlpha();
-    std::memset(img.GetAlpha(), 0, (size_t)w * h);  // fully transparent
+    std::memset(img.GetAlpha(), 0, (size_t)w * h); // fully transparent
     dc_bmp_ = wxBitmap(img);
     return dc_bmp_;
 }
@@ -547,11 +617,13 @@ wxBitmap& ChartTile57::RenderRegionView(const PlugIn_ViewPort& vp, const wxRegio
     return transparent_bitmap(vp);
 }
 
-wxBitmap& ChartTile57::RenderRegionViewOnDCNoText(const PlugIn_ViewPort& vp, const wxRegion& /*Region*/) {
+wxBitmap& ChartTile57::RenderRegionViewOnDCNoText(const PlugIn_ViewPort& vp,
+                                                  const wxRegion& /*Region*/) {
     return transparent_bitmap(vp);
 }
 
-bool ChartTile57::RenderRegionViewOnDCTextOnly(wxMemoryDC& /*dc*/, const PlugIn_ViewPort& /*VPoint*/,
+bool ChartTile57::RenderRegionViewOnDCTextOnly(wxMemoryDC& /*dc*/,
+                                               const PlugIn_ViewPort& /*VPoint*/,
                                                const wxRegion& /*Region*/) {
-    return false;  // GL-only plugin; nothing to draw on the DC canvas
+    return false; // GL-only plugin; nothing to draw on the DC canvas
 }
