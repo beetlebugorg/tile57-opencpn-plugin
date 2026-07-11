@@ -54,3 +54,13 @@ done
 
 echo "fix-macos-libs.sh: retargeted $changed wxWidgets reference(s):"
 otool -L "$plugin" | grep -i wx || true
+
+# install_name_tool INVALIDATES the linker's ad-hoc code signature. macOS then
+# SIGKILLs the plugin at dlopen with "Code Signature Invalid / Invalid Page" (dyld
+# faults reading the header in isUniversal/compatibleSlice) and OpenCPN disables it.
+# Re-sign ad-hoc so it loads; --force mints a fresh CDHash, which also sidesteps a
+# stale kernel code-signing cache on in-place reinstalls.
+if [ "$changed" -gt 0 ]; then
+    codesign --remove-signature "$plugin" 2>/dev/null || true
+    codesign --force --sign - "$plugin" && echo "fix-macos-libs.sh: re-signed (ad-hoc)."
+fi
