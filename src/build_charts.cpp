@@ -1,7 +1,8 @@
 // build_charts.cpp — see build_charts.h.
 //
 // Threading/lifetime: ONE coordinator std::thread launches N worker threads
-// (hardware_concurrency-2, min 1) that pull cell paths from a shared deque. The
+// (~hardware_concurrency, one bake per core — a single-chart bake is
+// single-threaded) that pull cell paths from a shared deque. The
 // coordinator joins all workers then flips finished_. The main-thread timer
 // polls the atomics for the gauge/status and, on finished_, joins the
 // coordinator, stops the timer, and (if not cancelled) registers the
@@ -249,12 +250,13 @@ void BuildChartsDialog::StartWorkers(std::vector<std::string> cells) {
     }
 
     coordinator_ = std::thread([this]() {
-        // tile57_bake_chart_bytes is ALREADY internally parallel (~cores threads via
-        // its tile parallelFor). Profiling showed an outer pool beyond ~2 concurrent
-        // cells barely helps (the internal pools contend) while spawning cores×N
-        // threads, so cap the outer fan-out low rather than at hardware_concurrency-2.
+        // A single-chart bake (tile57_bake_chart_bytes) is SINGLE-THREADED — the
+        // engine's parallel unit is the chart, so one core per bake. The outer
+        // pool is therefore what uses the machine: one worker per core (less one
+        // for the UI/coordinator), capped at 8 as a memory bound (each concurrent
+        // bake holds a whole chart's parse+portray+raster working set).
         unsigned hw = std::thread::hardware_concurrency();
-        unsigned n = hw > 2 ? std::min(4u, hw - 2) : 1;
+        unsigned n = hw > 1 ? std::min(8u, hw - 1) : 1;
 
         auto worker = [this]() {
             for (;;) {
