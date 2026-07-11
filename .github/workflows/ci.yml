@@ -13,12 +13,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout plugin (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Checkout tile57 engine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: beetlebugorg/tile57
           submodules: recursive
@@ -62,12 +62,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout plugin (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Checkout tile57 engine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: beetlebugorg/tile57
           submodules: recursive
