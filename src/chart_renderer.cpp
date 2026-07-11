@@ -489,7 +489,6 @@ void ChartRenderer::set_chart(tile57_chart* c) {
     if (c == chart_) return;
     if (chart_) tile57_chart_close(chart_);
     chart_ = c;
-    have_cam_ = false;    // force a re-portray against the newly swapped-in chart
     have_range_ = false;  // re-fetch zoom range + coverage bounds for the new chart
     if (gl_ready_) clear_tiles();   // the cached tiles belonged to the old chart
 }
@@ -655,10 +654,6 @@ bool ChartRenderer::ensure_gl() {
     u_origin_ = glGetUniformLocation(prog_, "uOrigin");
     u_vp_ = glGetUniformLocation(prog_, "uVp");
     u_zoom_ = glGetUniformLocation(prog_, "uZoom");
-    glGenBuffers(1, &vbo_area_);
-    glGenBuffers(1, &vbo_line_);
-    glGenBuffers(1, &vbo_symbol_);
-    glGenBuffers(1, &vbo_text_);
 
     // Sprite program (textured point symbols).
     prog_sprite_ = glCreateProgram();
@@ -674,7 +669,6 @@ bool ChartRenderer::ensure_gl() {
     su_vp_ = glGetUniformLocation(prog_sprite_, "uVp");
     su_zoom_ = glGetUniformLocation(prog_sprite_, "uZoom");
     su_atlas_ = glGetUniformLocation(prog_sprite_, "uAtlas");
-    glGenBuffers(1, &vbo_sprite_);
 
     // Pattern program (tiled area fills).
     prog_pat_ = glCreateProgram();
@@ -690,7 +684,6 @@ bool ChartRenderer::ensure_gl() {
     pu_vp_ = glGetUniformLocation(prog_pat_, "uVp");
     pu_zoom_ = glGetUniformLocation(prog_pat_, "uZoom");
     pu_atlas_ = glGetUniformLocation(prog_pat_, "uAtlas");
-    glGenBuffers(1, &vbo_pat_);
 
     // Glyph program (SDF text).
     prog_glyph_ = glCreateProgram();
@@ -707,7 +700,6 @@ bool ChartRenderer::ensure_gl() {
     gu_vp_ = glGetUniformLocation(prog_glyph_, "uVp");
     gu_zoom_ = glGetUniformLocation(prog_glyph_, "uZoom");
     gu_atlas_ = glGetUniformLocation(prog_glyph_, "uAtlas");
-    glGenBuffers(1, &vbo_glyph_);
 
     // Composite program + a unit fullscreen quad (pos.xy, tex.uv).
     prog_blit_ = glCreateProgram();
@@ -725,11 +717,6 @@ bool ChartRenderer::ensure_gl() {
 
     load_sprite_atlas();
     load_glyph_atlas();
-
-    // Tiled path (the MapLibre model): portray+tessellate each baked tile once, cache
-    // its GPU geometry, compose the view from cached tiles. This is the default and
-    // primary path; TILE57_WHOLEVIEW forces the legacy whole-view re-portray fallback.
-    tiled_ = std::getenv("TILE57_WHOLEVIEW") == nullptr;
 
     gl_ready_ = true;
     return true;
@@ -826,22 +813,6 @@ static void fill_surface_cb(tile57_surface_cb& cb, ChartRenderer* self) {
     // SDF glyph atlas: send text as strings (skips glyph tessellation). If it did
     // not load, draw_text_str stays null and text tessellates via draw_text.
     if (g_glyph.ok) cb.draw_text_str = tr_text_str;
-}
-
-void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uint32_t h,
-                            const tile57_mariner& m) {
-    area_.clear(); line_.clear(); symbol_.clear(); text_.clear(); sprite_.clear(); pattern_.clear(); glyph_.clear();
-    // World reference: the view centre, so vertex offsets stay tiny (f32-precise).
-    lonlat_to_world(lon, lat, ref_wx_, ref_wy_);
-    // Decimate geometry to ~half a pixel at the portrayal zoom.
-    decimate_eps_ = 0.5 / (256.0 * std::pow(2.0, zoom));
-    size_scale_ = m.size_scale > 0 ? m.size_scale : 1.0;
-
-    tile57_surface_cb cb{};
-    fill_surface_cb(cb, this);
-    tile57_status rc = tile57_chart_surface(chart_, lon, lat, zoom, w, h, &m, &cb, nullptr);
-    if (rc != TILE57_OK) std::fprintf(stderr, "tile57: chart_surface: %s\n", tile57_status_str(rc));
-    upload();
 }
 
 // ---- tiled path: portray + cache + compose per tile (see chart_renderer.h) -----
@@ -986,27 +957,6 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
     glUseProgram(0);
 }
 
-void ChartRenderer::upload() {
-    auto up = [](uint32_t vbo, const std::vector<Vtx>& v, uint32_t& n) {
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(Vtx), v.data(), GL_DYNAMIC_DRAW);
-        n = (uint32_t)v.size();
-    };
-    up(vbo_area_, area_, n_area_);
-    up(vbo_line_, line_, n_line_);
-    up(vbo_symbol_, symbol_, n_symbol_);
-    up(vbo_text_, text_, n_text_);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_sprite_);
-    glBufferData(GL_ARRAY_BUFFER, sprite_.size() * sizeof(SpriteVtx), sprite_.data(), GL_DYNAMIC_DRAW);
-    n_sprite_ = (uint32_t)sprite_.size();
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_pat_);
-    glBufferData(GL_ARRAY_BUFFER, pattern_.size() * sizeof(PatVtx), pattern_.data(), GL_DYNAMIC_DRAW);
-    n_pat_ = (uint32_t)pattern_.size();
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_glyph_);
-    glBufferData(GL_ARRAY_BUFFER, glyph_.size() * sizeof(GlyphVtx), glyph_.data(), GL_DYNAMIC_DRAW);
-    n_glyph_ = (uint32_t)glyph_.size();
-}
-
 void ChartRenderer::draw_range(uint32_t vbo, uint32_t count) {
     if (!count) return;
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -1089,128 +1039,28 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         have_bounds_ = info.has_bounds;
         b_w_ = info.west; b_s_ = info.south; b_e_ = info.east; b_n_ = info.north;
     }
-    // Tiled path: portray+cache+compose per tile (MapLibre model). Invalidate the
-    // tile cache when the mariner settings change (they change the portrayal).
-    if (tiled_) {
-        uint64_t mhx = mariner_hash(m);
-        if (mhx != tiles_mhash_) { clear_tiles(); tiles_mhash_ = mhx; }
-    }
-    // Portray at the view zoom clamped to the baked band (tile selection); the
-    // GPU then transforms to ANY zoom, so pan and zoom are re-portray-free.
-    double cz = zoom;
-    if (cz < min_zoom_) cz = min_zoom_;
-    if (cz > max_zoom_) cz = max_zoom_;
-
-    // Re-portray on zoom only once the gesture SETTLES (detected via `moving`
-    // below): while the zoom changes we transform the cached geometry (smooth,
-    // like a native chart) and refresh to crisp detail when it STOPS. A large
-    // excursion (>3 levels) refreshes even mid-gesture to bound extreme scaling.
-    bool zoom_stale = std::fabs(cz - cam_zoom_) > 0.3;
-
+    // The tile cache is the ONLY geometry source. Invalidate it when the mariner
+    // settings change (they change the portrayal).
     uint64_t mh = mariner_hash(m);
-    // Is the view in active motion (pan or zoom) this frame? While it is we do NOT
-    // re-portray on the render thread — we transform the CACHED geometry on the GPU
-    // (smooth) and re-portray once the gesture settles. Re-portraying mid-pan was
-    // the killer: it re-tessellated every quilt chart every frame (~tens of ms
-    // each), and being CPU-bound it janks on ANY GPU. The resulting low framerate
-    // makes each frame's pan step larger, tripping the margin again — a
-    // self-sustaining low-fps spiral. (Zoom already deferred to settle via
-    // zoom_stale/zoom_settled; this extends the same rule to pan.)
+    if (mh != tiles_mhash_) { clear_tiles(); tiles_mhash_ = mh; }
+
+    // Motion (pan or zoom) this frame — used only to gate the offscreen supersample
+    // (AA when settled, direct during a gesture). Tiles are cached, so pan/zoom just
+    // re-transform them on the GPU; no re-portray is tied to motion.
     bool moving = (std::fabs(lon - last_lon_) > 1e-9 || std::fabs(lat - last_lat_) > 1e-9
                    || std::fabs(zoom - last_zoom_r_) > 1e-4);
     last_lon_ = lon; last_lat_ = lat; last_zoom_r_ = zoom;
-    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now().time_since_epoch()).count();
-    // Pan margin: overscan so a settled view — and moderate pans before the settle
-    // re-portray lands — is covered without blanking at the edges. Bigger = fewer
-    // re-portrays / less transient blank, but more geometry drawn per frame and a
-    // costlier settle rebuild. TILE57_OVERSCAN overrides the default.
-    static const double overscan = [] {
-        const char* e = std::getenv("TILE57_OVERSCAN");
-        double v = e ? std::atof(e) : 0.0;
-        return v >= 1.0 ? v : 1.5;
-    }();
-    auto cam_dim = [&](uint32_t v) { return (uint32_t)std::min(std::ceil(v * overscan), 4096.0); };
-    // Which trigger fired (for TILE57_PROF): init = first portray of a chart (a
-    // freshly-visible quilt cell, e.g. many at once on zoom-out — these CANNOT be
-    // deferred, there is no cached geometry to transform); grow = viewport bigger
-    // than the cache; zoom = a settled/large zoom step; pan = view left the window.
-    const char* reason = !have_cam_ ? "init"
-                       : (mh != cam_mhash_) ? "mariner"
-                       : (cam_w_ < cam_dim(w) / 2 || cam_h_ < cam_dim(h) / 2) ? "grow"
-                       : (zoom_stale && std::fabs(cz - cam_zoom_) > 3.0) ? "zoom"  // extreme-scale safety
-                       : nullptr;
-    bool need = reason != nullptr;
-    if (!need) {
-        // Deferred re-portray triggers — kept OFF during a gesture (we transform the
-        // cached geometry, smooth) and fired on SETTLE:
-        //  - pan: view centre left the portrayed window — fire on settle, or throttled
-        //    during continuous motion (auto-follow keeps up without re-tessellating
-        //    every frame);
-        //  - zoom: the portray zoom drifted >0.3 so tile detail no longer matches —
-        //    fire on settle only (a zoom gesture always ends; the >3 excursion above
-        //    is the mid-gesture safety). Gating on !moving (ANY motion this frame)
-        //    instead of a frame-delta "settled" proxy is what stops a slow / high-fps
-        //    zoom from re-portraying the whole quilt mid-gesture.
-        constexpr int64_t kReportrayThrottleMs = 200;
-        double cwx, cwy, vwx, vwy;
-        lonlat_to_world(cam_lon_, cam_lat_, cwx, cwy);
-        lonlat_to_world(lon, lat, vwx, vwy);
-        double scale_px = 256.0 * std::pow(2.0, cam_zoom_) * device_scale;
-        double dx = std::fabs(vwx - cwx) * scale_px, dy = std::fabs(vwy - cwy) * scale_px;
-        bool out = (dx + w * 0.5 > cam_w_ * 0.5 || dy + h * 0.5 > cam_h_ * 0.5);
-        if (out && (!moving || now_ms - last_portray_ms_ >= kReportrayThrottleMs)) {
-            need = true; reason = "pan";
-        } else if (zoom_stale && !moving) {
-            need = true; reason = "zoom";
-        }
-    }
-    // The text pass never re-portrays (it trails the base pass on OpenCPN's
-    // compose; regenerating would desync the shared buffers).
-    if (pass == Pass::kText && have_cam_) { need = false; reason = nullptr; }
 
-    // TILE57_PROF: log every re-portray (the synchronous CPU tessellation on the
-    // render thread) with its cost and how many frames since the last one — so the
-    // rebuild FREQUENCY and per-rebuild ms are both visible in opencpn.log. This is
-    // the GPU-independent cost that makes pan/zoom janky even on a fast GPU.
-    static const bool prof = std::getenv("TILE57_PROF") != nullptr;
-    static long prof_frames = 0, prof_rebuilds = 0, prof_last_frame = 0;
-    if (prof && pass != Pass::kText) ++prof_frames;
-    if (need && !tiled_) {
-        cam_lon_ = lon; cam_lat_ = lat; cam_zoom_ = cz;
-        cam_w_ = cam_dim(w); cam_h_ = cam_dim(h); cam_mhash_ = mh;
-        last_portray_ms_ = now_ms;
-        if (prof) {
-            auto t0 = std::chrono::steady_clock::now();
-            rebuild(lon, lat, cz, cam_w_, cam_h_, m);
-            double ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - t0).count();
-            wxLogMessage("tile57 PROF rebuild #%ld  %-7s  %.2f ms  (+%ld frames)  z=%.2f  "
-                         "win=%ux%u  verts a=%u l=%u sym=%u spr=%u pat=%u gly=%u",
-                         ++prof_rebuilds, reason ? reason : "?", ms,
-                         prof_frames - prof_last_frame, cz, cam_w_, cam_h_,
-                         n_area_, n_line_, n_symbol_, n_sprite_, n_pat_, n_glyph_);
-            prof_last_frame = prof_frames;
-        } else {
-            rebuild(lon, lat, cz, cam_w_, cam_h_, m);
-        }
-        have_cam_ = true;
-    }
-
-    // Per-frame transform: screen = aWorld*uScale + uOrigin + aPost.
+    // Per-frame transform: screen = aWorld*uScale + uOrigin + aPost (uOrigin per tile).
     double vwx, vwy;
     lonlat_to_world(lon, lat, vwx, vwy);
     // Projection at the PHYSICAL framebuffer: geographic zoom scaled by device_scale
-    // (so e.g. a 2x HiDPI framebuffer gets 2x px per world unit, while zoom — and thus
-    // the SCAMIN cull below — stays geographic).
+    // (a 2x HiDPI framebuffer gets 2x px per world unit; zoom — and the SCAMIN cull
+    // below — stays geographic).
     double scale_px = 256.0 * std::pow(2.0, zoom) * device_scale;   // px per world[0,1]
-    double ox = (ref_wx_ - vwx) * scale_px + w * 0.5;
-    double oy = (ref_wy_ - vwy) * scale_px + h * 0.5;
     // SCAMIN cull zoom: symbols/text are enlarged (content scale on HiDPI), so pull the
     // cull zoom DOWN by cull_bias — bigger symbols drop out that many mercator levels
-    // earlier, keeping decluttering while zoomed out. Driven by the SAME content-scale
-    // that enlarges the symbols (NOT the projection's device_scale, which is 1.0 when
-    // OpenCPN hands a physical-px ViewPort — decoupling the cull from the enlargement).
+    // earlier, keeping decluttering while zoomed out.
     float cull_zoom = (float)(zoom - cull_bias);
 
     (void)stencil_clip;
@@ -1247,21 +1097,14 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         glClearColor(0, 0, 0, 0);
         glClear(GL_COLOR_BUFFER_BIT);
     }
-    glUseProgram(prog_);
     glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA); glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
-    glUniform1f(u_scale_, (float)scale_px);
-    float origin[2] = { (float)ox, (float)oy };
-    glUniform2fv(u_origin_, 1, origin);
-    float vp[2] = { (float)w, (float)h };
-    glUniform2fv(u_vp_, 1, vp);
-    glUniform1f(u_zoom_, cull_zoom);
 
-    if (tiled_) {
-        // Pick the tile zoom (the baked band the view falls in) and the visible tile
-        // x/y range, clamped to the chart's coverage so a zoomed-out view doesn't
-        // enumerate a sea of empty tiles. render_tiled portrays any missing tile ONCE
-        // and composes the cached tiles.
+    // Compose the view from cached tiles: pick the tile zoom (the baked band the view
+    // falls in) and the visible x/y range, clamped to the chart coverage so a
+    // zoomed-out view doesn't enumerate empty tiles. render_tiled portrays any missing
+    // tile (budgeted per frame) and draws the cached tiles with per-tile origins.
+    {
         int z = (int)std::lround(zoom);
         if (z < (int)min_zoom_) z = (int)min_zoom_;
         if (z > (int)max_zoom_) z = (int)max_zoom_;
@@ -1286,89 +1129,6 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
                          (uint32_t)x0, (uint32_t)x1, (uint32_t)y0, (uint32_t)y1);
     }
 
-    if (!tiled_ && pass != Pass::kText) {
-        draw_range(vbo_area_, n_area_);
-        if (n_pat_ && g_atlas.ok) {
-            glUseProgram(prog_pat_);
-            glUniform1f(pu_scale_, (float)scale_px);
-            glUniform2fv(pu_origin_, 1, origin);
-            glUniform2fv(pu_vp_, 1, vp);
-            glUniform1f(pu_zoom_, cull_zoom);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, g_atlas.tex);
-            glUniform1i(pu_atlas_, 0);
-            glBindBuffer(GL_ARRAY_BUFFER, vbo_pat_);
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, wx));
-            glEnableVertexAttribArray(1);
-            glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, u0));
-            glEnableVertexAttribArray(2);
-            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, tw));
-            glEnableVertexAttribArray(3);
-            glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, thresh));
-            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)n_pat_);
-            glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
-            glDisableVertexAttribArray(2); glDisableVertexAttribArray(3);
-            glBindTexture(GL_TEXTURE_2D, 0);
-            glUseProgram(prog_);
-        }
-        draw_range(vbo_line_, n_line_);
-        draw_range(vbo_symbol_, n_symbol_);
-        if (n_sprite_ && g_atlas.ok) {
-            glUseProgram(prog_sprite_);
-            glUniform1f(su_scale_, (float)scale_px);
-            glUniform2fv(su_origin_, 1, origin);
-            glUniform2fv(su_vp_, 1, vp);
-            glUniform1f(su_zoom_, cull_zoom);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, g_atlas.tex);
-            glUniform1i(su_atlas_, 0);
-            glBindBuffer(GL_ARRAY_BUFFER, vbo_sprite_);
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx), (void*)offsetof(SpriteVtx, wx));
-            glEnableVertexAttribArray(1);
-            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx), (void*)offsetof(SpriteVtx, px));
-            glEnableVertexAttribArray(2);
-            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx), (void*)offsetof(SpriteVtx, u));
-            glEnableVertexAttribArray(3);
-            glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx), (void*)offsetof(SpriteVtx, thresh));
-            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)n_sprite_);
-            glDisableVertexAttribArray(0); glDisableVertexAttribArray(1);
-            glDisableVertexAttribArray(2); glDisableVertexAttribArray(3);
-            glBindTexture(GL_TEXTURE_2D, 0);
-            glUseProgram(prog_);
-        }
-    }
-    if (!tiled_ && pass != Pass::kBase) {
-        draw_range(vbo_text_, n_text_);   // tessellated fallback (empty when SDF text is active)
-        if (n_glyph_ && g_glyph.ok) {
-            glUseProgram(prog_glyph_);
-            glUniform1f(gu_scale_, (float)scale_px);
-            glUniform2fv(gu_origin_, 1, origin);
-            glUniform2fv(gu_vp_, 1, vp);
-            glUniform1f(gu_zoom_, cull_zoom);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, g_glyph.tex);
-            glUniform1i(gu_atlas_, 0);
-            glBindBuffer(GL_ARRAY_BUFFER, vbo_glyph_);
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, wx));
-            glEnableVertexAttribArray(1);
-            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, px));
-            glEnableVertexAttribArray(2);
-            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, u));
-            glEnableVertexAttribArray(3);
-            glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, r));
-            glEnableVertexAttribArray(4);
-            glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, thresh));
-            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)n_glyph_);
-            glDisableVertexAttribArray(0); glDisableVertexAttribArray(1); glDisableVertexAttribArray(2);
-            glDisableVertexAttribArray(3); glDisableVertexAttribArray(4);
-            glBindTexture(GL_TEXTURE_2D, 0);
-            glUseProgram(prog_);
-        }
-    }
-
     if (ss) {
         // Composite the supersampled texture over OpenCPN's FBO, down-sampled by
         // the sampler's linear filter, clipped to the same patch scissor.
@@ -1383,9 +1143,9 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         static int cnt = 0;
         if (cnt++ < 10) {
             GLenum e = glGetError();
-            wxLogMessage("tile57 GL: pass=%d ss=%d n_area=%u n_line=%u n_sym=%u prev_fbo=%d "
+            wxLogMessage("tile57 GL: pass=%d ss=%d tiles=%zu pending=%d prev_fbo=%d "
                          "vp=[%d,%d,%d,%d] scissor_on=%d sc=[%d,%d,%d,%d] glerr=0x%x",
-                         (int)pass, ss ? 1 : 0, n_area_, n_line_, n_symbol_, prev_fbo,
+                         (int)pass, ss ? 1 : 0, tiles_.size(), (int)tiles_pending_, prev_fbo,
                          prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3], (int)sc_on,
                          prev_sc[0], prev_sc[1], prev_sc[2], prev_sc[3], (unsigned)e);
         }
@@ -1394,9 +1154,8 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
 
 void ChartRenderer::shutdown() {
     gl_ready_ = false; prog_ = prog_sprite_ = prog_pat_ = prog_glyph_ = prog_blit_ = 0;
-    vbo_area_ = vbo_line_ = vbo_symbol_ = vbo_text_ = vbo_sprite_ = vbo_pat_ = vbo_glyph_ = vbo_quad_ = 0;
-    n_area_ = n_line_ = n_symbol_ = n_text_ = n_sprite_ = n_pat_ = n_glyph_ = 0;
-    have_cam_ = false; have_range_ = false;
+    vbo_quad_ = 0;
+    have_range_ = false;
     tiles_.clear(); tiles_mhash_ = 0;   // GL buffers die with the context on shutdown
     if (chart_) { tile57_chart_close(chart_); chart_ = nullptr; }
 }

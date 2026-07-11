@@ -92,10 +92,9 @@ public:
                           float thresh);
 
     // ---- tiled path (MapLibre model): portray+tessellate each baked tile ONCE,
-    // cache its GPU geometry, compose the view from cached tiles. Enabled by
-    // TILE57_TILED; the whole-view rebuild() path above is the fallback.
-    // One tile's tessellated GPU geometry (its own VBOs) + the world origin its
-    // verts are relative to (the tile's NW corner, so aWorld stays f32-tiny).
+    // cache its GPU geometry, compose the view from cached tiles. This is the only
+    // render path. One tile's tessellated GPU geometry (its own VBOs) + the world
+    // origin its verts are relative to (the tile's NW corner, so aWorld stays f32-tiny).
     struct TileGeom {
         uint32_t vbo[7] = {0,0,0,0,0,0,0};   // area,line,symbol,text,sprite,pat,glyph
         uint32_t n[7]   = {0,0,0,0,0,0,0};
@@ -104,9 +103,6 @@ public:
     };
 
 private:
-    void rebuild(double lon, double lat, double zoom, uint32_t w, uint32_t h,
-                 const tile57_mariner& m);
-    void upload();
     void draw_range(uint32_t vbo, uint32_t count);        // Vtx layout (prog_)
     void draw_pat_range(uint32_t vbo, uint32_t count);    // PatVtx layout (prog_pat_)
     void draw_sprite_range(uint32_t vbo, uint32_t count); // SpriteVtx layout (prog_sprite_)
@@ -125,17 +121,16 @@ private:
     }
 
     tile57_chart* chart_ = nullptr;
-    uint32_t prog_ = 0, vbo_area_ = 0, vbo_line_ = 0, vbo_symbol_ = 0, vbo_text_ = 0;
-    uint32_t n_area_ = 0, n_line_ = 0, n_symbol_ = 0, n_text_ = 0;
+    uint32_t prog_ = 0;   // solid Vtx program (area/line/symbol/text tile layers)
     int u_scale_ = -1, u_origin_ = -1, u_vp_ = -1, u_zoom_ = -1;
-    // Sprite (textured) program + buffer for point symbols.
-    uint32_t prog_sprite_ = 0, vbo_sprite_ = 0, n_sprite_ = 0;
+    // Sprite (textured point symbols) program.
+    uint32_t prog_sprite_ = 0;
     int su_scale_ = -1, su_origin_ = -1, su_vp_ = -1, su_zoom_ = -1, su_atlas_ = -1;
-    // Pattern (tiled-texture) program + buffer for area fills.
-    uint32_t prog_pat_ = 0, vbo_pat_ = 0, n_pat_ = 0;
+    // Pattern (tiled-texture area fills) program.
+    uint32_t prog_pat_ = 0;
     int pu_scale_ = -1, pu_origin_ = -1, pu_vp_ = -1, pu_zoom_ = -1, pu_atlas_ = -1;
-    // Glyph (SDF text) program + buffer.
-    uint32_t prog_glyph_ = 0, vbo_glyph_ = 0, n_glyph_ = 0;
+    // Glyph (SDF text) program.
+    uint32_t prog_glyph_ = 0;
     int gu_scale_ = -1, gu_origin_ = -1, gu_vp_ = -1, gu_zoom_ = -1, gu_atlas_ = -1;
     // Composite program + fullscreen quad: draw the resolved MSAA texture (a
     // shared multisampled FBO, see chart_renderer.cpp) over OpenCPN's FBO. MSAA
@@ -149,19 +144,12 @@ private:
     bool have_bounds_ = false;
     double b_w_ = 0, b_s_ = 0, b_e_ = 0, b_n_ = 0;   // chart coverage bbox (deg)
 
-    // Cached portrayal camera: the geometry is valid for views inside this
-    // world window; leaving it (pan) or a big zoom step re-portrays.
-    bool have_cam_ = false;
-    double cam_lon_ = 0, cam_lat_ = 0, cam_zoom_ = 0;
-    double last_lon_ = 1e9, last_lat_ = 1e9, last_zoom_r_ = 1e9;  // last render view (motion detect)
-    uint32_t cam_w_ = 0, cam_h_ = 0;
-    uint64_t cam_mhash_ = 0;
-    int64_t last_portray_ms_ = 0;   // steady-clock ms of the last re-portray (motion throttle)
+    // Previous render's view centre/zoom — motion detection (gates the AA supersample).
+    double last_lon_ = 1e9, last_lat_ = 1e9, last_zoom_r_ = 1e9;
 
-    // Tiled path state.
+    // Tiled path state (the only render path).
     std::unordered_map<uint64_t, TileGeom> tiles_;   // (z,x,y) -> cached tile geometry
     uint64_t tiles_mhash_ = 0;                        // mariner hash the cache was portrayed at
-    bool tiled_ = false;                              // tiled path active (default; TILE57_WHOLEVIEW off)
     bool tiles_pending_ = false;                      // last render deferred some tiles (portray budget)
 };
 
