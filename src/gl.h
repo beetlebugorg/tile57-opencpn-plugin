@@ -11,12 +11,21 @@
 // locations explicitly rather than with layout(location=…), and use no VAOs.
 #define T57_GLSL_VERSION "#version 120\n"
 
+// Load GL entry points, running glewInit() ONCE (until it succeeds). glewInit is a
+// heavy dyld symbol-lookup storm on macOS (hundreds of dlsym over the export trie),
+// and ensure_gl() runs per ChartRenderer — once per quilt cell, and again for every
+// newly-visible cell as you pan — so re-running it made glewInit ~99% of render time
+// (Instruments). The entry points are global to the process GL context, so one
+// successful init serves every renderer. Self-healing: retries if a call ever fails,
+// so it never caches a bad result.
 static inline bool t57_gl_loader_init() {
+    static bool loaded = false;
+    if (loaded) return true;
     glewExperimental = GL_TRUE;
     GLenum e = glewInit();
-    // GLEW can report GLEW_ERROR_NO_GLX_DISPLAY under some setups yet still load
-    // every entry point; accept that as long as the functions we use are present.
-    if (e == GLEW_OK) return true;
-    glGetError();
-    return glCreateProgram != nullptr && glGenBuffers != nullptr;
+    // GLEW can report GLEW_ERROR_NO_GLX_DISPLAY under some setups yet still load every
+    // entry point; accept that as long as the functions we use are present.
+    if (e != GLEW_OK) glGetError();
+    loaded = (e == GLEW_OK) || (glCreateProgram != nullptr && glGenBuffers != nullptr);
+    return loaded;
 }
