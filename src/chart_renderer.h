@@ -45,6 +45,10 @@ public:
                 double device_scale = 1.0, double cull_bias = 0.0);
     void shutdown();
     bool has_chart() const { return chart_ != nullptr; }
+    // True when the last render left visible tiles un-portrayed (per-frame portray
+    // budget): the caller should request another redraw so they finish (progressive
+    // fill instead of a one-frame freeze on a big first-visit burst).
+    bool tiles_pending() const { return tiles_pending_; }
     bool get_info(tile57_info& out) const;
     tile57_chart* chart_handle() const { return chart_; }   // for object-query
 
@@ -115,6 +119,7 @@ private:
                       uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1);
     TileGeom& ensure_tile(int z, uint32_t x, uint32_t y, const tile57_mariner& m);
     void clear_tiles();
+    void evict_lru(size_t cap);   // drop least-recently-drawn tiles above `cap`
     static uint64_t tile_key(int z, uint32_t x, uint32_t y) {
         return ((uint64_t)(z & 0x1f) << 58) | ((uint64_t)(x & 0x1fffffff) << 29) | (y & 0x1fffffff);
     }
@@ -156,7 +161,8 @@ private:
     // Tiled path state.
     std::unordered_map<uint64_t, TileGeom> tiles_;   // (z,x,y) -> cached tile geometry
     uint64_t tiles_mhash_ = 0;                        // mariner hash the cache was portrayed at
-    bool tiled_ = false;                              // TILE57_TILED
+    bool tiled_ = false;                              // tiled path active (default; TILE57_WHOLEVIEW off)
+    bool tiles_pending_ = false;                      // last render deferred some tiles (portray budget)
 };
 
 } // namespace t57

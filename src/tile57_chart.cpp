@@ -602,6 +602,11 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     }
     renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip,
                      device_scale, cull_bias);
+    // The tiled renderer portrays only a budget of new tiles per frame (so a big
+    // first-visit burst doesn't freeze one frame). If it deferred some, schedule
+    // another redraw so they fill in progressively.
+    if (renderer_.tiles_pending() && canvas_)
+        canvas_->CallAfter([w = canvas_]() { w->Refresh(false); });
     if (pass != t57::ChartRenderer::Pass::kText) draw_calibration();
     return true;
 }

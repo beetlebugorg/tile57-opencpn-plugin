@@ -726,10 +726,10 @@ bool ChartRenderer::ensure_gl() {
     load_sprite_atlas();
     load_glyph_atlas();
 
-    // TILE57_TILED: portray+tessellate each baked tile once, cache its GPU geometry,
-    // and compose the view from cached tiles (the MapLibre model) instead of
-    // re-portraying the whole view. Off by default; the whole-view path is the fallback.
-    tiled_ = std::getenv("TILE57_TILED") != nullptr;
+    // Tiled path (the MapLibre model): portray+tessellate each baked tile once, cache
+    // its GPU geometry, compose the view from cached tiles. This is the default and
+    // primary path; TILE57_WHOLEVIEW forces the legacy whole-view re-portray fallback.
+    tiled_ = std::getenv("TILE57_WHOLEVIEW") == nullptr;
 
     gl_ready_ = true;
     return true;
@@ -896,6 +896,24 @@ void ChartRenderer::clear_tiles() {
     tiles_.clear();
 }
 
+// Evict least-recently-drawn tiles (and free their VBOs) until at most `cap` remain.
+// Tiles drawn this frame carry the newest used_ms, so they sort last and are kept.
+void ChartRenderer::evict_lru(size_t cap) {
+    if (tiles_.size() <= cap) return;
+    std::vector<std::pair<int64_t, uint64_t>> by_age;   // (used_ms, key)
+    by_age.reserve(tiles_.size());
+    for (auto& kv : tiles_) by_age.push_back({ kv.second.used_ms, kv.first });
+    std::sort(by_age.begin(), by_age.end());             // oldest first
+    size_t to_drop = tiles_.size() - cap;
+    for (size_t i = 0; i < to_drop && i < by_age.size(); ++i) {
+        auto it = tiles_.find(by_age[i].second);
+        if (it == tiles_.end()) continue;
+        for (int j = 0; j < 7; ++j)
+            if (it->second.vbo[j]) glDeleteBuffers(1, &it->second.vbo[j]);
+        tiles_.erase(it);
+    }
+}
+
 // Compose the view from cached tiles: ensure each visible tile is portrayed (once)
 // then draw the cached tile VBOs in paint order, each with its own per-tile origin
 // uniform. Layer indices: 0 area, 1 line, 2 symbol, 3 text, 4 sprite, 5 pattern,
@@ -903,15 +921,37 @@ void ChartRenderer::clear_tiles() {
 void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, Pass pass,
                                  float cull_zoom, double vwx, double vwy, double scale_px, int z,
                                  uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1) {
-    // unordered_map references stay valid across inserts, so pointers gathered while
-    // portraying missing tiles remain good for the draw loop below.
+    // Budget the per-frame portray: a big first-visit burst (many tiles entering on a
+    // zoom-out) is spread over frames instead of freezing one. Uncached tiles beyond
+    // the budget are skipped this frame and flagged pending; the plugin re-requests a
+    // redraw (tiles_pending()) so they finish — progressive fill, not a hitch. Cached
+    // tiles always draw. (unordered_map refs stay valid across inserts/erases of OTHER
+    // elements, so the pointers gathered here remain good through eviction + draw.)
+    constexpr int kPortrayBudgetPerFrame = 6;
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch()).count();
+    tiles_pending_ = false;
+    int portrayed = 0;
     std::vector<const TileGeom*> vis;
     vis.reserve((size_t)(x1 - x0 + 1) * (y1 - y0 + 1));
     for (uint32_t ty = y0; ty <= y1; ++ty)
         for (uint32_t tx = x0; tx <= x1; ++tx) {
-            const TileGeom& t = ensure_tile(z, tx, ty, m);
+            uint64_t key = tile_key(z, tx, ty);
+            auto it = tiles_.find(key);
+            if (it == tiles_.end()) {
+                if (portrayed >= kPortrayBudgetPerFrame) { tiles_pending_ = true; continue; }
+                ensure_tile(z, tx, ty, m);          // portray + insert (once, ever)
+                ++portrayed;
+                it = tiles_.find(key);
+                if (it == tiles_.end()) continue;   // (defensive; ensure_tile always inserts)
+            }
+            it->second.used_ms = now;               // LRU: mark drawn this frame
+            const TileGeom& t = it->second;
             for (int i = 0; i < 7; ++i) if (t.n[i]) { vis.push_back(&t); break; }
         }
+    // Bound cache memory: drop least-recently-drawn tiles (never this frame's — they
+    // hold the max used_ms so they sort last and survive; vis pointers stay valid).
+    evict_lru(512);
     if (vis.empty()) return;
 
     const float vp[2] = { (float)w, (float)h };
