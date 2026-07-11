@@ -916,9 +916,16 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         return v >= 1.0 ? v : 1.5;
     }();
     auto cam_dim = [&](uint32_t v) { return (uint32_t)std::min(std::ceil(v * overscan), 4096.0); };
-    bool need = !have_cam_ || mh != cam_mhash_
-             || cam_w_ < cam_dim(w) / 2 || cam_h_ < cam_dim(h) / 2
-             || (zoom_stale && (zoom_settled || std::fabs(cz - cam_zoom_) > 3.0));
+    // Which trigger fired (for TILE57_PROF): init = first portray of a chart (a
+    // freshly-visible quilt cell, e.g. many at once on zoom-out — these CANNOT be
+    // deferred, there is no cached geometry to transform); grow = viewport bigger
+    // than the cache; zoom = a settled/large zoom step; pan = view left the window.
+    const char* reason = !have_cam_ ? "init"
+                       : (mh != cam_mhash_) ? "mariner"
+                       : (cam_w_ < cam_dim(w) / 2 || cam_h_ < cam_dim(h) / 2) ? "grow"
+                       : (zoom_stale && (zoom_settled || std::fabs(cz - cam_zoom_) > 3.0)) ? "zoom"
+                       : nullptr;
+    bool need = reason != nullptr;
     if (!need) {
         // Pan check: has the view centre left the portrayed window? When it has,
         // re-portray immediately if SETTLED (crisp), or — while still moving — only
@@ -932,11 +939,13 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         double scale_px = 256.0 * std::pow(2.0, cam_zoom_) * device_scale;
         double dx = std::fabs(vwx - cwx) * scale_px, dy = std::fabs(vwy - cwy) * scale_px;
         bool out = (dx + w * 0.5 > cam_w_ * 0.5 || dy + h * 0.5 > cam_h_ * 0.5);
-        if (out && (!moving || now_ms - last_portray_ms_ >= kReportrayThrottleMs)) need = true;
+        if (out && (!moving || now_ms - last_portray_ms_ >= kReportrayThrottleMs)) {
+            need = true; reason = "pan";
+        }
     }
     // The text pass never re-portrays (it trails the base pass on OpenCPN's
     // compose; regenerating would desync the shared buffers).
-    if (pass == Pass::kText && have_cam_) need = false;
+    if (pass == Pass::kText && have_cam_) { need = false; reason = nullptr; }
 
     // TILE57_PROF: log every re-portray (the synchronous CPU tessellation on the
     // render thread) with its cost and how many frames since the last one — so the
@@ -954,9 +963,10 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
             rebuild(lon, lat, cz, cam_w_, cam_h_, m);
             double ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t0).count();
-            wxLogMessage("tile57 PROF rebuild #%ld  %.2f ms  (+%ld frames)  z=%.2f  "
-                         "verts a=%u l=%u sym=%u spr=%u pat=%u gly=%u",
-                         ++prof_rebuilds, ms, prof_frames - prof_last_frame, cz,
+            wxLogMessage("tile57 PROF rebuild #%ld  %-7s  %.2f ms  (+%ld frames)  z=%.2f  "
+                         "win=%ux%u  verts a=%u l=%u sym=%u spr=%u pat=%u gly=%u",
+                         ++prof_rebuilds, reason ? reason : "?", ms,
+                         prof_frames - prof_last_frame, cz, cam_w_, cam_h_,
                          n_area_, n_line_, n_symbol_, n_sprite_, n_pat_, n_glyph_);
             prof_last_frame = prof_frames;
         } else {
