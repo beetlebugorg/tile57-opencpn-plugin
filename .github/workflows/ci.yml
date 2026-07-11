@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The plugin links libtile57.a (the tile57 engine, built with Zig) and the vendored
+# OpenCPN api-18 submodule. macOS is intentionally NOT built here (it needs an
+# OpenCPN.app to retarget/re-sign wxWidgets against — see cmake/fix-macos-libs.sh).
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout plugin (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Checkout tile57 engine
+        uses: actions/checkout@v4
+        with:
+          repository: beetlebugorg/tile57
+          submodules: recursive
+          path: tile57
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build tile57 (static lib)
+        working-directory: tile57
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake \
+            libwxgtk3.2-dev \
+            libglew-dev libgl1-mesa-dev libglu1-mesa-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTILE57_DIR="${{ github.workspace }}/tile57"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tile57_pi-linux
+          path: build/libtile57_pi.so
+          if-no-files-found: error
+
+  # Best-effort Windows build. The plugin links the vendored MSVC OpenCPN import lib
+  # (opencpn-libs/api-18/msvc-wx32/opencpn.lib), so tile57 must be built for the MSVC
+  # ABI too, and wxWidgets/GLEW come from vcpkg. Building wxWidgets from source via
+  # vcpkg is slow; a failure here does not block the Linux build.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout plugin (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Checkout tile57 engine
+        uses: actions/checkout@v4
+        with:
+          repository: beetlebugorg/tile57
+          submodules: recursive
+          path: tile57
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build tile57 (MSVC-ABI static lib)
+        working-directory: tile57
+        run: zig build -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseFast
+
+      - name: Locate tile57 lib
+        id: t57lib
+        shell: bash
+        run: |
+          lib=$(ls tile57/zig-out/lib/*.lib tile57/zig-out/lib/*.a 2>/dev/null | head -1)
+          echo "Found tile57 lib: $lib"
+          echo "path=$lib" >> "$GITHUB_OUTPUT"
+
+      - name: Install wxWidgets + GLEW (vcpkg)
+        run: vcpkg install wxwidgets glew --triplet x64-windows
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows
+          -DTILE57_DIR="${{ github.workspace }}/tile57"
+          -DTILE57_LIB="${{ steps.t57lib.outputs.path }}"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tile57_pi-windows
+          path: build/**/tile57_pi.dll
+          if-no-files-found: error

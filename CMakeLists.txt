@@ -27,11 +27,13 @@ add_subdirectory(opencpn-libs/api-18)
 
 find_package(wxWidgets REQUIRED COMPONENTS core base gl)
 find_package(OpenGL REQUIRED)
-find_library(GLEW_LIB GLEW REQUIRED)   # Homebrew on macOS; distro package on Linux
+# GLEW: "GLEW" on macOS/Linux (Homebrew / distro), "glew32" on Windows (vcpkg/MSVC).
+find_library(GLEW_LIB NAMES GLEW glew32 glew32s REQUIRED)
 # GLEW's headers are NOT on the compiler's default search path on macOS (Homebrew
 # under /opt/homebrew or /usr/local). Previously <GL/glew.h> was found only
 # incidentally via wxWidgets' include dir, so a clean/relocated build could lose it.
-# Resolve it explicitly (mirrors where find_library found libGLEW).
+# Resolve it explicitly (mirrors where find_library found libGLEW). The vcpkg
+# toolchain adds its own include dir, so Windows needs no hint here.
 find_path(GLEW_INCLUDE_DIR GL/glew.h REQUIRED
   HINTS /opt/homebrew/include /usr/local/include)
 include(${wxWidgets_USE_FILE})
@@ -55,9 +57,15 @@ target_include_directories(tile57_pi PRIVATE
 target_compile_definitions(tile57_pi PRIVATE ${wxWidgets_DEFINITIONS})
 target_compile_options(tile57_pi PRIVATE ${wxWidgets_CXX_FLAGS})
 
+# libm / libpthread are the Unix math + threads libs; MSVC has neither (they're in
+# the CRT), so link them only off-Windows.
+if(NOT WIN32)
+  set(PLATFORM_LIBS m pthread)
+endif()
+
 target_link_libraries(tile57_pi PRIVATE
   ocpn::api
-  ${wxWidgets_LIBRARIES} ${OPENGL_LIBRARIES} ${GLEW_LIB} ${TILE57_LIB} m pthread)
+  ${wxWidgets_LIBRARIES} ${OPENGL_LIBRARIES} ${GLEW_LIB} ${TILE57_LIB} ${PLATFORM_LIBS})
 
 # OpenCPN loads plugins as .dylib on macOS; silence its OpenGL deprecation noise.
 if(APPLE)
