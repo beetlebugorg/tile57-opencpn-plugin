@@ -40,18 +40,19 @@ static double size_cal_factor() {
     }();
     return f;
 }
-double display_size_scale() {
+double display_size_scale(double csf) {
     double mm = PlugInGetDisplaySizeMM();
     int sw = wxGetDisplaySize().GetWidth();
     if (mm < 1.0 || sw <= 0) return size_cal_factor();
     // S-52 sizes symbology in physical mm, so we need the display's PHYSICAL px/mm.
     // wxGetDisplaySize() returns LOGICAL points on macOS (DIPs generally), so scale by
-    // the content-scale factor to recover physical pixels first. Without this, a HiDPI
-    // display (csf=2) renders every symbol/label HALF size — measured: the 5mm CHKSYM01
-    // square came out 2.5mm on a csf=2 (4K @ 2x) external monitor. csf=1 (non-HiDPI /
-    // Linux) makes this a no-op. cull_bias = log2(size_scale) (render_pass) tracks the
-    // result, so symbol decluttering follows the true size. TILE57_SIZE trims manually.
-    double csf = OCPN_GetDisplayContentScaleFactor();
+    // the content-scale factor (csf) to recover physical pixels first. Without this, a
+    // HiDPI display (csf=2) renders every symbol/label HALF size — measured: the 5mm
+    // CHKSYM01 square came out 2.5mm on a csf=2 (4K @ 2x) external monitor. csf=1
+    // (non-HiDPI / Linux) makes this a no-op. IMPORTANT: csf must be the RENDER-time
+    // value — at construction OCPN_GetDisplayContentScaleFactor() returns 1 (the chart's
+    // canvas isn't on its display yet), so render_pass recomputes this when csf is known.
+    // cull_bias = log2(size_scale) (render_pass) tracks the result. TILE57_SIZE trims.
     if (!(csf > 0.0)) csf = 1.0;
     double s = (sw * csf / mm) / kTile57RefPxPerMm * size_cal_factor();
     return (s > 0.1 && s < 12.0) ? s : 1.0;
@@ -99,7 +100,9 @@ ChartTile57::ChartTile57() {
     m_ChartFamily = PI_CHART_FAMILY_VECTOR;
     m_projection = PI_PROJECTION_MERCATOR;
     tile57_mariner_defaults(&mariner_);
-    mariner_.size_scale = display_size_scale();
+    // Placeholder — csf reads 1 here (canvas not yet realized); render_pass recomputes
+    // it once the real content-scale is known.
+    mariner_.size_scale = display_size_scale(OCPN_GetDisplayContentScaleFactor());
     chart_registry().push_back(this);
 }
 
@@ -372,6 +375,14 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     // == contentScale * pix_width), correct ppm by that factor.
     double ppm = (vp.view_scale_ppm > 0) ? vp.view_scale_ppm : 0.01;
     double csf = OCPN_GetDisplayContentScaleFactor();
+    // Physical symbol/text size (size_scale) needs the display content-scale, which is
+    // only reliable HERE — at construction the chart's canvas isn't on its display yet, so
+    // csf read 1 and symbols came out half size on a 2x display. Recompute when csf
+    // changes (once, on the first real frame); this also refreshes cull_bias below.
+    if (csf != size_scale_csf_) {
+        size_scale_csf_ = csf;
+        mariner_.size_scale = display_size_scale(csf);
+    }
     // When OpenCPN hands a LOGICAL-unit ViewPort against a HiDPI framebuffer, the raw
     // ppm is logical. Instead of bumping the zoom by contentScale (which also shifts
     // tile detail + SCAMIN, over-crowding when zoomed out on a 2x display), keep the
