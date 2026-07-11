@@ -949,7 +949,8 @@ void ChartRenderer::evict_lru(size_t cap) {
 // 6 glyph. Batched by program (one program bind per layer, inner loop over tiles).
 void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, float cull_zoom,
                                  double vwx, double vwy, double scale_px, int z, uint32_t x0,
-                                 uint32_t x1, uint32_t y0, uint32_t y1, int budget) {
+                                 uint32_t x1, uint32_t y0, uint32_t y1, int budget,
+                                 int max_portray_ms) {
     // Budget the per-frame portray: a big first-visit burst (many tiles entering on a
     // zoom-out) is spread over frames instead of freezing one. Uncached tiles beyond
     // the budget are skipped this frame and flagged pending; the plugin re-requests a
@@ -968,7 +969,18 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
             uint64_t key = tile_key(z, tx, ty);
             auto it = tiles_.find(key);
             if (it == tiles_.end()) {
-                if (portrayed >= kPortrayBudgetPerFrame) { tiles_pending_ = true; continue; }
+                // Two ways to defer an uncached tile to a later frame: a hard COUNT cap
+                // (used while MOVING, to keep the pan frame cheap) and a wall-clock TIME
+                // cap (used when SETTLED, where we want to finish the whole view in as few
+                // redraws as possible — ideally one — without freezing on a huge burst).
+                // Each deferral schedules exactly one more redraw (tiles_pending_). Fewer
+                // redraws == fewer full-canvas repaints == fewer core basemap re-tessellations.
+                bool over_count = portrayed >= kPortrayBudgetPerFrame;
+                bool over_time = max_portray_ms > 0 && portrayed > 0 &&
+                    (std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch()).count()
+                     - now) >= max_portray_ms;
+                if (over_count || over_time) { tiles_pending_ = true; continue; }
                 ensure_tile(z, tx, ty, m);          // portray + insert (once, ever)
                 ++portrayed;
                 it = tiles_.find(key);
@@ -978,10 +990,38 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
             const TileGeom& t = it->second;
             for (int i = 0; i < 7; ++i) if (t.n[i]) { vis.push_back(&t); break; }
         }
-    // Bound cache memory: drop least-recently-drawn tiles (never this frame's — they
-    // hold the max used_ms so they sort last and survive; vis pointers stay valid).
+    // BACKDROP (fixes the "gray tiles fill in top-down during zoom" flicker): OpenCPN
+    // disables its FBO chart cache on Retina, so there is no cached frame to show while a
+    // new zoom level's tiles portray — cold patches read as gray. Instead, when the target
+    // zoom still has cold tiles, draw the last FULLY-cached zoom's tiles underneath. They
+    // sit at the correct geo position (per-tile ref_wx/ref_wy origin) just at a coarser
+    // bake, so the view stays continuous (blurry -> sharp, map-style) instead of gray.
+    // Cached tiles only — the backdrop NEVER portrays (no added per-frame cost).
+    std::vector<const TileGeom*> back_vis;
+    if (tiles_pending_ && backdrop_z_ >= 0 && backdrop_z_ != z && std::abs(backdrop_z_ - z) <= 4) {
+        double half_wx = (w * 0.5) / scale_px, half_wy = (h * 0.5) / scale_px;
+        double nb = std::pow(2.0, backdrop_z_), maxb = nb - 1.0;
+        long bx0 = (long)std::floor(std::clamp((vwx - half_wx) * nb, 0.0, maxb));
+        long bx1 = (long)std::floor(std::clamp((vwx + half_wx) * nb, 0.0, maxb));
+        long by0 = (long)std::floor(std::clamp((vwy - half_wy) * nb, 0.0, maxb));
+        long by1 = (long)std::floor(std::clamp((vwy + half_wy) * nb, 0.0, maxb));
+        if ((bx1 - bx0 + 1) * (by1 - by0 + 1) <= 4096) {
+            for (long ty = by0; ty <= by1; ++ty)
+                for (long tx = bx0; tx <= bx1; ++tx) {
+                    auto it = tiles_.find(tile_key(backdrop_z_, (uint32_t)tx, (uint32_t)ty));
+                    if (it == tiles_.end()) continue;   // draw cached backdrop tiles only
+                    it->second.used_ms = now;           // keep them alive through eviction
+                    const TileGeom& t = it->second;
+                    for (int i = 0; i < 7; ++i) if (t.n[i]) { back_vis.push_back(&t); break; }
+                }
+        }
+    }
+
+    // Bound cache memory: drop least-recently-drawn tiles (never this frame's target OR
+    // backdrop — both just stamped used_ms=now, so they sort last and survive; the gathered
+    // pointers stay valid across erases of OTHER elements).
     evict_lru(512);
-    if (vis.empty()) return;
+    if (vis.empty() && back_vis.empty()) return;
 
     const float vp[2] = { (float)w, (float)h };
     auto set_origin = [&](int uloc, const TileGeom* t) {
@@ -989,25 +1029,34 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
                        (float)((t->ref_wy - vwy) * scale_px + h * 0.5) };
         glUniform2fv(uloc, 1, o);
     };
-    auto layer = [&](int prog, int u_scale, int u_vp, int u_zoom, int u_origin, int idx,
+    auto layer = [&](const std::vector<const TileGeom*>& list, int prog, int u_scale, int u_vp,
+                     int u_zoom, int u_origin, int idx,
                      void (ChartRenderer::*drawfn)(uint32_t, uint32_t), uint32_t tex, int u_atlas) {
         glUseProgram(prog);
         glUniform1f(u_scale, (float)scale_px); glUniform2fv(u_vp, 1, vp); glUniform1f(u_zoom, cull_zoom);
         if (tex) { glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex); glUniform1i(u_atlas, 0); }
-        for (auto* t : vis) if (t->n[idx]) { set_origin(u_origin, t); (this->*drawfn)(t->vbo[idx], t->n[idx]); }
+        for (auto* t : list) if (t->n[idx]) { set_origin(u_origin, t); (this->*drawfn)(t->vbo[idx], t->n[idx]); }
         if (tex) glBindTexture(GL_TEXTURE_2D, 0);
     };
-
     // Geometry only (paint order). Layers 3/6 (text/glyph) are never populated for
     // tiles now — labels are drawn by the whole-view text pass (draw_view_labels).
-    layer(prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 0, &ChartRenderer::draw_range, 0, -1);          // area
-    if (g_atlas.ok)
-        layer(prog_pat_, pu_scale_, pu_vp_, pu_zoom_, pu_origin_, 5, &ChartRenderer::draw_pat_range, g_atlas.tex, pu_atlas_);  // pattern
-    layer(prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 1, &ChartRenderer::draw_range, 0, -1);          // line
-    layer(prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 2, &ChartRenderer::draw_range, 0, -1);          // symbol (tessellated)
-    if (g_atlas.ok)
-        layer(prog_sprite_, su_scale_, su_vp_, su_zoom_, su_origin_, 4, &ChartRenderer::draw_sprite_range, g_atlas.tex, su_atlas_);  // sprite
+    auto draw_layers = [&](const std::vector<const TileGeom*>& list) {
+        if (list.empty()) return;
+        layer(list, prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 0, &ChartRenderer::draw_range, 0, -1);   // area
+        if (g_atlas.ok)
+            layer(list, prog_pat_, pu_scale_, pu_vp_, pu_zoom_, pu_origin_, 5, &ChartRenderer::draw_pat_range, g_atlas.tex, pu_atlas_);  // pattern
+        layer(list, prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 1, &ChartRenderer::draw_range, 0, -1);   // line
+        layer(list, prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 2, &ChartRenderer::draw_range, 0, -1);   // symbol (tessellated)
+        if (g_atlas.ok)
+            layer(list, prog_sprite_, su_scale_, su_vp_, su_zoom_, su_origin_, 4, &ChartRenderer::draw_sprite_range, g_atlas.tex, su_atlas_);  // sprite
+    };
+    draw_layers(back_vis);   // coarser fallback zoom underneath (only when target incomplete)
+    draw_layers(vis);        // target zoom on top
     glUseProgram(0);
+
+    // Remember the newest zoom that is fully cached for the whole view — that is what a
+    // later (still-loading) zoom uses as its backdrop.
+    if (!tiles_pending_) backdrop_z_ = z;
 }
 
 // Portray the WHOLE view's labels (one shared declutter grid → no per-tile seam drops)
@@ -1166,7 +1215,16 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     // earlier, keeping decluttering while zoomed out.
     float cull_zoom = (float)(zoom - cull_bias);
 
-    (void)stencil_clip;
+    // When OpenCPN can't use FBOs it clips quilt patches with the STENCIL buffer and
+    // passes b_use_stencil=true (arrives here as stencil_clip) on the base pass. Our
+    // offscreen-supersample composite clips with SCISSOR, which does NOT align with that
+    // stencil path — the composite renders black/misplaced, and because only SOME passes/
+    // cells hit the SS branch, the view alternates good<->black frame to frame == flicker.
+    // Latch it: once the host has ever asked for stencil clipping, this GL context has no
+    // usable FBO path, so force DIRECT rendering for every pass (== auto TILE57_NOSS). The
+    // text/unquilted passes pass stencil_clip=false, hence the sticky flag rather than a
+    // per-call test. (Machines WITH FBOs never set it, so they keep the AA path.)
+    if (stencil_clip) host_stencil_mode_ = true;
     // Render the scene into the SS FBO (at kSS× res), then composite it back
     // down-sampled — antialiasing tessellated text/lines/area edges. Clip to the
     // chart's quilt patch via OpenCPN's SCISSOR (SetClipRect) rather than a
@@ -1182,7 +1240,8 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     // with that no-FBO path and renders black. Direct render (as during pan) works.
     static const bool noss = std::getenv("TILE57_NOSS") != nullptr;
     const int kSS = ss_factor();   // 1 on software GL (AA off); 2 on real GPUs
-    bool ss = !noss && kSS > 1 && ensure_ss((int)w, (int)h) && !(moving && pass != Pass::kText);
+    bool ss = !noss && !host_stencil_mode_ && kSS > 1 && ensure_ss((int)w, (int)h) &&
+              !(moving && pass != Pass::kText);
     // Saving GL state (glGetIntegerv/glIsEnabled) forces a driver sync — a GPU
     // pipeline stall. It is only needed to RESTORE the FBO/viewport/scissor after
     // an offscreen pass, so read it back only when supersampling; the direct
@@ -1227,13 +1286,26 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         long x1 = (long)std::floor(std::clamp(wmaxx * n, 0.0, maxt));
         long y0 = (long)std::floor(std::clamp(wminy * n, 0.0, maxt));
         long y1 = (long)std::floor(std::clamp(wmaxy * n, 0.0, maxt));
-        // Portray fewer cold tiles per frame WHILE MOVING (keep the frame fast during
-        // a fast pan/zoom — the reported lag was ~budget×portray_ms/frame) and more
-        // when SETTLED so the view fills in quickly. Deferred tiles trigger a redraw.
-        int budget = moving ? 2 : 8;
+        // WHILE MOVING: portray only a few cold tiles per frame (hard count cap) so the
+        // pan frame stays cheap — OpenCPN is already repainting every frame during the
+        // gesture, so tiles fill as you move. WHEN SETTLED: finish the whole view in as
+        // FEW redraws as possible (ideally one) — a count cap of 8 spread a cold view over
+        // ceil(N/8) frames, and because OpenCPN re-tessellates the world basemap on the CPU
+        // every full repaint, each of those frames was a fresh basemap re-tessellation ->
+        // the visible "rebuild"/flicker as tiles dribbled in. So lift the count cap and
+        // instead bound the frame by wall-clock: portray until ~30 ms elapses, defer the
+        // rest to one more redraw. Typical views finish in a single frame; a pathological
+        // burst still can't freeze.
+        // The backdrop (coarser cached zoom, drawn underneath) now hides any not-yet-portrayed
+        // target tiles, so motion no longer has to crawl at a 2-tile budget to avoid gray gaps.
+        // Give motion a WALL-CLOCK budget instead: portray as many as fit in ~8 ms/frame so the
+        // sharp layer catches up fast over the blur, while the time cap keeps the pan/zoom frame
+        // bounded. Settled: finish the view (up to 30 ms) in ideally one redraw.
+        int budget    = moving ? 256 : 4096;
+        int portray_ms = moving ? 8 : 30;
         if (wmaxx >= wminx && wmaxy >= wminy && (x1 - x0 + 1) * (y1 - y0 + 1) <= 4096)
             render_tiled(w, h, m, cull_zoom, vwx, vwy, scale_px, z,
-                         (uint32_t)x0, (uint32_t)x1, (uint32_t)y0, (uint32_t)y1, budget);
+                         (uint32_t)x0, (uint32_t)x1, (uint32_t)y0, (uint32_t)y1, budget, portray_ms);
     }
     // LABELS (text pass / unquilted): portray the whole view's text with a single
     // declutter grid (per-tile grids dropped labels at seams — the missing lights). This

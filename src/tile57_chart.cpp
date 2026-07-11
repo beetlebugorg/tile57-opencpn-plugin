@@ -6,6 +6,7 @@
 #include <wx/image.h>
 #include <wx/log.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -427,8 +428,18 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     // The tiled renderer portrays only a budget of new tiles per frame (so a big
     // first-visit burst doesn't freeze one frame). If it deferred some, schedule
     // another redraw so they fill in progressively.
-    if (renderer_.tiles_pending() && canvas_)
-        canvas_->CallAfter([w = canvas_]() { w->Refresh(false); });
+    // Ask for one more redraw only if this render deferred tiles/labels. Coalesce across
+    // the whole canvas: one paint fans out to every pass (base/text) and every quilt cell,
+    // and each used to queue its own CallAfter(Refresh) — N redundant full-canvas repaints
+    // for one frame's worth of pending. A single in-flight guard collapses them to one:
+    // one Refresh already repaints all cells. The flag is cleared inside the marshalled
+    // callback (main thread) BEFORE Refresh, so the paint it triggers can queue the next.
+    static std::atomic<bool> refresh_inflight{false};
+    if (renderer_.tiles_pending() && canvas_ && !refresh_inflight.exchange(true))
+        canvas_->CallAfter([w = canvas_]() {
+            refresh_inflight.store(false);
+            w->Refresh(false);
+        });
     if (pass != t57::ChartRenderer::Pass::kText) draw_calibration();
     return true;
 }

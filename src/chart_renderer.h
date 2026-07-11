@@ -110,7 +110,7 @@ private:
     // Tiled path helpers (chart_renderer.cpp).
     void render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, float cull_zoom,
                       double vwx, double vwy, double scale_px, int z, uint32_t x0, uint32_t x1,
-                      uint32_t y0, uint32_t y1, int budget);
+                      uint32_t y0, uint32_t y1, int budget, int max_portray_ms);
     TileGeom& ensure_tile(int z, uint32_t x, uint32_t y, const tile57_mariner& m);
     void clear_tiles();
     void evict_lru(size_t cap);   // drop least-recently-drawn tiles above `cap`
@@ -154,6 +154,8 @@ private:
     std::unordered_map<uint64_t, TileGeom> tiles_;   // (z,x,y) -> cached tile geometry
     uint64_t tiles_mhash_ = 0;                        // mariner hash the cache was portrayed at
     bool tiles_pending_ = false;                      // last render deferred some tiles (portray budget)
+    bool host_stencil_mode_ = false;                  // host lacks FBOs (stencil-clips quilt) -> force direct render, no SS composite
+    int  backdrop_z_ = -1;                            // newest fully-cached zoom level, drawn under a still-loading zoom to avoid gray gaps
     // Whole-view label buffers (one declutter grid → no per-tile seam drops).
     uint32_t vbo_vtext_ = 0, vbo_vglyph_ = 0, n_vtext_ = 0, n_vglyph_ = 0;
     // Label cache: the whole-view label portray (pmtiles decode + declutter + soundings)
