@@ -893,21 +893,46 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     bool zoom_stale = std::fabs(cz - cam_zoom_) > 0.3;
 
     uint64_t mh = mariner_hash(m);
-    // Pan margin: a small overscan so short pans replay without re-portraying.
-    // Kept tight — portrayal + tessellation cost scales with camera AREA, and a
-    // big buffer is slow to draw every frame (it was the zoom-blank cause).
-    auto cam_dim = [&](uint32_t v) { return (uint32_t)std::min(std::ceil(v * 1.15), 4096.0); };
+    // Is the view in active motion (pan or zoom) this frame? While it is we do NOT
+    // re-portray on the render thread — we transform the CACHED geometry on the GPU
+    // (smooth) and re-portray once the gesture settles. Re-portraying mid-pan was
+    // the killer: it re-tessellated every quilt chart every frame (~tens of ms
+    // each), and being CPU-bound it janks on ANY GPU. The resulting low framerate
+    // makes each frame's pan step larger, tripping the margin again — a
+    // self-sustaining low-fps spiral. (Zoom already deferred to settle via
+    // zoom_stale/zoom_settled; this extends the same rule to pan.)
+    bool moving = (std::fabs(lon - last_lon_) > 1e-9 || std::fabs(lat - last_lat_) > 1e-9
+                   || std::fabs(zoom - last_zoom_r_) > 1e-4);
+    last_lon_ = lon; last_lat_ = lat; last_zoom_r_ = zoom;
+    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch()).count();
+    // Pan margin: overscan so a settled view — and moderate pans before the settle
+    // re-portray lands — is covered without blanking at the edges. Bigger = fewer
+    // re-portrays / less transient blank, but more geometry drawn per frame and a
+    // costlier settle rebuild. TILE57_OVERSCAN overrides the default.
+    static const double overscan = [] {
+        const char* e = std::getenv("TILE57_OVERSCAN");
+        double v = e ? std::atof(e) : 0.0;
+        return v >= 1.0 ? v : 1.5;
+    }();
+    auto cam_dim = [&](uint32_t v) { return (uint32_t)std::min(std::ceil(v * overscan), 4096.0); };
     bool need = !have_cam_ || mh != cam_mhash_
              || cam_w_ < cam_dim(w) / 2 || cam_h_ < cam_dim(h) / 2
              || (zoom_stale && (zoom_settled || std::fabs(cz - cam_zoom_) > 3.0));
     if (!need) {
-        // Pan check: is the view centre still well inside the portrayed window?
+        // Pan check: has the view centre left the portrayed window? When it has,
+        // re-portray immediately if SETTLED (crisp), or — while still moving — only
+        // if throttled, so continuous auto-follow keeps up (instead of blanking
+        // forever) without re-tessellating every frame. kReportrayThrottleMs bounds
+        // the mid-motion re-portray rate per chart.
+        constexpr int64_t kReportrayThrottleMs = 200;
         double cwx, cwy, vwx, vwy;
         lonlat_to_world(cam_lon_, cam_lat_, cwx, cwy);
         lonlat_to_world(lon, lat, vwx, vwy);
         double scale_px = 256.0 * std::pow(2.0, cam_zoom_) * device_scale;
         double dx = std::fabs(vwx - cwx) * scale_px, dy = std::fabs(vwy - cwy) * scale_px;
-        if (dx + w * 0.5 > cam_w_ * 0.5 || dy + h * 0.5 > cam_h_ * 0.5) need = true;
+        bool out = (dx + w * 0.5 > cam_w_ * 0.5 || dy + h * 0.5 > cam_h_ * 0.5);
+        if (out && (!moving || now_ms - last_portray_ms_ >= kReportrayThrottleMs)) need = true;
     }
     // The text pass never re-portrays (it trails the base pass on OpenCPN's
     // compose; regenerating would desync the shared buffers).
@@ -923,6 +948,7 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     if (need) {
         cam_lon_ = lon; cam_lat_ = lat; cam_zoom_ = cz;
         cam_w_ = cam_dim(w); cam_h_ = cam_dim(h); cam_mhash_ = mh;
+        last_portray_ms_ = now_ms;
         if (prof) {
             auto t0 = std::chrono::steady_clock::now();
             rebuild(lon, lat, cz, cam_w_, cam_h_, m);
@@ -960,13 +986,11 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     // down-sampled — antialiasing tessellated text/lines/area edges. Clip to the
     // chart's quilt patch via OpenCPN's SCISSOR (SetClipRect) rather than a
     // stencil EQUAL test (unreliable across GL backends).
-    // Antialias (offscreen supersample) only when the view is SETTLED. During
-    // pan/zoom motion render DIRECT into OpenCPN's cache so accelerated panning's
-    // partial strip updates align (offscreen compositing tore); AA pops in when
-    // motion stops. Text (a light, separate pass) always supersamples.
-    bool moving = (std::fabs(lon - last_lon_) > 1e-9 || std::fabs(lat - last_lat_) > 1e-9
-                   || std::fabs(zoom - last_zoom_r_) > 1e-4);
-    last_lon_ = lon; last_lat_ = lat; last_zoom_r_ = zoom;
+    // Antialias (offscreen supersample) only when the view is SETTLED (see the
+    // `moving` computation above). During pan/zoom motion render DIRECT into
+    // OpenCPN's cache so accelerated panning's partial strip updates align
+    // (offscreen compositing tore); AA pops in when motion stops. Text (a light,
+    // separate pass) always supersamples.
     // TILE57_NOSS forces DIRECT rendering (no offscreen supersample FBO). Needed when
     // OpenCPN itself reports "Framebuffer Objects unavailable" and falls back to stencil
     // clipping (some NVIDIA/driver combos): our offscreen FBO + composite doesn't align

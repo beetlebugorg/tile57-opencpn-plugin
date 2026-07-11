@@ -124,6 +124,7 @@ private:
     double last_lon_ = 1e9, last_lat_ = 1e9, last_zoom_r_ = 1e9;  // last render view
     uint32_t cam_w_ = 0, cam_h_ = 0;
     uint64_t cam_mhash_ = 0;
+    int64_t last_portray_ms_ = 0;   // steady-clock ms of the last re-portray (motion throttle)
 };
 
 } // namespace t57
