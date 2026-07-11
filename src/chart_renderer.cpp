@@ -891,14 +891,14 @@ void ChartRenderer::evict_lru(size_t cap) {
 // 6 glyph. Batched by program (one program bind per layer, inner loop over tiles).
 void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, Pass pass,
                                  float cull_zoom, double vwx, double vwy, double scale_px, int z,
-                                 uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1) {
+                                 uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1, int budget) {
     // Budget the per-frame portray: a big first-visit burst (many tiles entering on a
     // zoom-out) is spread over frames instead of freezing one. Uncached tiles beyond
     // the budget are skipped this frame and flagged pending; the plugin re-requests a
     // redraw (tiles_pending()) so they finish — progressive fill, not a hitch. Cached
     // tiles always draw. (unordered_map refs stay valid across inserts/erases of OTHER
     // elements, so the pointers gathered here remain good through eviction + draw.)
-    constexpr int kPortrayBudgetPerFrame = 6;
+    const int kPortrayBudgetPerFrame = budget;
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now().time_since_epoch()).count();
     tiles_pending_ = false;
@@ -1124,9 +1124,13 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         long x1 = (long)std::floor(std::clamp(wmaxx * n, 0.0, maxt));
         long y0 = (long)std::floor(std::clamp(wminy * n, 0.0, maxt));
         long y1 = (long)std::floor(std::clamp(wmaxy * n, 0.0, maxt));
+        // Portray fewer cold tiles per frame WHILE MOVING (keep the frame fast during
+        // a fast pan/zoom — the reported lag was ~budget×portray_ms/frame) and more
+        // when SETTLED so the view fills in quickly. Deferred tiles trigger a redraw.
+        int budget = moving ? 2 : 8;
         if (wmaxx >= wminx && wmaxy >= wminy && (x1 - x0 + 1) * (y1 - y0 + 1) <= 4096)
             render_tiled(w, h, m, pass, cull_zoom, vwx, vwy, scale_px, z,
-                         (uint32_t)x0, (uint32_t)x1, (uint32_t)y0, (uint32_t)y1);
+                         (uint32_t)x0, (uint32_t)x1, (uint32_t)y0, (uint32_t)y1, budget);
     }
 
     if (ss) {
@@ -1137,6 +1141,15 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         if (sc_on) glScissor(prev_sc[0], prev_sc[1], prev_sc[2], prev_sc[3]);
         composite_ss();
     }
+    // Restore the GL state OpenCPN's fixed-function / gluTess clip-region drawing
+    // relies on. Leaving a vertex-attrib array enabled or a VBO bound makes its
+    // immediate-mode glDrawArrays read OUR buffer out of bounds → crash (seen on
+    // macOS: SetClipRegion → gluTessEndPolygon → glDrawArrays_IMM_Exec). Belt-and-
+    // suspenders: our draw_* helpers already disable their arrays, but tiles churn
+    // VBOs so we hard-reset here after every render.
+    for (int i = 0; i < 5; ++i) glDisableVertexAttribArray(i);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
     glUseProgram(0);
     static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
     if (dbg) {

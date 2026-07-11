@@ -112,7 +112,7 @@ private:
     // Tiled path helpers (chart_renderer.cpp).
     void render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, Pass pass,
                       float cull_zoom, double vwx, double vwy, double scale_px, int z,
-                      uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1);
+                      uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1, int budget);
     TileGeom& ensure_tile(int z, uint32_t x, uint32_t y, const tile57_mariner& m);
     void clear_tiles();
     void evict_lru(size_t cap);   // drop least-recently-drawn tiles above `cap`
