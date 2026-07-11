@@ -47,13 +47,13 @@ static double size_cal_factor() {
 double display_size_scale() {
     double mm = PlugInGetDisplaySizeMM();
     int sw = wxGetDisplaySize().GetWidth();
-    double csf = OCPN_GetDisplayContentScaleFactor();
-    if (!(csf > 0.5 && csf < 6.0)) csf = 1.0;
-    if (mm < 1.0 || sw <= 0) return csf * size_cal_factor();
-    // Enlarge symbols/text by the content scale (bigger on a HiDPI display). The
-    // matching cull-zoom reduction (renderer: cull_zoom = zoom - log2(device_scale))
-    // makes the extra size drop features out earlier so it doesn't over-crowd.
-    double s = (sw / mm) / kTile57RefPxPerMm * csf * size_cal_factor();
+    if (mm < 1.0 || sw <= 0) return size_cal_factor();
+    // TRUE physical size (S-52 sizes symbology in mm): scale the 72-DPI reference to
+    // the display's px/mm. wxGetDisplaySize is PHYSICAL px (incl. HiDPI), so this is
+    // already physically correct — do NOT also multiply by the content-scale factor
+    // (that double-counted the density and rendered symbols 2x too big on Retina).
+    // cull_bias = log2(size_scale) (render_pass) tracks this, so decluttering follows.
+    double s = (sw / mm) / kTile57RefPxPerMm * size_cal_factor();
     return (s > 0.1 && s < 12.0) ? s : 1.0;
 }
 // Pixels per metre of a nominal 96-DPI display; turns a ground resolution into
