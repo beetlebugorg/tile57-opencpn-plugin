@@ -930,6 +930,7 @@ void ChartRenderer::clear_tiles() {
         for (int i = 0; i < 7; ++i)
             if (kv.second.vbo[i]) glDeleteBuffers(1, &kv.second.vbo[i]);
     tiles_.clear();
+    labels_valid_ = false;   // labels share the portrayal that just changed (mariner/chart)
 }
 
 // Evict least-recently-drawn tiles (and free their VBOs) until at most `cap` remain.
@@ -1017,10 +1018,11 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
     glUseProgram(0);
 }
 
-// Portray the WHOLE view's labels once (one shared declutter grid → no per-tile
-// seam drops) into the view-label buffers, referenced to the view centre. Cheap:
-// only text is emitted; geometry callbacks are no-ops (the dep still runs its
-// declutter). Re-portrayed each text-pass frame so the labels track the view.
+// Portray the WHOLE view's labels (one shared declutter grid → no per-tile seam drops)
+// into the view-label buffers, referenced to the view centre. Geometry callbacks are
+// no-ops (the dep still runs its declutter), but this is NOT cheap — it decodes the
+// pmtiles and decluttters every sounding, so render() calls it only on settle/view-change
+// (see the label cache there), not every frame.
 void ChartRenderer::portray_view_labels(double lon, double lat, double zoom,
                                         uint32_t w, uint32_t h, const tile57_mariner& m) {
     text_.clear(); glyph_.clear();
@@ -1038,11 +1040,16 @@ void ChartRenderer::portray_view_labels(double lon, double lat, double zoom,
     n_vglyph_ = (uint32_t)glyph_.size();
 }
 
-// Draw the view-label buffers. Their verts are relative to the view centre, so the
-// origin is simply the viewport centre.
-void ChartRenderer::draw_view_labels(double scale_px, float cull_zoom, uint32_t w, uint32_t h) {
+// Draw the view-label buffers. Their verts are relative to the world point the cache was
+// portrayed at (lbl_ref_*), so place that point on screen for the CURRENT view — the same
+// per-tile origin math as render_tiled. When the cache was portrayed THIS frame lbl_ref_*
+// == the view centre, so the origin is just (w/2, h/2); when reused across a pan/zoom the
+// labels ride the view correctly.
+void ChartRenderer::draw_view_labels(double scale_px, float cull_zoom, uint32_t w, uint32_t h,
+                                     double vwx, double vwy) {
     if (!n_vtext_ && !n_vglyph_) return;
-    const float origin[2] = { (float)(w * 0.5), (float)(h * 0.5) };
+    const float origin[2] = { (float)((lbl_ref_wx_ - vwx) * scale_px + w * 0.5),
+                              (float)((lbl_ref_wy_ - vwy) * scale_px + h * 0.5) };
     const float vp[2] = { (float)w, (float)h };
     if (n_vtext_) {                                    // tessellated fallback (usually empty)
         glUseProgram(prog_);
@@ -1236,12 +1243,30 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
             render_tiled(w, h, m, cull_zoom, vwx, vwy, scale_px, z,
                          (uint32_t)x0, (uint32_t)x1, (uint32_t)y0, (uint32_t)y1, budget);
     }
-    // LABELS (text pass / unquilted): portray the whole view's text ONCE with a single
-    // declutter grid (per-tile grids dropped labels at seams — the missing lights) and
-    // draw it referenced to the view centre.
+    // LABELS (text pass / unquilted): portray the whole view's text with a single
+    // declutter grid (per-tile grids dropped labels at seams — the missing lights). This
+    // portray (pmtiles decode + declutter + soundings) is the costliest per-frame item
+    // (~21% in Instruments), so cache it like the geometry tiles: portray only when the
+    // view has SETTLED at a new place/zoom (or nothing is cached yet); during a gesture
+    // reuse the cached buffers, drawn with a transformed origin. `moving` is unreliable
+    // here (the base pass already stamped last_*_ this frame), so detect settle from the
+    // previous TEXT frame (lbl_prev_*_).
     if (pass != Pass::kBase) {
-        portray_view_labels(lon, lat, zoom, w, h, m);
-        draw_view_labels(scale_px, cull_zoom, w, h);
+        bool lbl_moving = std::fabs(lon - lbl_prev_lon_) > 1e-9 || std::fabs(lat - lbl_prev_lat_) > 1e-9
+                          || std::fabs(zoom - lbl_prev_zoom_) > 1e-4;
+        lbl_prev_lon_ = lon; lbl_prev_lat_ = lat; lbl_prev_zoom_ = zoom;
+        bool stale = std::fabs(lon - lbl_lon_) > 1e-9 || std::fabs(lat - lbl_lat_) > 1e-9
+                     || std::fabs(zoom - lbl_zoom_) > 1e-4;
+        labels_pending_ = false;
+        if (!labels_valid_ || (stale && !lbl_moving)) {
+            portray_view_labels(lon, lat, zoom, w, h, m);
+            lbl_lon_ = lon; lbl_lat_ = lat; lbl_zoom_ = zoom;
+            lbl_ref_wx_ = ref_wx_; lbl_ref_wy_ = ref_wy_;   // portray set these to the view centre
+            labels_valid_ = true;
+        } else if (stale) {
+            labels_pending_ = true;   // moved this frame — refresh once motion stops (ask for a redraw)
+        }
+        draw_view_labels(scale_px, cull_zoom, w, h, vwx, vwy);
     }
 
     if (ss) {

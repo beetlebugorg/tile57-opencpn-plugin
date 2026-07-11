@@ -45,10 +45,11 @@ public:
                 double device_scale = 1.0, double cull_bias = 0.0);
     void shutdown();
     bool has_chart() const { return chart_ != nullptr; }
-    // True when the last render left visible tiles un-portrayed (per-frame portray
-    // budget): the caller should request another redraw so they finish (progressive
-    // fill instead of a one-frame freeze on a big first-visit burst).
-    bool tiles_pending() const { return tiles_pending_; }
+    // True when the last render deferred work that a follow-up redraw would finish:
+    // tiles left un-portrayed by the per-frame budget, OR a stale whole-view label
+    // portray postponed until motion stops. The caller requests another redraw so the
+    // view fills in / labels refresh (progressive fill instead of a one-frame freeze).
+    bool tiles_pending() const { return tiles_pending_ || labels_pending_; }
     bool get_info(tile57_info& out) const;
     tile57_chart* chart_handle() const { return chart_; }   // for object-query
 
@@ -119,7 +120,8 @@ private:
     // Whole-view label pass (shared declutter grid; fixes per-tile seam label drops).
     void portray_view_labels(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                              const tile57_mariner& m);
-    void draw_view_labels(double scale_px, float cull_zoom, uint32_t w, uint32_t h);
+    void draw_view_labels(double scale_px, float cull_zoom, uint32_t w, uint32_t h,
+                          double vwx, double vwy);
     static uint64_t tile_key(int z, uint32_t x, uint32_t y) {
         return ((uint64_t)(z & 0x1f) << 58) | ((uint64_t)(x & 0x1fffffff) << 29) | (y & 0x1fffffff);
     }
@@ -155,8 +157,19 @@ private:
     std::unordered_map<uint64_t, TileGeom> tiles_;   // (z,x,y) -> cached tile geometry
     uint64_t tiles_mhash_ = 0;                        // mariner hash the cache was portrayed at
     bool tiles_pending_ = false;                      // last render deferred some tiles (portray budget)
-    // Whole-view label buffers (re-portrayed each text pass with one declutter grid).
+    // Whole-view label buffers (one declutter grid → no per-tile seam drops).
     uint32_t vbo_vtext_ = 0, vbo_vglyph_ = 0, n_vtext_ = 0, n_vglyph_ = 0;
+    // Label cache: the whole-view label portray (pmtiles decode + declutter + soundings)
+    // is the costliest per-frame item, so — like the geometry tiles — portray only on
+    // settle / view-change and reuse the buffers (drawn with a transformed origin) during
+    // a pan/zoom gesture. lbl_*_ is the view the cache was portrayed at; lbl_prev_*_ is the
+    // previous text frame (settle detection, kept separate from last_*_ which both passes
+    // stamp — so it would always read "still" in the text pass).
+    bool labels_valid_ = false;
+    bool labels_pending_ = false;                     // stale portray deferred until motion stops
+    double lbl_lon_ = 1e9, lbl_lat_ = 1e9, lbl_zoom_ = 1e9;
+    double lbl_prev_lon_ = 1e9, lbl_prev_lat_ = 1e9, lbl_prev_zoom_ = 1e9;
+    double lbl_ref_wx_ = 0, lbl_ref_wy_ = 0;          // cache's world reference (draw origin)
 };
 
 } // namespace t57
