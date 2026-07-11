@@ -589,7 +589,8 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     // TILE57_DEBUG: one line per zoom step exposing the HiDPI coupling — cull_zoom is what
     // the SCAMIN shader test uses (show if cull_zoom >= feature threshold). gate = fbw vs
     // pix_width*csf shows why device_scale resolves to 1 (physical-px ViewPort).
-    if (std::getenv("TILE57_DEBUG") && pass != t57::ChartRenderer::Pass::kText) {
+    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
+    if (dbg && pass != t57::ChartRenderer::Pass::kText) {
         static double dbg_last = 1e9;
         if (std::fabs(zoom - dbg_last) > 0.02) {
             dbg_last = zoom;

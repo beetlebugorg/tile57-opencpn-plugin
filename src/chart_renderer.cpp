@@ -2,6 +2,8 @@
 #include "chart_renderer.h"
 #include "gl.h"
 #include <array>
+#include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -9,6 +11,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <wx/log.h>   // reliable capture in opencpn.log (stderr isn't captured here)
 #include <wx/image.h>
 #include <wx/mstream.h>
 #include "earcut.hpp"
@@ -629,7 +632,8 @@ static uint32_t compile(GLenum t, const char* body) {
     const char* s = src.c_str();
     uint32_t sh = glCreateShader(t); glShaderSource(sh, 1, &s, nullptr); glCompileShader(sh);
     GLint ok = 0; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
-    if (!ok) { char l[512]; glGetShaderInfoLog(sh, 512, nullptr, l); std::fprintf(stderr, "tile57 shader: %s\n", l); }
+    if (!ok) { char l[512]; glGetShaderInfoLog(sh, 512, nullptr, l); wxLogMessage("tile57 shader FAIL: %s", l); }
+    else wxLogMessage("tile57 shader ok (type=0x%x)", (unsigned)t);
     return sh;
 }
 
@@ -730,7 +734,32 @@ namespace {
 // One shared FBO (not one per chart) keeps it cheap; a plain texture target
 // (no multisample resolve blit) avoids the scroll-compose glitch that a
 // resolve introduced.
-constexpr int kSS = 2;
+//
+// Supersample factor. 2× SSAA costs 4× the fragment work plus a full-screen
+// composite — fine on a real GPU, ruinous on a SOFTWARE rasterizer (llvmpipe &
+// co.), where every fragment is CPU work. So detect a software renderer once
+// (from GL_RENDERER, needs a live context) and drop to 1 (AA off, render
+// direct) there. TILE57_SS=<n> forces it (1 = off, 2 = 2×). Must be called with
+// a current GL context (render() guarantees it via ensure_gl()).
+int ss_factor() {
+    static int k = -1;
+    if (k >= 0) return k;
+    if (const char* e = std::getenv("TILE57_SS")) {
+        int v = std::atoi(e);
+        k = v < 1 ? 1 : (v > 4 ? 4 : v);
+        return k;
+    }
+    k = 2;
+    if (const char* r = reinterpret_cast<const char*>(glGetString(GL_RENDERER))) {
+        std::string s(r);
+        for (char& c : s) c = (char)std::tolower((unsigned char)c);
+        for (const char* sw : {"llvmpipe", "softpipe", "swrast", "swr", "software",
+                               "swiftshader", "microsoft basic"})
+            if (s.find(sw) != std::string::npos) { k = 1; break; }
+    }
+    wxLogMessage("tile57: supersample factor = %d", k);
+    return k;
+}
 struct SsTarget {
     uint32_t fbo = 0, tex = 0; int w = 0, h = 0; bool ok = false;
 };
@@ -738,6 +767,7 @@ SsTarget g_ss;
 
 bool ensure_ss(int w, int h) {
     if (w <= 0 || h <= 0) return false;
+    int kSS = ss_factor();
     int sw = w * kSS, sh = h * kSS;
     if (g_ss.fbo && g_ss.w == sw && g_ss.h == sh) return g_ss.ok;
     if (!g_ss.fbo) { glGenFramebuffers(1, &g_ss.fbo); glGenTextures(1, &g_ss.tex); }
@@ -883,10 +913,29 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     // compose; regenerating would desync the shared buffers).
     if (pass == Pass::kText && have_cam_) need = false;
 
+    // TILE57_PROF: log every re-portray (the synchronous CPU tessellation on the
+    // render thread) with its cost and how many frames since the last one — so the
+    // rebuild FREQUENCY and per-rebuild ms are both visible in opencpn.log. This is
+    // the GPU-independent cost that makes pan/zoom janky even on a fast GPU.
+    static const bool prof = std::getenv("TILE57_PROF") != nullptr;
+    static long prof_frames = 0, prof_rebuilds = 0, prof_last_frame = 0;
+    if (prof && pass != Pass::kText) ++prof_frames;
     if (need) {
         cam_lon_ = lon; cam_lat_ = lat; cam_zoom_ = cz;
         cam_w_ = cam_dim(w); cam_h_ = cam_dim(h); cam_mhash_ = mh;
-        rebuild(lon, lat, cz, cam_w_, cam_h_, m);
+        if (prof) {
+            auto t0 = std::chrono::steady_clock::now();
+            rebuild(lon, lat, cz, cam_w_, cam_h_, m);
+            double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+            wxLogMessage("tile57 PROF rebuild #%ld  %.2f ms  (+%ld frames)  z=%.2f  "
+                         "verts a=%u l=%u sym=%u spr=%u pat=%u gly=%u",
+                         ++prof_rebuilds, ms, prof_frames - prof_last_frame, cz,
+                         n_area_, n_line_, n_symbol_, n_sprite_, n_pat_, n_glyph_);
+            prof_last_frame = prof_frames;
+        } else {
+            rebuild(lon, lat, cz, cam_w_, cam_h_, m);
+        }
         have_cam_ = true;
     }
 
@@ -911,11 +960,6 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     // down-sampled — antialiasing tessellated text/lines/area edges. Clip to the
     // chart's quilt patch via OpenCPN's SCISSOR (SetClipRect) rather than a
     // stencil EQUAL test (unreliable across GL backends).
-    GLint prev_fbo = 0, prev_vp[4] = {0,0,0,0}, prev_sc[4] = {0,0,0,0};
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
-    glGetIntegerv(GL_VIEWPORT, prev_vp);
-    glGetIntegerv(GL_SCISSOR_BOX, prev_sc);
-    GLboolean sc_on = glIsEnabled(GL_SCISSOR_TEST);
     // Antialias (offscreen supersample) only when the view is SETTLED. During
     // pan/zoom motion render DIRECT into OpenCPN's cache so accelerated panning's
     // partial strip updates align (offscreen compositing tore); AA pops in when
@@ -923,8 +967,24 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     bool moving = (std::fabs(lon - last_lon_) > 1e-9 || std::fabs(lat - last_lat_) > 1e-9
                    || std::fabs(zoom - last_zoom_r_) > 1e-4);
     last_lon_ = lon; last_lat_ = lat; last_zoom_r_ = zoom;
-    bool ss = ensure_ss((int)w, (int)h) && !(moving && pass != Pass::kText);
+    // TILE57_NOSS forces DIRECT rendering (no offscreen supersample FBO). Needed when
+    // OpenCPN itself reports "Framebuffer Objects unavailable" and falls back to stencil
+    // clipping (some NVIDIA/driver combos): our offscreen FBO + composite doesn't align
+    // with that no-FBO path and renders black. Direct render (as during pan) works.
+    static const bool noss = std::getenv("TILE57_NOSS") != nullptr;
+    const int kSS = ss_factor();   // 1 on software GL (AA off); 2 on real GPUs
+    bool ss = !noss && kSS > 1 && ensure_ss((int)w, (int)h) && !(moving && pass != Pass::kText);
+    // Saving GL state (glGetIntegerv/glIsEnabled) forces a driver sync — a GPU
+    // pipeline stall. It is only needed to RESTORE the FBO/viewport/scissor after
+    // an offscreen pass, so read it back only when supersampling; the direct
+    // motion path (the interactive hot path) skips all four reads.
+    GLint prev_fbo = 0, prev_vp[4] = {0,0,0,0}, prev_sc[4] = {0,0,0,0};
+    GLboolean sc_on = GL_FALSE;
     if (ss) {
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+        glGetIntegerv(GL_VIEWPORT, prev_vp);
+        glGetIntegerv(GL_SCISSOR_BOX, prev_sc);
+        sc_on = glIsEnabled(GL_SCISSOR_TEST);
         glBindFramebuffer(GL_FRAMEBUFFER, g_ss.fbo);
         glViewport(0, 0, (GLsizei)(w * kSS), (GLsizei)(h * kSS));
         if (sc_on) glScissor(prev_sc[0]*kSS, prev_sc[1]*kSS, prev_sc[2]*kSS, prev_sc[3]*kSS);
@@ -1033,6 +1093,18 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         composite_ss();
     }
     glUseProgram(0);
+    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
+    if (dbg) {
+        static int cnt = 0;
+        if (cnt++ < 10) {
+            GLenum e = glGetError();
+            wxLogMessage("tile57 GL: pass=%d ss=%d n_area=%u n_line=%u n_sym=%u prev_fbo=%d "
+                         "vp=[%d,%d,%d,%d] scissor_on=%d sc=[%d,%d,%d,%d] glerr=0x%x",
+                         (int)pass, ss ? 1 : 0, n_area_, n_line_, n_symbol_, prev_fbo,
+                         prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3], (int)sc_on,
+                         prev_sc[0], prev_sc[1], prev_sc[2], prev_sc[3], (unsigned)e);
+        }
+    }
 }
 
 void ChartRenderer::shutdown() {
