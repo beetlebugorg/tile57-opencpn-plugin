@@ -1,6 +1,6 @@
 // chart_renderer.h — draws a tile57 chart as a GPU vector chart.
 //
-// tile57 portrays a view ONCE (tile57_chart_render_surface_cb) into a WORLD-SPACE
+// tile57 portrays a view ONCE (tile57_chart_surface) into a WORLD-SPACE
 // tagged stream: area/line geometry in web-mercator [0,1]; point symbols and text
 // as a world anchor + a local reference-px outline; each draw call tagged with
 // its feature SCAMIN. We tessellate that once into a single vertex buffer and,
@@ -26,7 +26,7 @@ class ChartRenderer {
 public:
     enum class Pass { kBase, kText, kAll };
 
-    bool open_chart(const std::string& pmtiles_path);   // pmtiles OR .000 cell
+    bool open_chart(const std::string& pmtiles_path);   // baked .pmtiles archive
     // Swap in a chart handle opened elsewhere (e.g. a background bake thread), closing
     // the previous one and forcing a re-portray against it. Main thread only.
     void set_chart(tile57_chart* c);
@@ -44,7 +44,7 @@ public:
                 double device_scale = 1.0, double cull_bias = 0.0);
     void shutdown();
     bool has_chart() const { return chart_ != nullptr; }
-    bool get_info(tile57_chart_info& out) const;
+    bool get_info(tile57_info& out) const;
     tile57_chart* chart_handle() const { return chart_; }   // for object-query
 
     // Unified GPU vertex (see header note).

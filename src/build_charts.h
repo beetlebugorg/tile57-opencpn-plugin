@@ -48,7 +48,6 @@ private:
 
     // --- widgets ---
     wxDirPickerCtrl* encPicker_ = nullptr;
-    wxChoice*        detailChoice_ = nullptr;   // native / native-1 / native-2 zoom cap
     wxButton*        buildBtn_ = nullptr;
     wxButton*        rebuildBtn_ = nullptr;      // force re-bake (ignore existing outputs)
     wxButton*        cancelBtn_ = nullptr;
@@ -65,7 +64,6 @@ private:
     std::mutex        status_mtx_;
     std::string       current_cell_;
     std::string       dest_;
-    std::atomic<int>  zoom_reduce_{1};   // levels below native to bake (0=native,1,2)
     std::atomic<bool> force_{false};     // Rebuild: overwrite existing outputs
     std::chrono::steady_clock::time_point start_time_;   // set when a run begins
 

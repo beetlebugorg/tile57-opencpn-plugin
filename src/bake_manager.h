@@ -23,12 +23,12 @@ public:
 
     // Queue a cell for LOW-priority background pre-baking to cache_file. No-op if it is
     // already cached or already queued. Survives the caller (a transient scan chart).
-    void enqueue(std::string cell_path, uint8_t max_zoom, std::string cache_file);
+    void enqueue(std::string cell_path, std::string cache_file);
 
     // Ensure cache_file is baked NOW (a viewed cell needs it immediately): bakes it
     // here, or waits if another thread is already baking this exact cell. Bumps the
     // priority count so the background sweep pauses meanwhile. Returns true if present.
-    bool bake_now(const std::string& cell_path, uint8_t max_zoom, const std::string& cache_file);
+    bool bake_now(const std::string& cell_path, const std::string& cache_file);
 
     // Plugin DeInit: stop + join the worker (may wait out one in-flight bake).
     void stop();
@@ -49,10 +49,9 @@ private:
     void worker_loop();
     // Bake cell_path -> cache_file (atomic tmp+rename) + sweep stale siblings, letting
     // only one thread bake a given cache_file at a time. Returns true if present after.
-    bool bake_coordinated(const std::string& cell_path, uint8_t max_zoom,
-                          const std::string& cache_file);
+    bool bake_coordinated(const std::string& cell_path, const std::string& cache_file);
 
-    struct Job { std::string cell; uint8_t max_zoom; std::string cache; };
+    struct Job { std::string cell; std::string cache; };
     std::mutex mtx_;
     std::condition_variable cv_;
     std::deque<Job> queue_;

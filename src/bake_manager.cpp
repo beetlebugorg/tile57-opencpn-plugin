@@ -17,14 +17,14 @@ BakeManager& BakeManager::instance() {
 
 BakeManager::~BakeManager() { stop(); }
 
-void BakeManager::enqueue(std::string cell_path, uint8_t max_zoom, std::string cache_file) {
+void BakeManager::enqueue(std::string cell_path, std::string cache_file) {
     std::error_code ec;
     if (fs::exists(cache_file, ec)) return;   // already baked
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (stop_) return;
         if (!queued_.insert(cache_file).second) return;   // already queued
-        queue_.push_back({std::move(cell_path), max_zoom, std::move(cache_file)});
+        queue_.push_back({std::move(cell_path), std::move(cache_file)});
         enqueued_.fetch_add(1, std::memory_order_relaxed);
         if (!worker_started_) {
             worker_started_ = true;
@@ -45,18 +45,17 @@ void BakeManager::worker_loop() {
             job = std::move(queue_.front());
             queue_.pop_front();
         }
-        bake_coordinated(job.cell, job.max_zoom, job.cache);
+        bake_coordinated(job.cell, job.cache);
         processed_.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
-bool BakeManager::bake_now(const std::string& cell_path, uint8_t max_zoom,
-                           const std::string& cache_file) {
+bool BakeManager::bake_now(const std::string& cell_path, const std::string& cache_file) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
         ++priority_;   // pause the background sweep while we bake
     }
-    bool ok = bake_coordinated(cell_path, max_zoom, cache_file);
+    bool ok = bake_coordinated(cell_path, cache_file);
     {
         std::lock_guard<std::mutex> lk(mtx_);
         --priority_;
@@ -65,8 +64,7 @@ bool BakeManager::bake_now(const std::string& cell_path, uint8_t max_zoom,
     return ok;
 }
 
-bool BakeManager::bake_coordinated(const std::string& cell_path, uint8_t max_zoom,
-                                   const std::string& cache_file) {
+bool BakeManager::bake_coordinated(const std::string& cell_path, const std::string& cache_file) {
     std::error_code ec;
     {
         std::unique_lock<std::mutex> lk(mtx_);
@@ -81,14 +79,16 @@ bool BakeManager::bake_coordinated(const std::string& cell_path, uint8_t max_zoo
     bool ok = false;
     uint8_t* bytes = nullptr;
     size_t len = 0;
-    if (tile57_bake_cell_bytes(cell_path.c_str(), 0, max_zoom, &bytes, &len) == 1) {
+    // The engine bakes the chart's NATIVE band zoom range (v0.3 owns the cap that
+    // the plugin used to compute from the CSCL).
+    if (tile57_bake_chart_bytes(cell_path.c_str(), &bytes, &len, nullptr) == TILE57_OK && bytes) {
         std::string tmp = cache_file + ".tmp";
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
             f.write(reinterpret_cast<const char*>(bytes), static_cast<std::streamsize>(len));
         }
         fs::rename(tmp, cache_file, ec);
-        tile57_free(bytes, len);
+        tile57_free(bytes);
         if (ec) {
             fs::remove(tmp, ec);   // write failed -> leave no partial
         } else {

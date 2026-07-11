@@ -112,13 +112,18 @@ public:
 private:
     // Extract bbox / native scale / M_COVR coverage from an open chart handle into
     // this chart's members (GetChartExtent / m_Chart_Scale / GetCOVR*).
-    void apply_info(tile57_chart* h, const tile57_chart_info& info);
+    void apply_info(tile57_chart* h, const tile57_info& info);
+    // Bounds/scale for a NOT-YET-BAKED cell, from the raw-source reader
+    // (tile57_enc_charts JSON) — coverage falls back to the bbox rectangle until
+    // the baked archive (which embeds real M_COVR) opens on a later run.
+    void apply_enc_meta(double w, double s, double e, double n, int scale);
     // The on-disk per-cell tile cache path (keyed by cell + freshest mtime + update
-    // count + zoom + bake version), so the slow bake is one-time across runs.
-    std::string cache_path(const std::string& cell_path, uint8_t maxz) const;
-    // Background bake (full init): bake the quick native band then the full range,
-    // handing each result to the render thread via pending_chart_. See tile57_chart.cpp
-    // for the thread-safety contract (single-writer chart_, atomic handoff, warmup).
+    // count + bake version), so the slow bake is one-time across runs. The engine
+    // owns the zoom range (native band), so zoom is no longer part of the key.
+    std::string cache_path(const std::string& cell_path) const;
+    // Background bake (full init): bake the native band range and hand the result
+    // to the render thread via pending_chart_. See tile57_chart.cpp for the
+    // thread-safety contract (single-writer chart_, atomic handoff, warmup).
     void start_bake();
     void publish(tile57_chart* c);     // bake thread -> render thread handoff
     void adopt_pending();              // render thread: swap in a freshly baked chart
@@ -169,9 +174,6 @@ private:
     std::thread bake_thread_;
     std::string bake_path_;             // resolved .000 path (set before the thread starts)
     std::string cache_file_;            // on-disk baked-tile cache for this cell
-    uint8_t bake_quick_max_ = 12;       // quick-phase max zoom (coarse first paint)
-    uint8_t bake_full_max_ = 16;        // full-phase max zoom = the cell's native zoom
-                                        // (baking past it overzooms => tile-count blowup)
     wxWindow* canvas_ = nullptr;        // for a thread-safe CallAfter refresh
 
     wxDECLARE_DYNAMIC_CLASS(ChartTile57);

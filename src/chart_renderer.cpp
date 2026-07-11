@@ -250,7 +250,7 @@ void load_sprite_atlas() {
     g_atlas.tried = true;
     tile57_assets assets{};
     // sprite-mln: pivot-centred cells + {name:{x,y,w,h}} JSON. NULL => embedded.
-    if (!tile57_bake_sprite_mln(nullptr, &assets)) return;
+    if (tile57_bake_sprite_mln(nullptr, &assets, nullptr) != TILE57_OK) return;
     if (assets.sprite_png && assets.sprite_png_len) {
         wxMemoryInputStream mis(assets.sprite_png, assets.sprite_png_len);
         wxImage img;
@@ -319,7 +319,7 @@ void load_glyph_atlas() {
     if (g_glyph.tried) return;
     g_glyph.tried = true;
     tile57_assets a{};
-    if (!tile57_bake_glyph_sdf(&a)) return;
+    if (tile57_bake_glyph_sdf(&a, nullptr) != TILE57_OK) return;
     if (a.sprite_png && a.sprite_png_len) {
         wxMemoryInputStream mis(a.sprite_png, a.sprite_png_len);
         wxImage img;
@@ -474,18 +474,12 @@ static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, 
 // ---- chart / GL lifecycle --------------------------------------------------
 bool ChartRenderer::open_chart(const std::string& path) {
     if (chart_) return true;
-    // A .t57 file is a symlink to a live .000 cell (its .001.. updates live in the
-    // cell's real directory), so resolve it first — then tile57_chart_open reads the
-    // update chain from there. A .pmtiles bundle streams the baked archive.
+    // Only baked .pmtiles archives open as charts (the v0.3 ABI bakes raw cells
+    // first — see ChartTile57::start_bake). Resolve symlinks so mmap sees the
+    // real file.
     std::string real = path;
     if (char* rp = realpath(path.c_str(), nullptr)) { real = rp; std::free(rp); }
-    auto ends_with = [&](const char* suf) {
-        std::string s(suf);
-        return real.size() >= s.size() && real.compare(real.size() - s.size(), s.size(), s) == 0;
-    };
-    chart_ = ends_with(".pmtiles") ? tile57_chart_open_pmtiles(real.c_str())
-                                   : tile57_chart_open(real.c_str());
-    return chart_ != nullptr;
+    return tile57_chart_open(real.c_str(), &chart_, nullptr) == TILE57_OK && chart_;
 }
 void ChartRenderer::set_chart(tile57_chart* c) {
     if (c == chart_) return;
@@ -493,7 +487,7 @@ void ChartRenderer::set_chart(tile57_chart* c) {
     chart_ = c;
     have_cam_ = false;   // force a re-portray against the newly swapped-in chart
 }
-bool ChartRenderer::get_info(tile57_chart_info& out) const {
+bool ChartRenderer::get_info(tile57_info& out) const {
     if (!chart_) return false;
     tile57_chart_get_info(chart_, &out);
     return true;
@@ -801,8 +795,8 @@ void ChartRenderer::rebuild(double lon, double lat, double zoom, uint32_t w, uin
     // SDF glyph atlas: send text as strings (skips glyph tessellation). If it did
     // not load, draw_text_str stays null and text tessellates via draw_text.
     if (g_glyph.ok) cb.draw_text_str = tr_text_str;
-    int rc = tile57_chart_render_surface_cb(chart_, lon, lat, zoom, w, h, &m, &cb);
-    if (rc != 0) std::fprintf(stderr, "tile57: render_surface_cb rc=%d\n", rc);
+    tile57_status rc = tile57_chart_surface(chart_, lon, lat, zoom, w, h, &m, &cb, nullptr);
+    if (rc != TILE57_OK) std::fprintf(stderr, "tile57: chart_surface: %s\n", tile57_status_str(rc));
     upload();
 }
 
@@ -850,7 +844,7 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
                            double device_scale, double cull_bias) {
     if (!chart_ || !ensure_gl()) return;
     if (!have_range_) {
-        tile57_chart_info info{};
+        tile57_info info{};
         tile57_chart_get_info(chart_, &info);
         min_zoom_ = info.min_zoom; max_zoom_ = info.max_zoom; have_range_ = true;
     }

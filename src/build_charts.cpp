@@ -58,20 +58,18 @@ std::string FixedDest() {
     return (base / "tile57" / "charts").string();
 }
 
-void LoadPaths(wxString& enc, int& detail) {
+void LoadPaths(wxString& enc) {
     wxFileConfig cfg(wxEmptyString, wxEmptyString, ConfigPath(), wxEmptyString,
                      wxCONFIG_USE_LOCAL_FILE);
     cfg.SetPath(_T("/tile57"));
     cfg.Read(_T("EncSource"), &enc, wxEmptyString);
-    cfg.Read(_T("Detail"), &detail, 1);
 }
 
-void SavePaths(const wxString& enc, int detail) {
+void SavePaths(const wxString& enc) {
     wxFileConfig cfg(wxEmptyString, wxEmptyString, ConfigPath(), wxEmptyString,
                      wxCONFIG_USE_LOCAL_FILE);
     cfg.SetPath(_T("/tile57"));
     cfg.Write(_T("EncSource"), enc);
-    cfg.Write(_T("Detail"), detail);
     cfg.Flush();
 }
 
@@ -118,17 +116,6 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     row(encPicker_);
 
     top->AddSpacer(16);
-    label(_T("Detail (max zoom vs bake time):"));
-    detailChoice_ = new wxChoice(this, wxID_ANY);
-    // The GL renderer overzooms native tiles, so a level below native is barely
-    // distinguishable but bakes ~2x faster (measured 1.02s -> 0.59s/cell).
-    detailChoice_->Append(_T("Native (crispest, slowest)"));
-    detailChoice_->Append(_T("Native −1 (recommended — ~2× faster)"));
-    detailChoice_->Append(_T("Native −2 (fastest — ~3× faster)"));
-    detailChoice_->SetSelection(1);
-    row(detailChoice_);
-
-    top->AddSpacer(16);
     row(new wxStaticText(this, wxID_ANY,
                          wxString::Format(_T("Output: %s"),
                                           wxString::FromUTF8(FixedDest().c_str()))));
@@ -165,10 +152,8 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     // Restore persisted settings.
     wxLogMessage("tile57: BuildChartsDialog loading config");
     wxString enc;
-    int detail = 1;
-    LoadPaths(enc, detail);
+    LoadPaths(enc);
     if (!enc.IsEmpty()) encPicker_->SetPath(enc);
-    if (detail >= 0 && detail <= 2) detailChoice_->SetSelection(detail);
 
     buildBtn_->Bind(wxEVT_BUTTON, &BuildChartsDialog::OnBuild, this);
     rebuildBtn_->Bind(wxEVT_BUTTON, &BuildChartsDialog::OnRebuild, this);
@@ -195,7 +180,6 @@ void BuildChartsDialog::SetRunningUI(bool running) {
     rebuildBtn_->Enable(!running);
     cancelBtn_->Enable(running);
     encPicker_->Enable(!running);
-    detailChoice_->Enable(!running);
 }
 
 void BuildChartsDialog::StartBuild(bool force) {
@@ -215,9 +199,7 @@ void BuildChartsDialog::StartBuild(bool force) {
         return;
     }
 
-    const int detail = detailChoice_->GetSelection();
-    zoom_reduce_.store(detail >= 0 ? detail : 1);
-    SavePaths(encPicker_->GetPath(), zoom_reduce_.load());
+    SavePaths(encPicker_->GetPath());
 
     // Enumerate .000 cells (case-insensitive) recursively under enc.
     std::vector<std::string> cells;
@@ -267,7 +249,7 @@ void BuildChartsDialog::StartWorkers(std::vector<std::string> cells) {
     }
 
     coordinator_ = std::thread([this]() {
-        // tile57_bake_cell_bytes is ALREADY internally parallel (~cores threads via
+        // tile57_bake_chart_bytes is ALREADY internally parallel (~cores threads via
         // its tile parallelFor). Profiling showed an outer pool beyond ~2 concurrent
         // cells barely helps (the internal pools contend) while spawning cores×N
         // threads, so cap the outer fan-out low rather than at hardware_concurrency-2.
@@ -298,37 +280,26 @@ void BuildChartsDialog::StartWorkers(std::vector<std::string> cells) {
                     continue;
                 }
 
-                // Per-cell native maxzoom — mirrors ChartTile57::Init exactly.
-                tile57_chart* h = tile57_chart_open_header(path.c_str());
-                if (!h) { failed_.fetch_add(1); done_.fetch_add(1); continue; }
-                tile57_chart_info info{};
-                tile57_chart_get_info(h, &info);
-                tile57_chart_close(h);
-                int zn = info.native_scale > 0
-                             ? (int)std::lround(std::log2(559082264.0 / (double)info.native_scale))
-                             : 14;
-                // Cap at native, then drop the user's detail levels (the GL renderer
-                // overzooms, so a level below native bakes ~2x faster, barely visible).
-                zn = std::max(4, std::min(zn, 16) - zoom_reduce_.load());
-
                 {
                     std::lock_guard<std::mutex> lk(status_mtx_);
                     current_cell_ = in.stem().string();
                 }
 
+                // The engine bakes the chart's native band zoom range (v0.3 owns
+                // the zoom cap the plugin used to compute per cell).
                 uint8_t* bytes = nullptr;
                 size_t len = 0;
-                if (tile57_bake_cell_bytes(path.c_str(), 0, (uint8_t)zn, &bytes, &len) == 1) {
+                if (tile57_bake_chart_bytes(path.c_str(), &bytes, &len, nullptr) == TILE57_OK && bytes) {
                     const fs::path tmp = out.string() + ".tmp";
                     {
                         std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
                         ofs.write(reinterpret_cast<const char*>(bytes), (std::streamsize)len);
                     }
-                    tile57_free(bytes, len);
+                    tile57_free(bytes);
                     fs::rename(tmp, out, ec);
                     if (ec) { fs::remove(tmp, ec); failed_.fetch_add(1); }
                 } else {
-                    if (bytes) tile57_free(bytes, len);
+                    if (bytes) tile57_free(bytes);
                     failed_.fetch_add(1);
                 }
                 baked_.fetch_add(1);   // actually baked this run (drives the rate)
