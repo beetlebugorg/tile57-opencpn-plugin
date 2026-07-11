@@ -639,83 +639,118 @@ static uint32_t compile(GLenum t, const char* body) {
     return sh;
 }
 
+namespace {
+// The shader programs + uniform locations + composite quad VBO are IDENTICAL for
+// every ChartRenderer, so compile them ONCE process-wide (like the atlases) instead
+// of once per quilt cell. Per-instance compiles also forced a fresh Metal render-
+// pipeline build per cell on macOS. ensure_gl() copies these handles into the
+// instance, so all the render code that reads prog_/u_scale_/… is unchanged.
+struct GlPrograms {
+    uint32_t prog = 0, prog_sprite = 0, prog_pat = 0, prog_glyph = 0, prog_blit = 0, vbo_quad = 0;
+    int u_scale = -1, u_origin = -1, u_vp = -1, u_zoom = -1;
+    int su_scale = -1, su_origin = -1, su_vp = -1, su_zoom = -1, su_atlas = -1;
+    int pu_scale = -1, pu_origin = -1, pu_vp = -1, pu_zoom = -1, pu_atlas = -1;
+    int gu_scale = -1, gu_origin = -1, gu_vp = -1, gu_zoom = -1, gu_atlas = -1;
+    int bu_tex = -1;
+    bool ready = false;
+};
+GlPrograms g_prog;
+
+void build_programs() {
+    GlPrograms& g = g_prog;
+    g.prog = glCreateProgram();
+    glAttachShader(g.prog, compile(GL_VERTEX_SHADER, VS));
+    glAttachShader(g.prog, compile(GL_FRAGMENT_SHADER, FS));
+    glBindAttribLocation(g.prog, 0, "aWorld");
+    glBindAttribLocation(g.prog, 1, "aPost");
+    glBindAttribLocation(g.prog, 2, "aColor");
+    glBindAttribLocation(g.prog, 3, "aThresh");
+    glLinkProgram(g.prog);
+    g.u_scale = glGetUniformLocation(g.prog, "uScale");
+    g.u_origin = glGetUniformLocation(g.prog, "uOrigin");
+    g.u_vp = glGetUniformLocation(g.prog, "uVp");
+    g.u_zoom = glGetUniformLocation(g.prog, "uZoom");
+
+    // Sprite program (textured point symbols).
+    g.prog_sprite = glCreateProgram();
+    glAttachShader(g.prog_sprite, compile(GL_VERTEX_SHADER, VS_SPRITE));
+    glAttachShader(g.prog_sprite, compile(GL_FRAGMENT_SHADER, FS_SPRITE));
+    glBindAttribLocation(g.prog_sprite, 0, "aWorld");
+    glBindAttribLocation(g.prog_sprite, 1, "aPost");
+    glBindAttribLocation(g.prog_sprite, 2, "aUV");
+    glBindAttribLocation(g.prog_sprite, 3, "aThresh");
+    glLinkProgram(g.prog_sprite);
+    g.su_scale = glGetUniformLocation(g.prog_sprite, "uScale");
+    g.su_origin = glGetUniformLocation(g.prog_sprite, "uOrigin");
+    g.su_vp = glGetUniformLocation(g.prog_sprite, "uVp");
+    g.su_zoom = glGetUniformLocation(g.prog_sprite, "uZoom");
+    g.su_atlas = glGetUniformLocation(g.prog_sprite, "uAtlas");
+
+    // Pattern program (tiled area fills).
+    g.prog_pat = glCreateProgram();
+    glAttachShader(g.prog_pat, compile(GL_VERTEX_SHADER, VS_PAT));
+    glAttachShader(g.prog_pat, compile(GL_FRAGMENT_SHADER, FS_PAT));
+    glBindAttribLocation(g.prog_pat, 0, "aWorld");
+    glBindAttribLocation(g.prog_pat, 1, "aRect");
+    glBindAttribLocation(g.prog_pat, 2, "aTile");
+    glBindAttribLocation(g.prog_pat, 3, "aThresh");
+    glLinkProgram(g.prog_pat);
+    g.pu_scale = glGetUniformLocation(g.prog_pat, "uScale");
+    g.pu_origin = glGetUniformLocation(g.prog_pat, "uOrigin");
+    g.pu_vp = glGetUniformLocation(g.prog_pat, "uVp");
+    g.pu_zoom = glGetUniformLocation(g.prog_pat, "uZoom");
+    g.pu_atlas = glGetUniformLocation(g.prog_pat, "uAtlas");
+
+    // Glyph program (SDF text).
+    g.prog_glyph = glCreateProgram();
+    glAttachShader(g.prog_glyph, compile(GL_VERTEX_SHADER, VS_GLYPH));
+    glAttachShader(g.prog_glyph, compile(GL_FRAGMENT_SHADER, FS_GLYPH));
+    glBindAttribLocation(g.prog_glyph, 0, "aWorld");
+    glBindAttribLocation(g.prog_glyph, 1, "aPost");
+    glBindAttribLocation(g.prog_glyph, 2, "aUV");
+    glBindAttribLocation(g.prog_glyph, 3, "aColor");
+    glBindAttribLocation(g.prog_glyph, 4, "aThresh");
+    glLinkProgram(g.prog_glyph);
+    g.gu_scale = glGetUniformLocation(g.prog_glyph, "uScale");
+    g.gu_origin = glGetUniformLocation(g.prog_glyph, "uOrigin");
+    g.gu_vp = glGetUniformLocation(g.prog_glyph, "uVp");
+    g.gu_zoom = glGetUniformLocation(g.prog_glyph, "uZoom");
+    g.gu_atlas = glGetUniformLocation(g.prog_glyph, "uAtlas");
+
+    // Composite program + a unit fullscreen quad (pos.xy, tex.uv).
+    g.prog_blit = glCreateProgram();
+    glAttachShader(g.prog_blit, compile(GL_VERTEX_SHADER, VS_BLIT));
+    glAttachShader(g.prog_blit, compile(GL_FRAGMENT_SHADER, FS_BLIT));
+    glBindAttribLocation(g.prog_blit, 0, "aPos");
+    glBindAttribLocation(g.prog_blit, 1, "aTex");
+    glLinkProgram(g.prog_blit);
+    g.bu_tex = glGetUniformLocation(g.prog_blit, "uTex");
+    const float quad[] = { -1,-1, 0,0,  1,-1, 1,0,  1,1, 1,1,
+                           -1,-1, 0,0,  1,1, 1,1,  -1,1, 0,1 };
+    glGenBuffers(1, &g.vbo_quad);
+    glBindBuffer(GL_ARRAY_BUFFER, g.vbo_quad);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+    g.ready = true;
+}
+}  // namespace
+
 bool ChartRenderer::ensure_gl() {
     if (gl_ready_) return true;
     if (!t57_gl_loader_init()) return false;
-    prog_ = glCreateProgram();
-    glAttachShader(prog_, compile(GL_VERTEX_SHADER, VS));
-    glAttachShader(prog_, compile(GL_FRAGMENT_SHADER, FS));
-    glBindAttribLocation(prog_, 0, "aWorld");
-    glBindAttribLocation(prog_, 1, "aPost");
-    glBindAttribLocation(prog_, 2, "aColor");
-    glBindAttribLocation(prog_, 3, "aThresh");
-    glLinkProgram(prog_);
-    u_scale_ = glGetUniformLocation(prog_, "uScale");
-    u_origin_ = glGetUniformLocation(prog_, "uOrigin");
-    u_vp_ = glGetUniformLocation(prog_, "uVp");
-    u_zoom_ = glGetUniformLocation(prog_, "uZoom");
+    if (!g_prog.ready) build_programs();   // compile shaders/programs ONCE process-wide
+    const GlPrograms& g = g_prog;          // adopt the shared handles into this instance
+    prog_ = g.prog; u_scale_ = g.u_scale; u_origin_ = g.u_origin; u_vp_ = g.u_vp; u_zoom_ = g.u_zoom;
+    prog_sprite_ = g.prog_sprite; su_scale_ = g.su_scale; su_origin_ = g.su_origin;
+    su_vp_ = g.su_vp; su_zoom_ = g.su_zoom; su_atlas_ = g.su_atlas;
+    prog_pat_ = g.prog_pat; pu_scale_ = g.pu_scale; pu_origin_ = g.pu_origin;
+    pu_vp_ = g.pu_vp; pu_zoom_ = g.pu_zoom; pu_atlas_ = g.pu_atlas;
+    prog_glyph_ = g.prog_glyph; gu_scale_ = g.gu_scale; gu_origin_ = g.gu_origin;
+    gu_vp_ = g.gu_vp; gu_zoom_ = g.gu_zoom; gu_atlas_ = g.gu_atlas;
+    prog_blit_ = g.prog_blit; bu_tex_ = g.bu_tex; vbo_quad_ = g.vbo_quad;
 
-    // Sprite program (textured point symbols).
-    prog_sprite_ = glCreateProgram();
-    glAttachShader(prog_sprite_, compile(GL_VERTEX_SHADER, VS_SPRITE));
-    glAttachShader(prog_sprite_, compile(GL_FRAGMENT_SHADER, FS_SPRITE));
-    glBindAttribLocation(prog_sprite_, 0, "aWorld");
-    glBindAttribLocation(prog_sprite_, 1, "aPost");
-    glBindAttribLocation(prog_sprite_, 2, "aUV");
-    glBindAttribLocation(prog_sprite_, 3, "aThresh");
-    glLinkProgram(prog_sprite_);
-    su_scale_ = glGetUniformLocation(prog_sprite_, "uScale");
-    su_origin_ = glGetUniformLocation(prog_sprite_, "uOrigin");
-    su_vp_ = glGetUniformLocation(prog_sprite_, "uVp");
-    su_zoom_ = glGetUniformLocation(prog_sprite_, "uZoom");
-    su_atlas_ = glGetUniformLocation(prog_sprite_, "uAtlas");
-
-    // Pattern program (tiled area fills).
-    prog_pat_ = glCreateProgram();
-    glAttachShader(prog_pat_, compile(GL_VERTEX_SHADER, VS_PAT));
-    glAttachShader(prog_pat_, compile(GL_FRAGMENT_SHADER, FS_PAT));
-    glBindAttribLocation(prog_pat_, 0, "aWorld");
-    glBindAttribLocation(prog_pat_, 1, "aRect");
-    glBindAttribLocation(prog_pat_, 2, "aTile");
-    glBindAttribLocation(prog_pat_, 3, "aThresh");
-    glLinkProgram(prog_pat_);
-    pu_scale_ = glGetUniformLocation(prog_pat_, "uScale");
-    pu_origin_ = glGetUniformLocation(prog_pat_, "uOrigin");
-    pu_vp_ = glGetUniformLocation(prog_pat_, "uVp");
-    pu_zoom_ = glGetUniformLocation(prog_pat_, "uZoom");
-    pu_atlas_ = glGetUniformLocation(prog_pat_, "uAtlas");
-
-    // Glyph program (SDF text).
-    prog_glyph_ = glCreateProgram();
-    glAttachShader(prog_glyph_, compile(GL_VERTEX_SHADER, VS_GLYPH));
-    glAttachShader(prog_glyph_, compile(GL_FRAGMENT_SHADER, FS_GLYPH));
-    glBindAttribLocation(prog_glyph_, 0, "aWorld");
-    glBindAttribLocation(prog_glyph_, 1, "aPost");
-    glBindAttribLocation(prog_glyph_, 2, "aUV");
-    glBindAttribLocation(prog_glyph_, 3, "aColor");
-    glBindAttribLocation(prog_glyph_, 4, "aThresh");
-    glLinkProgram(prog_glyph_);
-    gu_scale_ = glGetUniformLocation(prog_glyph_, "uScale");
-    gu_origin_ = glGetUniformLocation(prog_glyph_, "uOrigin");
-    gu_vp_ = glGetUniformLocation(prog_glyph_, "uVp");
-    gu_zoom_ = glGetUniformLocation(prog_glyph_, "uZoom");
-    gu_atlas_ = glGetUniformLocation(prog_glyph_, "uAtlas");
-    glGenBuffers(1, &vbo_vtext_);    // whole-view label buffers (shared declutter grid)
+    // Per-instance whole-view label buffers (each chart's own decluttered text).
+    glGenBuffers(1, &vbo_vtext_);
     glGenBuffers(1, &vbo_vglyph_);
-
-    // Composite program + a unit fullscreen quad (pos.xy, tex.uv).
-    prog_blit_ = glCreateProgram();
-    glAttachShader(prog_blit_, compile(GL_VERTEX_SHADER, VS_BLIT));
-    glAttachShader(prog_blit_, compile(GL_FRAGMENT_SHADER, FS_BLIT));
-    glBindAttribLocation(prog_blit_, 0, "aPos");
-    glBindAttribLocation(prog_blit_, 1, "aTex");
-    glLinkProgram(prog_blit_);
-    bu_tex_ = glGetUniformLocation(prog_blit_, "uTex");
-    const float quad[] = { -1,-1, 0,0,  1,-1, 1,0,  1,1, 1,1,
-                           -1,-1, 0,0,  1,1, 1,1,  -1,1, 0,1 };
-    glGenBuffers(1, &vbo_quad_);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_quad_);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
 
     load_sprite_atlas();
     load_glyph_atlas();
@@ -1246,6 +1281,9 @@ void ChartRenderer::shutdown() {
     vbo_quad_ = 0;
     have_range_ = false;
     tiles_.clear(); tiles_mhash_ = 0;   // GL buffers die with the context on shutdown
+    // The shared programs die with the context too — force a rebuild on the next
+    // ensure_gl (e.g. after a plugin reload / context recreate).
+    g_prog = GlPrograms{};
     if (chart_) { tile57_chart_close(chart_); chart_ = nullptr; }
 }
 
