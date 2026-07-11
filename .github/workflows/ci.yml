@@ -48,7 +48,7 @@ jobs:
         run: cmake --build build -j
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tile57_pi-linux
           path: build/libtile57_pi.so
@@ -108,7 +108,7 @@ jobs:
         run: cmake --build build --config Release
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tile57_pi-windows
           path: build/**/tile57_pi.dll
