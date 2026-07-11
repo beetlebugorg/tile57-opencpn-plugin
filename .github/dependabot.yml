@@ -1,0 +1,11 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+  # The Docusaurus docs site pulls a large npm tree — the main dependency-vuln surface.
+  - package-ecosystem: npm
+    directory: "/docs"
+    schedule:
+      interval: weekly
