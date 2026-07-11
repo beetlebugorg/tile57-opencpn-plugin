@@ -1266,7 +1266,14 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         } else if (stale) {
             labels_pending_ = true;   // moved this frame — refresh once motion stops (ask for a redraw)
         }
-        draw_view_labels(scale_px, cull_zoom, w, h, vwx, vwy);
+        // Draw labels at the TRUE zoom, NOT the biased cull_zoom. cull_bias
+        // (= log2(size_scale)) pulls the SCAMIN cull down to thin the un-declutterable
+        // enlarged SYMBOLS; but text + soundings already self-declutter via the dep's
+        // shared grid, so biasing them just hides labels ~log2(size_scale) levels early
+        // — on a Retina display (size_scale ~3) that erased most labels, lights first
+        // (they carry a SCAMIN). At true zoom, S-52 SCAMIN governs label visibility and
+        // the declutter grid handles crowding.
+        draw_view_labels(scale_px, (float)zoom, w, h, vwx, vwy);
     }
 
     if (ss) {
