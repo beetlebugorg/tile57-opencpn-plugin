@@ -35,24 +35,28 @@ but inside OpenCPN's own render loop.
 ## How it fits together
 
 ```
- ENC cell (.000)                OpenCPN                     tile57 engine
-      │                            │                             │
-      │  bake (background thread)  │                             │
-      ▼                            │                             │
- in-memory PMTiles  ◄──────────────┤   RenderRegionViewOnGL      │
-      │                            ├────────────────────────────►│ S-52 portrayal
-      │                            │   per-tile portray + labels  │ (draw callbacks)
-      ▼                            │◄────────────────────────────┤
- per-tile GPU cache  ──────────────►  composed on the GPU        │
+ ENC cells (.000)          OpenCPN                      tile57 engine
+      │                       │                              │
+  Build Charts               │                              │
+  (bake up front)            │                              │
+      ▼                      │   RenderRegionViewOnGL        │
+ PMTiles bundles ────────────┤─────────────────────────────►│ S-52 portrayal
+      │                      │   per-tile portray + labels   │ (draw callbacks)
+      ▼                      │◄─────────────────────────────┤
+  chart directory            │   per-tile GPU cache          │
+      └──────────────────────►   composed on the GPU         │
 ```
+
+Charts are baked to PMTiles bundles once (via the plugin's Build Charts dialog), then
+OpenCPN loads them like any chart directory and drives the GPU render.
 
 - **[tile57](https://github.com/beetlebugorg/tile57)** is the chart engine: it reads
   S-57, adapts to the S-101 data model, runs the official IHO S-101 Portrayal
   Catalogue, and emits resolved draw primitives. This plugin embeds tile57 as a
   static library and calls it through its C ABI.
 - **OpenCPN** owns the canvas, the quilt, and the draw order. The plugin is a
-  `PlugInChartBaseGL` chart class; OpenCPN selects and renders it exactly as it would
-  a native ENC.
+  `PlugInChartBaseExtended` chart class; OpenCPN selects and renders it exactly as it
+  would a native ENC.
 
 ## Where to go next
 
@@ -60,8 +64,8 @@ but inside OpenCPN's own render loop.
   CMake build (Linux and macOS).
 - [**Getting Started**](./getting-started.md) — bake or link a chart, add it to
   OpenCPN, and enable OpenGL.
-- [**Architecture**](./architecture.md) — the chart classes, the live-cell bake
-  flow, and how the plugin plugs into OpenCPN's quilted render.
+- [**Architecture**](./architecture.md) — the chart class, the bake flow, and how the
+  plugin plugs into OpenCPN's quilted render.
 - [**Rendering**](./rendering.md) — the tiled portray/cache/compose pipeline, the
   whole-view label pass, and the GPU vertex model.
 - [**Settings**](./settings.md) — how OpenCPN's S-52 display options (safety

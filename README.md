@@ -37,19 +37,18 @@ demand" model:
 4. labels are portrayed once for the whole view with a single declutter grid (and
    cached the same way) so text doesn't clash at tile seams.
 
-Raw `.000` cells are baked to in-memory PMTiles on background threads (via the plugin's
-Build Charts dialog or the `tile57` CLI); the render thread never blocks on a bake. See
-the [architecture docs](https://beetlebugorg.github.io/tile57-opencpn-plugin/architecture)
+ENC cells are baked to `*.pmtiles` bundles up front (via the plugin's Build Charts
+dialog or the `tile57` CLI); OpenCPN then loads those bundles like any chart directory.
+See the [architecture docs](https://beetlebugorg.github.io/tile57-opencpn-plugin/architecture)
 for the full picture.
 
 ## Layout
 
 ```
-src/tile57_pi.cpp        OpenCPN plugin entry (create_pi / plugin class); registers the chart, overlay, dialogs
-src/tile57_chart.*       ChartTile57 (PlugInChartBaseExtended) + the *.pmtiles / *.t57 chart classes
+src/tile57_pi.cpp        OpenCPN plugin entry (create_pi / plugin class); registers the chart + dialogs
+src/tile57_chart.*       ChartTile57Pmtiles (PlugInChartBaseExtended) — opens a baked *.pmtiles bundle
 src/chart_renderer.*     tiled portray -> tessellate -> cache -> compose on the GPU
-src/bake_manager.*       background cell -> PMTiles bake queue + on-disk cache
-src/build_charts.*       Build Charts dialog: bulk-bake an ENC root
+src/build_charts.*       Build Charts dialog: bulk-bake an ENC root to *.pmtiles
 src/gl.h                 GL headers (GLEW) + GLSL version prologue
 third_party/earcut.hpp   polygon tessellation (Mapbox earcut, ISC)
 opencpn-libs/            OpenCPN plugin API (git submodule; api-18 -> ocpn::api)

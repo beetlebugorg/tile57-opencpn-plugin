@@ -28,9 +28,6 @@ public:
     enum class Pass { kBase, kText, kAll };
 
     bool open_chart(const std::string& pmtiles_path);   // baked .pmtiles archive
-    // Swap in a chart handle opened elsewhere (e.g. a background bake thread), closing
-    // the previous one and forcing a re-portray against it. Main thread only.
-    void set_chart(tile57_chart* c);
     bool ensure_gl();
     // Portray (if needed) for this view, then draw into the current framebuffer.
     // lon/lat = view centre, zoom = the GEOGRAPHIC (chart-scale) web-mercator zoom —

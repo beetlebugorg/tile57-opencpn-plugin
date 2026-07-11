@@ -478,19 +478,11 @@ static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, 
 // ---- chart / GL lifecycle --------------------------------------------------
 bool ChartRenderer::open_chart(const std::string& path) {
     if (chart_) return true;
-    // Only baked .pmtiles archives open as charts (the v0.3 ABI bakes raw cells
-    // first — see ChartTile57::start_bake). Resolve symlinks so mmap sees the
-    // real file.
+    // Only baked .pmtiles archives open as charts (cells are baked to bundles up
+    // front via the Build Charts dialog). Resolve symlinks so mmap sees the real file.
     std::string real = path;
     if (char* rp = realpath(path.c_str(), nullptr)) { real = rp; std::free(rp); }
     return tile57_chart_open(real.c_str(), &chart_, nullptr) == TILE57_OK && chart_;
-}
-void ChartRenderer::set_chart(tile57_chart* c) {
-    if (c == chart_) return;
-    if (chart_) tile57_chart_close(chart_);
-    chart_ = c;
-    have_range_ = false;  // re-fetch zoom range + coverage bounds for the new chart
-    if (gl_ready_) clear_tiles();   // the cached tiles belonged to the old chart
 }
 bool ChartRenderer::get_info(tile57_info& out) const {
     if (!chart_) return false;

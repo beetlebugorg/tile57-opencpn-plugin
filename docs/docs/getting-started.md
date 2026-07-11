@@ -66,11 +66,12 @@ selects and draws it like a native chart, including quilting with adjacent cells
 whatever the plugin's charts cover under the cursor, the same information a native
 ENC "Object Query" gives you.
 
-## Loading feedback
+## Baking feedback
 
-While a cell is baking for the first time, the plugin draws an animated "loading"
-veil over that cell's area and a progress bar at the bottom-left, then swaps in the
-real chart as each band lands — the chart is never blocked waiting on a bake.
+Baking happens up front, in the **Build Charts** dialog — it shows a progress bar as it
+works through the cells, then registers the chart directory when it finishes. Once
+charts are baked, OpenCPN opens the `.pmtiles` bundles directly and they render
+immediately; there is no per-view baking while you navigate.
 
 ## Next
 

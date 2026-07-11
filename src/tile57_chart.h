@@ -22,8 +22,6 @@
 #pragma once
 #include <cstdint>  // ocpn_plugin.h (api-18) references uint8_t before including it
 #include <vector>
-#include <atomic>
-#include <thread>
 #include <string>
 #include "ocpn_plugin.h"
 #include "chart_renderer.h"
@@ -37,18 +35,16 @@ public:
     ChartTile57();
     virtual ~ChartTile57();
 
-    // OpenCPN discovers baked tile57 bundles by this mask.
-    // *.pmtiles = baked bundles; *.t57 = a symlink to a live .000 cell (a plugin-owned
-    // extension so OpenCPN's built-in S-57 engine doesn't claim it — see scripts).
-    wxString GetFileSearchMask(void) override { return _T("*.t57"); }
+    // OpenCPN discovers baked tile57 bundles by this mask (the concrete class
+    // ChartTile57Pmtiles overrides it; see below).
+    wxString GetFileSearchMask(void) override { return _T("*.pmtiles"); }
 
     int Init(const wxString& full_path, int init_flags) override;
     void SetColorScheme(int cs, bool bApplyImmediate) override;
 
-    // Ready as soon as Init returns (metadata + coverage are loaded). Tiles bake on a
-    // background thread and stream in via the render path; reporting "not ready" here
-    // instead makes OpenCPN destroy + re-create the chart every frame (re-baking
-    // forever). So we stay ready and simply draw nothing until the first band lands.
+    // A baked bundle opens synchronously in Init (metadata + coverage loaded), so the
+    // chart is always ready. Reporting "not ready" would make OpenCPN destroy +
+    // re-create the chart every frame.
     bool IsReadyToRender() override { return true; }
 
     double GetNormalScaleMin(double canvas_scale_factor, bool b_allow_overzoom) override;
@@ -100,33 +96,10 @@ public:
     bool covers(double lon, double lat) const;
     static const std::vector<ChartTile57*>& instances();
 
-    // True while this cell is baking its tiles and has nothing to draw yet — the plugin
-    // overlay paints the animated 8-bit loader over this bbox meanwhile. Writes bounds
-    // and returns true only when loading.
-    bool loading_extent(double& w, double& s, double& e, double& n) const {
-        if (!loading_.load(std::memory_order_acquire)) return false;
-        w = bounds_west_; s = bounds_south_; e = bounds_east_; n = bounds_north_;
-        return true;
-    }
-
 private:
     // Extract bbox / native scale / M_COVR coverage from an open chart handle into
     // this chart's members (GetChartExtent / m_Chart_Scale / GetCOVR*).
     void apply_info(tile57_chart* h, const tile57_info& info);
-    // Bounds/scale for a NOT-YET-BAKED cell, from the raw-source reader
-    // (tile57_enc_charts JSON) — coverage falls back to the bbox rectangle until
-    // the baked archive (which embeds real M_COVR) opens on a later run.
-    void apply_enc_meta(double w, double s, double e, double n, int scale);
-    // The on-disk per-cell tile cache path (keyed by cell + freshest mtime + update
-    // count + bake version), so the slow bake is one-time across runs. The engine
-    // owns the zoom range (native band), so zoom is no longer part of the key.
-    std::string cache_path(const std::string& cell_path) const;
-    // Background bake (full init): bake the native band range and hand the result
-    // to the render thread via pending_chart_. See tile57_chart.cpp for the
-    // thread-safety contract (single-writer chart_, atomic handoff, warmup).
-    void start_bake();
-    void publish(tile57_chart* c);     // bake thread -> render thread handoff
-    void adopt_pending();              // render thread: swap in a freshly baked chart
 
     // Debug (env TILE57_CALIB=1): draw a 5mm square at the exact px/mm the chart
     // symbols/text use, centred, so it can be measured with a ruler — the S-52
@@ -159,41 +132,17 @@ private:
 
     int plib_hash_ = -1;    // last PI_GetPLIBStateHash() folded into mariner_
 
-    // --- Background progressive bake (full init only) ---
-    // Thread model (portable, no platform APIs): the bake thread NEVER touches the
-    // renderer's chart_; it publishes each baked handle into `pending_chart_` (a
-    // lock-free atomic pointer). The main/GL thread is the sole consumer/owner of
-    // chart_ (adopt_pending swaps it in during render). Each handle is closed exactly
-    // once, by one thread. `ready_` gates IsReadyToRender(). Global tile57 registries
-    // are warmed on the main thread at plugin load (tile57_warmup) so the concurrent
-    // bake only READS them; the allocator is thread-safe and portrayal is threadlocal.
-    std::atomic<bool> ready_{false};
-    std::atomic<bool> cancel_{false};
-    std::atomic<bool> loading_{false};   // baking, nothing to draw yet -> show the loader
-    std::atomic<tile57_chart*> pending_chart_{nullptr};
-    std::thread bake_thread_;
-    std::string bake_path_;             // resolved .000 path (set before the thread starts)
-    std::string cache_file_;            // on-disk baked-tile cache for this cell
-    wxWindow* canvas_ = nullptr;        // for a thread-safe CallAfter refresh
+    wxWindow* canvas_ = nullptr;   // canvas for CallAfter(Refresh) (progressive-tile redraw)
 
     wxDECLARE_DYNAMIC_CLASS(ChartTile57);
 };
 
-// Two concrete chart classes so OpenCPN scans BOTH extensions and the user can switch
-// renderers by which folder is added: baked bundles (*.pmtiles, ENC_ROOT_TILES) or
-// live cells (*.t57, ENC_ROOT_CELLS). GetFileSearchMask can't return multiple masks
-// (OpenCPN uses the whole string as one wildcard), so each is its own dynamic class;
-// all behaviour lives in the shared base (Init branches on the file extension).
+// The concrete registered chart class (see Tile57Plugin::GetDynamicChartClassNameArray).
+// GetFileSearchMask can return only one wildcard (OpenCPN uses the whole string as one),
+// so the mask lives on this subclass while all behaviour stays in the shared base.
 class ChartTile57Pmtiles : public ChartTile57 {
 public:
     wxString GetFileSearchMask(void) override { return _T("*.pmtiles"); }
 private:
     wxDECLARE_DYNAMIC_CLASS(ChartTile57Pmtiles);
-};
-
-class ChartTile57Cell : public ChartTile57 {
-public:
-    wxString GetFileSearchMask(void) override { return _T("*.t57"); }
-private:
-    wxDECLARE_DYNAMIC_CLASS(ChartTile57Cell);
 };

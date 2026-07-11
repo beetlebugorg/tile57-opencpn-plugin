@@ -1,6 +1,5 @@
 // tile57_chart.cpp — see tile57_chart.h.
 #include "tile57_chart.h"
-#include "bake_manager.h"
 #include "gl.h"
 #include <wx/fileconf.h>
 #include <wx/filename.h>
@@ -10,19 +9,16 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <string>
-#include <sys/stat.h>
 #include <unordered_set>
 #include <vector>
 
 // wxWidgets can create ChartTile57 by class name; OpenCPN uses this to
 // instantiate the chart for each matching file it finds in a chart directory.
 wxIMPLEMENT_DYNAMIC_CLASS(ChartTile57, PlugInChartBaseExtended);
-// The two concrete classes OpenCPN instantiates by name (baked bundles + live cells);
-// they differ only in GetFileSearchMask, everything else is the shared base.
+// The concrete class OpenCPN instantiates by name; it only sets GetFileSearchMask,
+// everything else is the shared base.
 wxIMPLEMENT_DYNAMIC_CLASS(ChartTile57Pmtiles, ChartTile57);
-wxIMPLEMENT_DYNAMIC_CLASS(ChartTile57Cell, ChartTile57);
 
 namespace {
 constexpr double kEarthR = 6378137.0;
@@ -92,31 +88,6 @@ int scale_denom(double zoom, double lat_deg) {
     return (int)std::llround(resolution_m_per_px(zoom, lat_deg) * kPxPerMetre);
 }
 
-// Bounds + compilation scale of the FIRST chart in the tile57_enc_charts JSON —
-// engine-generated with a fixed shape ([{"name":..,"scale":N,..,"bbox":[w,s,e,n]}]),
-// so targeted field extraction beats hauling in a JSON parser. Returns false when
-// the path doesn't parse as S-57 or carries no bbox.
-bool enc_chart_meta(const std::string& path, double& w, double& s, double& e,
-                    double& n, int& scale) {
-    uint8_t* buf = nullptr;
-    size_t len = 0;
-    if (tile57_enc_charts(path.c_str(), &buf, &len, nullptr) != TILE57_OK || !buf) return false;
-    std::string json(reinterpret_cast<const char*>(buf), len);
-    tile57_free(buf);
-
-    scale = 0;
-    if (size_t sp = json.find("\"scale\":"); sp != std::string::npos)
-        scale = std::atoi(json.c_str() + sp + 8);
-    size_t bp = json.find("\"bbox\":[");
-    if (bp == std::string::npos) return false;
-    const char* q = json.c_str() + bp + 8;
-    char* end = nullptr;
-    w = std::strtod(q, &end); if (!end || *end != ',') return false; q = end + 1;
-    s = std::strtod(q, &end); if (!end || *end != ',') return false; q = end + 1;
-    e = std::strtod(q, &end); if (!end || *end != ',') return false; q = end + 1;
-    n = std::strtod(q, &end); if (!end || *end != ']') return false;
-    return true;
-}
 }  // namespace
 
 ChartTile57::ChartTile57() {
@@ -129,14 +100,6 @@ ChartTile57::ChartTile57() {
 }
 
 ChartTile57::~ChartTile57() {
-    // Stop the bake thread first (it publishes into pending_chart_ / calls back into
-    // the canvas), then drain any handle it left, then tear down the renderer. join()
-    // waits out at most the current bake phase (cancel_ is checked between phases).
-    cancel_.store(true, std::memory_order_release);
-    if (bake_thread_.joinable()) bake_thread_.join();
-    if (tile57_chart* p = pending_chart_.exchange(nullptr, std::memory_order_acq_rel))
-        tile57_chart_close(p);
-
     auto& reg = chart_registry();
     reg.erase(std::remove(reg.begin(), reg.end(), this), reg.end());
     renderer_.shutdown();
@@ -182,189 +145,27 @@ void ChartTile57::apply_info(tile57_chart* h, const tile57_info& info) {
     min_zoom_ = info.min_zoom; max_zoom_ = info.max_zoom;
 }
 
-// Bounds/scale for a NOT-YET-BAKED cell (raw-source reader metadata): the bbox
-// rectangle stands in for coverage until the baked archive (which embeds real
-// M_COVR) opens on a later run — mirrors apply_info minus the archive-only parts.
-void ChartTile57::apply_enc_meta(double w, double s, double e, double n, int scale) {
-    center_lat_ = 0.5 * (n + s);
-    m_Chart_Scale = scale > 0 ? scale : 50000;   // CSCL absent: mid-range placeholder
-    m_Chart_Skew = 0.0;
-    m_depth_unit_id = PI_DEPTH_UNIT_METERS;
-    m_DepthUnits = _T("Meters");
-
-    covr_[0] = (float)n; covr_[1] = (float)w;   // NW
-    covr_[2] = (float)n; covr_[3] = (float)e;   // NE
-    covr_[4] = (float)s; covr_[5] = (float)e;   // SE
-    covr_[6] = (float)s; covr_[7] = (float)w;   // SW
-    covr_valid_ = true;
-    covr_tables_.clear();
-
-    bounds_west_ = w; bounds_south_ = s;
-    bounds_east_ = e; bounds_north_ = n;
-}
-
-// Bump when the bake format or portrayal changes so stale caches are ignored.
-// v3: the v0.3 C ABI — the engine bakes the chart's native band zoom range itself
-// (the plugin's zoom cap is gone, and with it the zoom component of the cache key).
-static constexpr int kBakeVersion = 3;
-
-// <cache>/tile57/cells/<stem>-<pathhash>-<keyhash>.pmtiles. The keyhash covers the
-// cell path, the freshest mtime across the .000 + its .001.. updates, the update
-// count, and kBakeVersion — so a re-issued cell, an added/edited update, or a
-// format bump all miss and re-bake. The stable pathhash
-// prefix lets the baker later sweep THIS cell's now-stale siblings. Pure/computation
-// only (called during the DB scan, once per cell) — no I/O beyond ensuring the dir.
-std::string ChartTile57::cache_path(const std::string& cell_path) const {
-    namespace fs = std::filesystem;
-    const char* xdg = std::getenv("XDG_CACHE_HOME");
-    const char* home = std::getenv("HOME");
-    fs::path dir = (xdg && *xdg) ? fs::path(xdg) : fs::path(home ? home : "/tmp") / ".cache";
-    dir = dir / "tile57" / "cells";
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-
-    long mt = 0;
-    int ucount = 0;
-    struct stat st {};
-    if (::stat(cell_path.c_str(), &st) == 0) mt = (long)st.st_mtime;
-    if (cell_path.size() > 4) {
-        std::string stem = cell_path.substr(0, cell_path.size() - 4);   // strip ".000"
-        for (int u = 1; u <= 999; ++u) {
-            char sfx[16];
-            std::snprintf(sfx, sizeof sfx, ".%03d", u);
-            struct stat us {};
-            if (::stat((stem + sfx).c_str(), &us) != 0) break;
-            ++ucount;
-            if ((long)us.st_mtime > mt) mt = (long)us.st_mtime;
-        }
-    }
-    std::string key = cell_path + "|" + std::to_string(mt) + "|" + std::to_string(ucount) +
-                      "|v" + std::to_string(kBakeVersion);
-    char ph[12], kh[20];
-    std::snprintf(ph, sizeof ph, "%08zx", std::hash<std::string>{}(cell_path) & 0xffffffffu);
-    std::snprintf(kh, sizeof kh, "%016zx", std::hash<std::string>{}(key));
-    std::string name = fs::path(cell_path).stem().string() + "-" + ph + "-" + kh + ".pmtiles";
-    return (dir / name).string();
-}
-
 int ChartTile57::Init(const wxString& full_path, int init_flags) {
     m_FullPath = full_path;
     m_Name = wxFileName(full_path).GetName();
     m_Description = _T("tile57 S-57/S-101 ENC (EXPERIMENTAL — NOT FOR NAVIGATION)");
     m_ID = full_path;
 
-    // Resolve the .t57 symlink to the real .000 so tile57 finds the .001.. update
-    // chain in the cell's own directory (the symlink tree carries only the base link).
+    // The plugin registers only the *.pmtiles class, so every chart is a pre-baked
+    // tile57 bundle: open the archive directly (a cheap peek) and render straight away —
+    // no cell parse, no bake. Metadata (bounds, native scale, M_COVR coverage) comes
+    // from the archive itself. Cells are baked to *.pmtiles up front via the Build
+    // Charts dialog (see build_charts.cpp).
     std::string path = std::string(full_path.mb_str());
-    if (char* rp = realpath(path.c_str(), nullptr)) { path = rp; std::free(rp); }
-
-    auto ends_with = [&](const char* suf) {
-        std::string s(suf);
-        return path.size() >= s.size() && path.compare(path.size() - s.size(), s.size(), s) == 0;
-    };
-
-    // A pre-baked *.pmtiles bundle opens directly (cheap archive peek) and renders
-    // straight away — no cell parse, no background bake. Metadata comes from the
-    // archive (its coverage is the bounding box; a baked bundle has no M_COVR).
-    if (ends_with(".pmtiles")) {
-        if (!renderer_.open_chart(path)) return PI_INIT_FAIL_REMOVE;
-        tile57_info pinfo{};
-        if (!renderer_.get_info(pinfo) || !pinfo.has_bounds) return PI_INIT_FAIL_REMOVE;
-        apply_info(renderer_.chart_handle(), pinfo);
-        m_bReadyToRender = true;
-        return PI_INIT_OK;
-    }
-
-    bake_path_ = path;
-    cache_file_ = cache_path(path);
-
-    // Cache hit: the baked archive already lives on disk — open it outright.
-    // Metadata AND the real M_COVR coverage come from the archive itself (the
-    // bake embeds them), so the warm path never parses the cell at all.
-    std::error_code ec;
-    if (std::filesystem::exists(cache_file_, ec) && renderer_.open_chart(cache_file_)) {
-        tile57_info info{};
-        if (renderer_.get_info(info) && info.has_bounds) {
-            apply_info(renderer_.chart_handle(), info);
-            wxLogMessage("tile57 Init: cache HIT %s bounds[W%.5f S%.5f E%.5f N%.5f] "
-                         "zoom[%d..%d] scale=1:%d flags=%d", cache_file_.c_str(),
-                         info.west, info.south, info.east, info.north,
-                         (int)info.min_zoom, (int)info.max_zoom, m_Chart_Scale, init_flags);
-            ready_.store(true, std::memory_order_release);
-            m_bReadyToRender = true;
-            return PI_INIT_OK;
-        }
-    }
-    std::filesystem::remove(cache_file_, ec);   // stale/corrupt (open failed) -> re-bake
-
-    // Cold: bounds + compilation scale via the raw-source reader (a cheap
-    // metadata parse, no bake) so a chart-DB scan over hundreds of cells stays
-    // fast. Coverage falls back to the bbox rectangle until the baked archive
-    // (which embeds real M_COVR) opens on the next run.
-    double w = 0, so = 0, e = 0, n = 0;
-    int scale = 0;
-    if (!enc_chart_meta(path, w, so, e, n, scale)) return PI_INIT_FAIL_REMOVE;
-    apply_enc_meta(w, so, e, n, scale);
-
-    // Pre-bake EVERY cell in the background (this runs during the DB scan too) so a
-    // cell is cached before it is ever viewed — no per-cell stall while navigating.
-    t57::BakeManager::instance().enqueue(path, cache_file_);
-
-    wxLogMessage("tile57 Init: %s bounds[W%.5f S%.5f E%.5f N%.5f] scale=1:%d flags=%d",
-                 m_FullPath.c_str(), w, so, e, n, m_Chart_Scale, init_flags);
-
-    // Header/thumbnail scan: metadata only, nothing renders — done (and "ready").
-    if (init_flags == PI_HEADER_ONLY || init_flags == PI_THUMB_ONLY) {
-        ready_.store(true, std::memory_order_release);
-        m_bReadyToRender = true;
-        return PI_INIT_OK;
-    }
-    wxLogMessage("tile57: cache MISS, baking -> %s", cache_file_.c_str());
-
-    // Cache miss: bake on a background thread (progressive — a coarse band for first
-    // paint, then the full range persisted to the cache so the next run is instant).
-    canvas_ = GetOCPNCanvasWindow();
-    ready_.store(false, std::memory_order_release);
-    cancel_.store(false, std::memory_order_release);
-    loading_.store(true, std::memory_order_release);   // show the loader over this cell
-    m_bReadyToRender = false;
-    start_bake();
+    if (!renderer_.open_chart(path)) return PI_INIT_FAIL_REMOVE;
+    tile57_info info{};
+    if (!renderer_.get_info(info) || !info.has_bounds) return PI_INIT_FAIL_REMOVE;
+    apply_info(renderer_.chart_handle(), info);
+    wxLogMessage("tile57 Init: %s bounds[W%.5f S%.5f E%.5f N%.5f] zoom[%d..%d] scale=1:%d flags=%d",
+                 m_FullPath.c_str(), info.west, info.south, info.east, info.north,
+                 (int)info.min_zoom, (int)info.max_zoom, m_Chart_Scale, init_flags);
+    m_bReadyToRender = true;
     return PI_INIT_OK;
-}
-
-// Bake thread: one native-band bake -> the shared bake manager persists it to the
-// disk cache (coordinated so the background sweep can't also bake this cell), then
-// open the written archive and hand it to the render thread via publish(). Only
-// READS the warmed global registries; never touches renderer_.chart_. (The old
-// two-phase quick-band preview rode the v0.2 zoom-capped open, which the v0.3 ABI
-// retired — the engine owns the native zoom range now.)
-void ChartTile57::start_bake() {
-    bake_thread_ = std::thread([this]() {
-        if (cancel_.load(std::memory_order_acquire)) return;
-        if (!t57::BakeManager::instance().bake_now(bake_path_, cache_file_)) return;
-        if (cancel_.load(std::memory_order_acquire)) return;
-        tile57_chart* full = nullptr;
-        tile57_chart_open(cache_file_.c_str(), &full, nullptr);
-        if (cancel_.load(std::memory_order_acquire)) { if (full) tile57_chart_close(full); return; }
-        if (full) publish(full);
-    });
-}
-
-// Bake thread -> render thread handoff. exchange() returns any prior pending handle
-// the render thread never consumed; the bake thread closes that (it was never shared).
-void ChartTile57::publish(tile57_chart* c) {
-    tile57_chart* prev = pending_chart_.exchange(c, std::memory_order_acq_rel);
-    if (prev) tile57_chart_close(prev);
-    ready_.store(true, std::memory_order_release);
-    if (canvas_) canvas_->CallAfter([w = canvas_]() { w->Refresh(false); });
-}
-
-// Render thread: adopt a freshly baked chart if one is waiting (sole owner of chart_).
-void ChartTile57::adopt_pending() {
-    if (tile57_chart* c = pending_chart_.exchange(nullptr, std::memory_order_acq_rel)) {
-        renderer_.set_chart(c);
-        loading_.store(false, std::memory_order_release);   // a band landed -> loader off
-    }
 }
 
 void ChartTile57::SetColorScheme(int cs, bool /*bApplyImmediate*/) {
@@ -541,13 +342,13 @@ void ChartTile57::draw_calibration() const {
 int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
                              bool stencil_clip) {
     if (!vp.bValid) return false;
-    // Adopt a freshly baked chart if the background thread has one waiting (main-thread
-    // owner of chart_). Until the first band lands, draw nothing here — the plugin's GL
-    // overlay paints the animated 8-bit loader over this cell's bbox (loading_extent).
-    adopt_pending();
     if (!renderer_.has_chart()) return true;
     if (!renderer_.ensure_gl()) return false;
     refresh_mariner();
+    // Remember the canvas (on the GL thread, where it's valid) for the deferred-tile
+    // CallAfter(Refresh) below — a settled view with cold tiles still pending asks for
+    // one more redraw so they fill in.
+    if (!canvas_) canvas_ = GetOCPNCanvasWindow();
 
     // Render into the CURRENT GL viewport — that is what NDC maps to, and it is
     // OpenCPN's choice of target (canvas FBO, or a sub-rect of it). Do NOT size

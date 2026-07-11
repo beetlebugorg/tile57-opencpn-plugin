@@ -20,11 +20,9 @@ certified navigation product. Do not rely on them for real-world navigation.
 - **Web Mercator only.** There is no chart rotation or course-up handling yet; the
   view is north-up web-mercator.
 - **Charts must be baked to PMTiles.** You bake cells to tile57 bundles (through the
-  Build Charts dialog or the `tile57` CLI) before OpenCPN can load them. Encrypted
-  (S-63) cells are not supported — the source `.000` must be unencrypted.
-- **Live `.t57` cells are opt-in.** The per-cell live class exists but isn't
-  auto-registered, so the normal path is baking to `*.pmtiles`. This avoids OpenCPN
-  triggering slow per-view bakes on its own.
+  Build Charts dialog or the `tile57` CLI) before OpenCPN can load them — there is no
+  live per-view rendering of a raw `.000`. Encrypted (S-63) cells are not supported;
+  the source `.000` must be unencrypted.
 - **Portrayal fidelity follows tile57.** Anything the engine doesn't yet portray
   correctly won't be correct here either — see tile57's own
   [Known Limitations](https://beetlebugorg.github.io/tile57/limitations).

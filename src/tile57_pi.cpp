@@ -10,25 +10,9 @@
 #include <cstdlib>  // getenv (startup build/debug marker)
 #include "ocpn_plugin.h"
 #include "tile57_chart.h"
-#include "bake_manager.h"
 #include "build_charts.h"
-#include "gl.h"
-#include <chrono>
-#include <cmath>
 #include <wx/wx.h>
 #include <wx/html/htmlwin.h>
-
-// While cells bake in the background, force periodic canvas redraws so the pre-bake
-// progress bar + the per-cell loading hint animate (a background bake doesn't itself
-// trigger a redraw). Idle (no baking) => a cheap check, no redraw.
-class BakeRefreshTimer : public wxTimer {
-public:
-    void Notify() override {
-        if (t57::BakeManager::instance().pending() > 0) {
-            if (wxWindow* w = GetOCPNCanvasWindow()) w->Refresh(false);
-        }
-    }
-};
 
 class Tile57Plugin : public opencpn_plugin_118 {
 public:
@@ -38,19 +22,14 @@ public:
         wxLogMessage("tile57_pi: initialised [build " __DATE__ " " __TIME__ ", TILE57_DEBUG=%s]",
                      std::getenv("TILE57_DEBUG") ? std::getenv("TILE57_DEBUG") : "(unset)");
         // Populate tile57's process-global read-only registries (S-100 catalogue +
-        // linestyles) on this, the main thread, BEFORE any chart spawns a background
-        // bake thread — thereafter they're read-only, so concurrent bake/render is
-        // race-free. Must precede the chart-DB scan (which creates ChartTile57s).
+        // linestyles) on this, the main thread, before the chart-DB scan creates any
+        // ChartTile57 and the GL thread first renders.
         tile57_warmup();
-        bake_timer_.Start(110);   // ~9 fps redraws while baking (loader + progress bar)
         return INSTALLS_PLUGIN_CHART | INSTALLS_PLUGIN_CHART_GL
              | WANTS_MOUSE_EVENTS | WANTS_CURSOR_LATLON
-             | WANTS_PREFERENCES              // the "Build Charts" settings panel
-             | WANTS_OPENGL_OVERLAY_CALLBACK;   // for the unobtrusive pre-bake indicator
+             | WANTS_PREFERENCES;             // the "Build Charts" settings panel
     }
     bool DeInit() override {
-        bake_timer_.Stop();
-        t57::BakeManager::instance().stop();   // stop + join the pre-bake worker
         if (query_dlg_) { query_dlg_->Destroy(); query_dlg_ = nullptr; }
         if (prefs_dlg_) { prefs_dlg_->StopBake(); prefs_dlg_->Destroy(); prefs_dlg_ = nullptr; }
         return true;
@@ -72,94 +51,6 @@ public:
         wxLogMessage("tile57: ShowPreferencesDialog shown");
     }
 
-    // Two unobtrusive indicators, both fixed-function so they compose with OpenCPN's GL:
-    //   * a subtle "still baking" hint (soft veil + pulsing dots) over each cell with
-    //     no tiles yet;
-    //   * a slim pre-bake progress bar bottom-left while the background sweep runs.
-    bool RenderGLOverlay(wxGLContext* /*ctx*/, PlugIn_ViewPort* vp) override {
-        if (!vp) return false;
-        auto& bm = t57::BakeManager::instance();
-        const int total = bm.total();
-        const int pending = bm.pending();
-
-        // Any cells currently loading (no tiles yet)?
-        bool any_loading = false;
-        for (ChartTile57* c : ChartTile57::instances()) {
-            double w, s, e, n;
-            if (c && c->loading_extent(w, s, e, n)) { any_loading = true; break; }
-        }
-        if (!any_loading && (total <= 0 || pending <= 0)) return false;
-
-        // glUseProgram (below) is a GLEW entry point — null until glewInit, which the
-        // renderer runs in ensure_gl(). But this overlay can fire before ANY chart has
-        // rendered (startup while every cell re-bakes: all loading, nothing drawn yet),
-        // so load the entry points here too (idempotent; the overlay's GL context is
-        // current) and skip this frame rather than call through a null pointer — that
-        // was a crash: RenderGLOverlay -> glUseProgram == 0x0.
-        static bool gl_ready = false;
-        if (!gl_ready) gl_ready = t57_gl_loader_init();
-        if (!gl_ready) return false;
-
-        const float W = (float)vp->pix_width, H = (float)vp->pix_height;
-        glUseProgram(0);   // drop any shader so fixed-function immediate mode draws
-        glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
-        glOrtho(0, W, H, 0, -1, 1);
-        glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
-        glDisable(GL_TEXTURE_2D);
-        glDisable(GL_DEPTH_TEST);
-        auto rect = [](float x, float y, float rw, float rh) {
-            glBegin(GL_QUADS);
-            glVertex2f(x, y); glVertex2f(x + rw, y);
-            glVertex2f(x + rw, y + rh); glVertex2f(x, y + rh);
-            glEnd();
-        };
-
-        // --- subtle "still baking" hint over each loading cell's bbox: a soft static
-        //     veil + three quietly pulsing dots at the centre (reads as "loading",
-        //     not a replacement for the map) ---
-        if (any_loading) {
-            const double t = std::chrono::duration<double>(
-                                 std::chrono::steady_clock::now().time_since_epoch()).count();
-            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            for (ChartTile57* c : ChartTile57::instances()) {
-                double bw, bs, be, bn;
-                if (!c || !c->loading_extent(bw, bs, be, bn)) continue;
-                wxPoint nw, se;
-                GetCanvasPixLL(vp, &nw, bn, bw);
-                GetCanvasPixLL(vp, &se, bs, be);
-                float x0 = std::max(0.f, (float)std::min(nw.x, se.x));
-                float y0 = std::max(0.f, (float)std::min(nw.y, se.y));
-                float x1 = std::min(W, (float)std::max(nw.x, se.x));
-                float y1 = std::min(H, (float)std::max(nw.y, se.y));
-                if (x1 <= x0 || y1 <= y0) continue;   // off-screen
-                glColor4f(0.55f, 0.60f, 0.66f, 0.14f);   // soft veil
-                rect(x0, y0, x1 - x0, y1 - y0);
-                // three dots pulsing in sequence at the cell centre
-                const float cx = 0.5f * (x0 + x1), cy = 0.5f * (y0 + y1);
-                const float dr = 3.f, gap = 11.f;
-                for (int i = 0; i < 3; ++i) {
-                    float ph = 0.5f + 0.5f * (float)std::sin(t * 3.0 - i * 0.8);
-                    glColor4f(0.93f, 0.95f, 0.98f, 0.18f + 0.55f * ph);
-                    rect(cx + (i - 1) * gap - dr, cy - dr, 2 * dr, 2 * dr);
-                }
-            }
-        }
-
-        // --- pre-bake progress bar (bottom-left) ---
-        if (total > 0 && pending > 0) {
-            const float frac = (float)(total - pending) / (float)total;
-            const float bx = 14.f, bh = 4.f, by = H - 18.f, bw = 150.f;
-            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-            glColor4f(0.f, 0.f, 0.f, 0.40f); rect(bx - 3, by - 3, bw + 6, bh + 6);
-            glColor4f(1.f, 1.f, 1.f, 0.22f); rect(bx, by, bw, bh);
-            glColor4f(0.30f, 0.72f, 1.f, 0.85f); rect(bx, by, bw * frac, bh);
-        }
-
-        glMatrixMode(GL_PROJECTION); glPopMatrix();
-        glMatrixMode(GL_MODELVIEW); glPopMatrix();
-        return true;
-    }
-
     int GetAPIVersionMajor() override { return 1; }
     int GetAPIVersionMinor() override { return 18; }
     int GetPlugInVersionMajor() override { return 0; }
@@ -171,9 +62,8 @@ public:
                                                         "rendered on the GPU. Add the folder holding a baked bundle's "
                                                         "chart.pmtiles as a chart directory. EXPERIMENTAL / NOT FOR NAVIGATION."); }
 
-    // pmtiles-ONLY: OpenCPN scans our pre-baked *.pmtiles (opened directly, fast) and
-    // never the raw *.000 cells (the *.t57 live-cell class is deliberately NOT registered
-    // so nothing triggers a slow per-view bake). Prepare charts via the Build Charts panel.
+    // OpenCPN scans our pre-baked *.pmtiles bundles (opened directly, fast). Prepare
+    // charts (bake ENC cells -> *.pmtiles) via the Build Charts panel.
     wxArrayString GetDynamicChartClassNameArray() override {
         wxArrayString a;
         a.Add(_T("ChartTile57Pmtiles"));
@@ -202,7 +92,6 @@ private:
     wxDialog* query_dlg_ = nullptr;
     wxHtmlWindow* query_html_ = nullptr;
     BuildChartsDialog* prefs_dlg_ = nullptr;
-    BakeRefreshTimer bake_timer_;
 
     void show_query(const wxString& body) {
         if (!query_dlg_) {
