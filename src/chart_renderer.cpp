@@ -884,12 +884,10 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     if (cz < min_zoom_) cz = min_zoom_;
     if (cz > max_zoom_) cz = max_zoom_;
 
-    // Re-portray on zoom only once the gesture SETTLES: while the zoom is still
-    // changing frame-to-frame we transform the cached geometry (smooth, like a
-    // native chart), and refresh to crisp detail when it stops. A large excursion
-    // (>3 levels) refreshes even mid-gesture to avoid extreme scaling artefacts.
-    bool zoom_settled = std::fabs(zoom - last_zoom_) < 0.02;
-    if (pass != Pass::kText) last_zoom_ = zoom;
+    // Re-portray on zoom only once the gesture SETTLES (detected via `moving`
+    // below): while the zoom changes we transform the cached geometry (smooth,
+    // like a native chart) and refresh to crisp detail when it STOPS. A large
+    // excursion (>3 levels) refreshes even mid-gesture to bound extreme scaling.
     bool zoom_stale = std::fabs(cz - cam_zoom_) > 0.3;
 
     uint64_t mh = mariner_hash(m);
@@ -923,15 +921,20 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     const char* reason = !have_cam_ ? "init"
                        : (mh != cam_mhash_) ? "mariner"
                        : (cam_w_ < cam_dim(w) / 2 || cam_h_ < cam_dim(h) / 2) ? "grow"
-                       : (zoom_stale && (zoom_settled || std::fabs(cz - cam_zoom_) > 3.0)) ? "zoom"
+                       : (zoom_stale && std::fabs(cz - cam_zoom_) > 3.0) ? "zoom"  // extreme-scale safety
                        : nullptr;
     bool need = reason != nullptr;
     if (!need) {
-        // Pan check: has the view centre left the portrayed window? When it has,
-        // re-portray immediately if SETTLED (crisp), or — while still moving — only
-        // if throttled, so continuous auto-follow keeps up (instead of blanking
-        // forever) without re-tessellating every frame. kReportrayThrottleMs bounds
-        // the mid-motion re-portray rate per chart.
+        // Deferred re-portray triggers — kept OFF during a gesture (we transform the
+        // cached geometry, smooth) and fired on SETTLE:
+        //  - pan: view centre left the portrayed window — fire on settle, or throttled
+        //    during continuous motion (auto-follow keeps up without re-tessellating
+        //    every frame);
+        //  - zoom: the portray zoom drifted >0.3 so tile detail no longer matches —
+        //    fire on settle only (a zoom gesture always ends; the >3 excursion above
+        //    is the mid-gesture safety). Gating on !moving (ANY motion this frame)
+        //    instead of a frame-delta "settled" proxy is what stops a slow / high-fps
+        //    zoom from re-portraying the whole quilt mid-gesture.
         constexpr int64_t kReportrayThrottleMs = 200;
         double cwx, cwy, vwx, vwy;
         lonlat_to_world(cam_lon_, cam_lat_, cwx, cwy);
@@ -941,6 +944,8 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         bool out = (dx + w * 0.5 > cam_w_ * 0.5 || dy + h * 0.5 > cam_h_ * 0.5);
         if (out && (!moving || now_ms - last_portray_ms_ >= kReportrayThrottleMs)) {
             need = true; reason = "pan";
+        } else if (zoom_stale && !moving) {
+            need = true; reason = "zoom";
         }
     }
     // The text pass never re-portrays (it trails the base pass on OpenCPN's

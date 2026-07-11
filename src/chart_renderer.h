@@ -120,8 +120,7 @@ private:
     // world window; leaving it (pan) or a big zoom step re-portrays.
     bool have_cam_ = false;
     double cam_lon_ = 0, cam_lat_ = 0, cam_zoom_ = 0;
-    double last_zoom_ = -1;   // previous frame's view zoom (settle detection)
-    double last_lon_ = 1e9, last_lat_ = 1e9, last_zoom_r_ = 1e9;  // last render view
+    double last_lon_ = 1e9, last_lat_ = 1e9, last_zoom_r_ = 1e9;  // last render view (motion detect)
     uint32_t cam_w_ = 0, cam_h_ = 0;
     uint64_t cam_mhash_ = 0;
     int64_t last_portray_ms_ = 0;   // steady-clock ms of the last re-portray (motion throttle)
