@@ -700,6 +700,8 @@ bool ChartRenderer::ensure_gl() {
     gu_vp_ = glGetUniformLocation(prog_glyph_, "uVp");
     gu_zoom_ = glGetUniformLocation(prog_glyph_, "uZoom");
     gu_atlas_ = glGetUniformLocation(prog_glyph_, "uAtlas");
+    glGenBuffers(1, &vbo_vtext_);    // whole-view label buffers (shared declutter grid)
+    glGenBuffers(1, &vbo_vglyph_);
 
     // Composite program + a unit fullscreen quad (pos.xy, tex.uv).
     prog_blit_ = glCreateProgram();
@@ -800,19 +802,47 @@ void ChartRenderer::composite_ss() {
     glUseProgram(0);
 }
 
-// Wire the surface callbacks to this renderer's tessellation sinks. Shared by the
-// whole-view rebuild() and the tiled per-tile portray.
+// No-op sinks: a portray pass that wants only SOME draw types still gets every
+// feature portrayed by the dep; unwanted types get a no-op (emit nothing). Note the
+// dep's drawText calls draw_text UNCONDITIONALLY (no null-check) — a null there
+// crashes — so a text-suppressing pass MUST supply a non-null no-op draw_text_str
+// (dep takes the SDF path and returns before that call).
+static void tr_noop_fill(void*, const tile57_feature*, const tile57_world_rings*, tile57_rgba, int) {}
+static void tr_noop_stroke(void*, const tile57_feature*, const tile57_world_rings*, float, float, float, tile57_rgba) {}
+static void tr_noop_symbol(void*, const tile57_feature*, tile57_world_point, const tile57_local_rings*, tile57_rgba, int, float) {}
+static void tr_noop_sprite(void*, const tile57_feature*, const char*, size_t, tile57_world_point, float, float, float) {}
+static void tr_noop_pattern(void*, const tile57_feature*, const char*, size_t, const tile57_world_rings*) {}
+static void tr_noop_text(void*, const tile57_feature*, tile57_world_point, const tile57_local_rings*, tile57_rgba, tile57_rgba, float) {}
+static void tr_noop_text_str(void*, const tile57_feature*, tile57_world_point, float, float, const char*, size_t, float, tile57_rgba, tile57_rgba) {}
+
+// GEOMETRY callbacks (per-tile portray): everything EXCEPT text/labels. Text is
+// portrayed separately for the whole view (fill_surface_cb_labels) so its declutter
+// grid spans the view — a per-tile grid dropped labels near tile seams (missing
+// lights). Symbols do not declutter (S-52 icon-allow-overlap) so they're safe per-tile.
+// Text is suppressed via a no-op draw_text_str (routes the dep to the cheap SDF path
+// and emits nothing — a null there would crash in emitText).
 static void fill_surface_cb(tile57_surface_cb& cb, ChartRenderer* self) {
     cb.ctx = self;
     cb.fill_area = tr_fill;
     cb.stroke_line = tr_stroke;
     cb.draw_symbol = tr_symbol;
-    cb.draw_text = tr_text;
-    // Point symbols/patterns draw from the atlas when it loaded; else tessellate.
     if (g_atlas.ok) { cb.draw_sprite = tr_sprite; cb.draw_pattern = tr_pattern; }
-    // SDF glyph atlas: send text as strings (skips glyph tessellation). If it did
-    // not load, draw_text_str stays null and text tessellates via draw_text.
-    if (g_glyph.ok) cb.draw_text_str = tr_text_str;
+    cb.draw_text = tr_noop_text;
+    cb.draw_text_str = tr_noop_text_str;
+}
+
+// LABEL callbacks (whole-view text pass): only text/glyph emit; the rest are no-ops
+// so the dep still resolves features + runs its declutter place() across the whole
+// view, giving one shared grid so labels near tile seams survive.
+static void fill_surface_cb_labels(tile57_surface_cb& cb, ChartRenderer* self) {
+    cb.ctx = self;
+    cb.fill_area = tr_noop_fill;
+    cb.stroke_line = tr_noop_stroke;
+    cb.draw_symbol = tr_noop_symbol;
+    cb.draw_sprite = tr_noop_sprite;
+    cb.draw_pattern = tr_noop_pattern;
+    cb.draw_text = tr_text;                          // tessellated fallback (decluttered)
+    if (g_glyph.ok) cb.draw_text_str = tr_text_str;  // SDF glyphs (decluttered)
 }
 
 // ---- tiled path: portray + cache + compose per tile (see chart_renderer.h) -----
@@ -889,9 +919,9 @@ void ChartRenderer::evict_lru(size_t cap) {
 // then draw the cached tile VBOs in paint order, each with its own per-tile origin
 // uniform. Layer indices: 0 area, 1 line, 2 symbol, 3 text, 4 sprite, 5 pattern,
 // 6 glyph. Batched by program (one program bind per layer, inner loop over tiles).
-void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, Pass pass,
-                                 float cull_zoom, double vwx, double vwy, double scale_px, int z,
-                                 uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1, int budget) {
+void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, float cull_zoom,
+                                 double vwx, double vwy, double scale_px, int z, uint32_t x0,
+                                 uint32_t x1, uint32_t y0, uint32_t y1, int budget) {
     // Budget the per-frame portray: a big first-visit burst (many tiles entering on a
     // zoom-out) is spread over frames instead of freezing one. Uncached tiles beyond
     // the budget are skipped this frame and flagged pending; the plugin re-requests a
@@ -940,19 +970,58 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
         if (tex) glBindTexture(GL_TEXTURE_2D, 0);
     };
 
-    if (pass != Pass::kText) {
-        layer(prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 0, &ChartRenderer::draw_range, 0, -1);          // area
-        if (g_atlas.ok)
-            layer(prog_pat_, pu_scale_, pu_vp_, pu_zoom_, pu_origin_, 5, &ChartRenderer::draw_pat_range, g_atlas.tex, pu_atlas_);  // pattern
-        layer(prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 1, &ChartRenderer::draw_range, 0, -1);          // line
-        layer(prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 2, &ChartRenderer::draw_range, 0, -1);          // symbol (tessellated)
-        if (g_atlas.ok)
-            layer(prog_sprite_, su_scale_, su_vp_, su_zoom_, su_origin_, 4, &ChartRenderer::draw_sprite_range, g_atlas.tex, su_atlas_);  // sprite
+    // Geometry only (paint order). Layers 3/6 (text/glyph) are never populated for
+    // tiles now — labels are drawn by the whole-view text pass (draw_view_labels).
+    layer(prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 0, &ChartRenderer::draw_range, 0, -1);          // area
+    if (g_atlas.ok)
+        layer(prog_pat_, pu_scale_, pu_vp_, pu_zoom_, pu_origin_, 5, &ChartRenderer::draw_pat_range, g_atlas.tex, pu_atlas_);  // pattern
+    layer(prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 1, &ChartRenderer::draw_range, 0, -1);          // line
+    layer(prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 2, &ChartRenderer::draw_range, 0, -1);          // symbol (tessellated)
+    if (g_atlas.ok)
+        layer(prog_sprite_, su_scale_, su_vp_, su_zoom_, su_origin_, 4, &ChartRenderer::draw_sprite_range, g_atlas.tex, su_atlas_);  // sprite
+    glUseProgram(0);
+}
+
+// Portray the WHOLE view's labels once (one shared declutter grid → no per-tile
+// seam drops) into the view-label buffers, referenced to the view centre. Cheap:
+// only text is emitted; geometry callbacks are no-ops (the dep still runs its
+// declutter). Re-portrayed each text-pass frame so the labels track the view.
+void ChartRenderer::portray_view_labels(double lon, double lat, double zoom,
+                                        uint32_t w, uint32_t h, const tile57_mariner& m) {
+    text_.clear(); glyph_.clear();
+    lonlat_to_world(lon, lat, ref_wx_, ref_wy_);       // labels referenced to view centre
+    decimate_eps_ = 0.5 / (256.0 * std::pow(2.0, zoom));
+    size_scale_ = m.size_scale > 0 ? m.size_scale : 1.0;
+    tile57_surface_cb cb{};
+    fill_surface_cb_labels(cb, this);
+    tile57_chart_surface(chart_, lon, lat, zoom, w, h, &m, &cb, nullptr);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_vtext_);
+    glBufferData(GL_ARRAY_BUFFER, text_.size() * sizeof(Vtx), text_.data(), GL_DYNAMIC_DRAW);
+    n_vtext_ = (uint32_t)text_.size();
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_vglyph_);
+    glBufferData(GL_ARRAY_BUFFER, glyph_.size() * sizeof(GlyphVtx), glyph_.data(), GL_DYNAMIC_DRAW);
+    n_vglyph_ = (uint32_t)glyph_.size();
+}
+
+// Draw the view-label buffers. Their verts are relative to the view centre, so the
+// origin is simply the viewport centre.
+void ChartRenderer::draw_view_labels(double scale_px, float cull_zoom, uint32_t w, uint32_t h) {
+    if (!n_vtext_ && !n_vglyph_) return;
+    const float origin[2] = { (float)(w * 0.5), (float)(h * 0.5) };
+    const float vp[2] = { (float)w, (float)h };
+    if (n_vtext_) {                                    // tessellated fallback (usually empty)
+        glUseProgram(prog_);
+        glUniform1f(u_scale_, (float)scale_px); glUniform2fv(u_origin_, 1, origin);
+        glUniform2fv(u_vp_, 1, vp); glUniform1f(u_zoom_, cull_zoom);
+        draw_range(vbo_vtext_, n_vtext_);
     }
-    if (pass != Pass::kBase) {
-        layer(prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 3, &ChartRenderer::draw_range, 0, -1);          // text (tessellated fallback)
-        if (g_glyph.ok)
-            layer(prog_glyph_, gu_scale_, gu_vp_, gu_zoom_, gu_origin_, 6, &ChartRenderer::draw_glyph_range, g_glyph.tex, gu_atlas_);   // glyph (SDF)
+    if (n_vglyph_ && g_glyph.ok) {
+        glUseProgram(prog_glyph_);
+        glUniform1f(gu_scale_, (float)scale_px); glUniform2fv(gu_origin_, 1, origin);
+        glUniform2fv(gu_vp_, 1, vp); glUniform1f(gu_zoom_, cull_zoom);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, g_glyph.tex); glUniform1i(gu_atlas_, 0);
+        draw_glyph_range(vbo_vglyph_, n_vglyph_);
+        glBindTexture(GL_TEXTURE_2D, 0);
     }
     glUseProgram(0);
 }
@@ -1100,11 +1169,11 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA); glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
 
-    // Compose the view from cached tiles: pick the tile zoom (the baked band the view
-    // falls in) and the visible x/y range, clamped to the chart coverage so a
-    // zoomed-out view doesn't enumerate empty tiles. render_tiled portrays any missing
-    // tile (budgeted per frame) and draws the cached tiles with per-tile origins.
-    {
+    // GEOMETRY (base pass / unquilted): compose from cached tiles. Pick the tile zoom
+    // (the baked band the view falls in) and the visible x/y range, clamped to the
+    // chart coverage so a zoomed-out view doesn't enumerate empty tiles. render_tiled
+    // portrays any missing tile (budgeted) and draws the cached tiles per-tile.
+    if (pass != Pass::kText) {
         int z = (int)std::lround(zoom);
         if (z < (int)min_zoom_) z = (int)min_zoom_;
         if (z > (int)max_zoom_) z = (int)max_zoom_;
@@ -1129,8 +1198,15 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         // when SETTLED so the view fills in quickly. Deferred tiles trigger a redraw.
         int budget = moving ? 2 : 8;
         if (wmaxx >= wminx && wmaxy >= wminy && (x1 - x0 + 1) * (y1 - y0 + 1) <= 4096)
-            render_tiled(w, h, m, pass, cull_zoom, vwx, vwy, scale_px, z,
+            render_tiled(w, h, m, cull_zoom, vwx, vwy, scale_px, z,
                          (uint32_t)x0, (uint32_t)x1, (uint32_t)y0, (uint32_t)y1, budget);
+    }
+    // LABELS (text pass / unquilted): portray the whole view's text ONCE with a single
+    // declutter grid (per-tile grids dropped labels at seams — the missing lights) and
+    // draw it referenced to the view centre.
+    if (pass != Pass::kBase) {
+        portray_view_labels(lon, lat, zoom, w, h, m);
+        draw_view_labels(scale_px, cull_zoom, w, h);
     }
 
     if (ss) {
