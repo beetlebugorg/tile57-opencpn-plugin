@@ -476,12 +476,25 @@ static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, 
 }
 
 // ---- chart / GL lifecycle --------------------------------------------------
+// realpath(3) is POSIX; MSVC spells it _fullpath. Both return a malloc'd absolute
+// path (or null on failure), so the caller frees either the same way.
+static std::string real_path(const std::string& path) {
+#ifdef _WIN32
+    char* rp = _fullpath(nullptr, path.c_str(), 0);
+#else
+    char* rp = realpath(path.c_str(), nullptr);
+#endif
+    if (!rp) return path;
+    std::string real(rp);
+    std::free(rp);
+    return real;
+}
+
 bool ChartRenderer::open_chart(const std::string& path) {
     if (chart_) return true;
     // Only baked .pmtiles archives open as charts (cells are baked to bundles up
     // front via the Build Charts dialog). Resolve symlinks so mmap sees the real file.
-    std::string real = path;
-    if (char* rp = realpath(path.c_str(), nullptr)) { real = rp; std::free(rp); }
+    std::string real = real_path(path);
     return tile57_chart_open(real.c_str(), &chart_, nullptr) == TILE57_OK && chart_;
 }
 bool ChartRenderer::get_info(tile57_info& out) const {

@@ -72,7 +72,56 @@ cmake -S tile57-opencpn-plugin -B build -DTILE57_DIR=$PWD/tile57
 cmake --build build -j
 ```
 
-The result is `build/libtile57_pi.so` (`.dylib` on macOS). See the
+### Windows
+
+OpenCPN for Windows is a **32-bit** application, and a plugin has to match the process
+it is loaded into — so tile57 and the plugin are both built x86. There is no system
+package for wxWidgets/GLEW, so the build reuses the prebuilt 32-bit copies that
+OpenCPN's own Windows build caches; get them by cloning OpenCPN alongside this repo and
+running `buildwin\win_deps.bat` once. CMake then finds wx, GLEW and tile57 on its own
+(override with `-DOCPN_SRC_DIR=`, `-DTILE57_DIR=`, `-DwxWidgets_ROOT_DIR=` if your
+layout differs).
+
+```bat
+git clone --recursive https://github.com/beetlebugorg/tile57-opencpn-plugin.git
+git clone --recursive https://github.com/OpenCPN/OpenCPN.git
+cd OpenCPN\buildwin && win_deps.bat && cd ..\..
+
+:: build the tile57 engine for the 32-bit MSVC ABI (Zig defaults to the 64-bit host,
+:: and a 64-bit or gnu-ABI tile57.lib fails the link inside compiler_rt.obj)
+git clone --recursive https://github.com/beetlebugorg/tile57.git
+cd tile57 && zig build -Doptimize=ReleaseFast -Dtarget=x86-windows-msvc && cd ..
+
+:: build the plugin (-A Win32 keeps it 32-bit; works from any shell, no dev prompt)
+cmake -S tile57-opencpn-plugin -B build -A Win32
+cmake --build build --config Release
+```
+
+That yields `build\Release\tile57_pi.dll`. Install it into the **user** plugin directory:
+
+```bat
+mkdir "%LOCALAPPDATA%\opencpn\plugins"
+copy build\Release\tile57_pi.dll "%LOCALAPPDATA%\opencpn\plugins\"
+```
+
+then restart OpenCPN and enable **tile57** in Options → Plugins. It must be that
+directory, not the `plugins\` folder inside OpenCPN's own install: OpenCPN skips any
+plugin found there unless it is one of the five it ships with (`IsSystemPluginPath` in
+`plugin_loader.cpp`), and it does so at debug log level — the plugin simply never
+appears, with nothing in the log to say why. The wxWidgets and GLEW DLLs it needs at
+runtime already sit in OpenCPN's install directory.
+
+The Windows build links the CRT **statically** (`/MT`). OpenCPN ships its own
+`msvcp140.dll` / `vcruntime140.dll` (14.12, from VS2017) beside `opencpn.exe` and loads
+them at startup, so they are already in the process before any plugin loads — a plugin
+linked against the shared CRT would run its `std::thread` / `std::mutex` code on that
+2017 runtime, which MSVC does not support from a newer toolset, and it faults. Shipping
+a newer DLL alongside the plugin cannot help, because the host's copy is already
+loaded. Static linking is what keeps the plugin independent of whatever runtime the
+host happens to bundle.
+
+The result is `build/libtile57_pi.so` (`.dylib` on macOS, `build\Release\tile57_pi.dll`
+on Windows). See the
 [building guide](https://beetlebugorg.github.io/tile57-opencpn-plugin/building) for
 Linux/macOS specifics (macOS needs a wxWidgets retarget + re-sign against
 `OpenCPN.app`), and [getting started](https://beetlebugorg.github.io/tile57-opencpn-plugin/getting-started)
