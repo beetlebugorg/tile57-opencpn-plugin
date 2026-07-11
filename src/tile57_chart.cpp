@@ -44,12 +44,16 @@ double display_size_scale() {
     double mm = PlugInGetDisplaySizeMM();
     int sw = wxGetDisplaySize().GetWidth();
     if (mm < 1.0 || sw <= 0) return size_cal_factor();
-    // TRUE physical size (S-52 sizes symbology in mm): scale the 72-DPI reference to
-    // the display's px/mm. wxGetDisplaySize is PHYSICAL px (incl. HiDPI), so this is
-    // already physically correct — do NOT also multiply by the content-scale factor
-    // (that double-counted the density and rendered symbols 2x too big on Retina).
-    // cull_bias = log2(size_scale) (render_pass) tracks this, so decluttering follows.
-    double s = (sw / mm) / kTile57RefPxPerMm * size_cal_factor();
+    // S-52 sizes symbology in physical mm, so we need the display's PHYSICAL px/mm.
+    // wxGetDisplaySize() returns LOGICAL points on macOS (DIPs generally), so scale by
+    // the content-scale factor to recover physical pixels first. Without this, a HiDPI
+    // display (csf=2) renders every symbol/label HALF size — measured: the 5mm CHKSYM01
+    // square came out 2.5mm on a csf=2 (4K @ 2x) external monitor. csf=1 (non-HiDPI /
+    // Linux) makes this a no-op. cull_bias = log2(size_scale) (render_pass) tracks the
+    // result, so symbol decluttering follows the true size. TILE57_SIZE trims manually.
+    double csf = OCPN_GetDisplayContentScaleFactor();
+    if (!(csf > 0.0)) csf = 1.0;
+    double s = (sw * csf / mm) / kTile57RefPxPerMm * size_cal_factor();
     return (s > 0.1 && s < 12.0) ? s : 1.0;
 }
 // Pixels per metre of a nominal 96-DPI display; turns a ground resolution into
@@ -377,13 +381,15 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
         (csf > 1.0 && fbw == (uint32_t)std::lround(vp.pix_width * csf)) ? csf : 1.0;
     double zoom = zoom_for_ppm(ppm);   // geographic (un-bumped)
     last_zoom_ = zoom;   // remembered for the object-query pick tolerance / SCAMIN
-    // SCAMIN cull bias: symbols/text are enlarged on HiDPI by the FULL size_scale (the
-    // physical px/mm chain AND the ×csf nudge), so drop features out log2(size_scale)
-    // mercator levels earlier — the SCAMIN thresholds are calibrated at size_scale=1, so
-    // the correct compensation is the actual on-screen enlargement, size_scale (NOT csf,
-    // which only covered part of it and under-culled -> the "SCAMIN isn't culling enough"
-    // clustering). NOTE: this only thins features that HAVE a SCAMIN; undecluttered
-    // soundings + labels need the dep's declutter path (that is a separate fix).
+    // SCAMIN cull bias: symbols are drawn at true physical size by size_scale (the px/mm
+    // chain, incl. the HiDPI csf), while the SCAMIN thresholds are calibrated at
+    // size_scale=1 — so drop SCAMIN'd features out log2(size_scale) mercator levels
+    // earlier to keep the intended on-screen density as symbols grow. Derived live from
+    // size_scale, so it tracks the display automatically (when the ×csf fix doubled
+    // size_scale on HiDPI, this bias went from ~0 to ~1 level, i.e. the compensation is
+    // now actually active). Symbols only — they can't declutter (S-52 allow-overlap);
+    // text + soundings self-declutter via the dep and are drawn at TRUE zoom (see
+    // render()), so this bias never touches labels.
     // TILE57_DECLUTTER=<levels> overrides: 0 = match native (no compensation), higher = more.
     static const double declutter_override = [] {
         const char* e = std::getenv("TILE57_DECLUTTER");
