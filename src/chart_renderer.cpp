@@ -661,6 +661,19 @@ void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float 
     const float rad = rot_sign * rot_deg * (float)kPi / 180.0f;
     const float rc = std::cos(rad), rs = std::sin(rad);
     const float postrot = (align == TILE57_ALIGN_MAP) ? 1.0f : 0.0f;
+    // TILE57_DEBUG: the run's ACTUAL emitted direction. Every part of this path checks out in
+    // isolation (the angle arrives, the atlas metrics parse, oy is y-down, the matrix matches
+    // tile57's own emitText) — yet the run does not lie along its contour on screen. So report
+    // what we really emit: the first glyph's quad centre, the last one's, and the angle of the
+    // line between them. That angle IS the run's direction; if it equals rot_deg we are
+    // building the right geometry and the fault is upstream of this file, and if it does not,
+    // it is here. Capped, and only for MAP-aligned runs (the contour values).
+    static const bool dbg_run = std::getenv("TILE57_DEBUG") != nullptr;
+    static int dbg_run_left = 8;
+    const bool trace = dbg_run && dbg_run_left > 0 && align == TILE57_ALIGN_MAP && len >= 2;
+    float first_cx = 0, first_cy = 0, last_cx = 0, last_cy = 0;
+    bool have_first = false;
+
     float pen = 0;
     size_t i = 0;
     while (i < len) {
@@ -685,8 +698,30 @@ void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float 
             v(x0, y0, g.u0, g.v0);
             v(x1, y1, g.u1, g.v1);
             v(x0, y1, g.u0, g.v1);
+
+            if (trace) { // the glyph's quad centre, AFTER rotation — see the note above
+                const float mx = (x0 + x1) * 0.5f, my = (y0 + y1) * 0.5f;
+                const float rx = mx * rc - my * rs, ry = mx * rs + my * rc;
+                if (!have_first) {
+                    have_first = true;
+                    first_cx = rx;
+                    first_cy = ry;
+                }
+                last_cx = rx;
+                last_cy = ry;
+            }
         }
         pen += g.adv * size_px;
+    }
+    if (trace && have_first && (last_cx != first_cx || last_cy != first_cy)) {
+        --dbg_run_left;
+        const float run_deg =
+            std::atan2(last_cy - first_cy, last_cx - first_cx) * 180.0f / (float)kPi;
+        wxLogMessage(wxString::Format(
+            "tile57 RUN: rot_deg=%7.2f applied=%7.2f  emitted run=%7.2f  (first=%.1f,%.1f "
+            "last=%.1f,%.1f) size=%.1f [%s]",
+            rot_deg, rot_sign * rot_deg, run_deg, first_cx, first_cy, last_cx, last_cy, size_px,
+            wxString::FromUTF8(text, len)));
     }
 }
 
@@ -764,10 +799,17 @@ static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, 
     static int dbg_left = 40;
     if (dbg && dbg_left > 0) {
         --dbg_left;
-        wxLogMessage("tile57 TXT: cls=%-8s align=%-8s rot=%7.2f size=%.1f ox=%.1f oy=%.1f \"%.*s\"",
-                     (f && f->cls) ? f->cls : "?",
-                     align == TILE57_ALIGN_MAP ? "MAP" : "VIEWPORT", rot, size, ox, oy, (int)len,
-                     text);
+        // Print the POINTER, and build the string ourselves. The previous version passed a
+        // non-NUL-terminated char* to wxLogMessage's %.*s, and a Unicode wx build treats %s
+        // as wchar_t* — so "(null)" in that log may have been wx mangling a perfectly good
+        // pointer rather than tile57 handing us a null one. ptr=0x0 settles it.
+        const wxString t =
+            text ? wxString::FromUTF8(text, len) : wxString::FromAscii("<NULL PTR>");
+        wxLogMessage(wxString::Format(
+            "tile57 TXT: cls=%s align=%s rot=%7.2f size=%.1f ox=%.1f oy=%.1f ptr=%p len=%zu [%s]",
+            wxString::FromAscii((f && f->cls) ? f->cls : "?"),
+            wxString::FromAscii(align == TILE57_ALIGN_MAP ? "MAP" : "VIEWPORT"), rot, size, ox, oy,
+            (const void*)text, len, t));
     }
     static_cast<ChartRenderer*>(c)->on_draw_text_str(a, ox, oy, text, len, size, rot, align, col,
                                                      halo, feat_scamin(c, f));
