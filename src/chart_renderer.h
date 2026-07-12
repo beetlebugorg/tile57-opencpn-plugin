@@ -215,6 +215,7 @@ class ChartRenderer {
     // Tiled path state (the only render path).
     std::unordered_map<uint64_t, TileGeom> tiles_; // (z,x,y) -> cached tile geometry
     uint64_t tiles_mhash_ = 0;                     // mariner hash the cache was portrayed at
+    tile57_mariner tiles_m_{};                     // ...and the settings themselves (debug diff)
     bool tiles_pending_ = false; // last render deferred some tiles (portray budget)
     bool host_stencil_mode_ =
         false; // host lacks FBOs (stencil-clips quilt) -> force direct render, no SS composite

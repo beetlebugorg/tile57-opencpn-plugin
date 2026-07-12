@@ -47,6 +47,54 @@ void lonlat_to_world(double lon, double lat, double& wx, double& wy) {
 // popping in and out ~28% of a scale step away from where the native charts do it.
 // The host knows its own scale exactly; there is nothing to model.
 float scamin_denom(int64_t scamin) { return scamin > 0 ? (float)scamin : kNeverCulled; }
+// TILE57_DEBUG: name the mariner fields that CHANGED — a cache clear costs a full re-portray
+// of every visible tile, so a hash that flaps every frame is a performance cliff, and the
+// hash alone ("a -> b") cannot say which setting moved. Compares the portrayal-relevant
+// fields by name; anything not listed here cannot invalidate the cache anyway.
+std::string mariner_diff(const tile57_mariner& a, const tile57_mariner& b) {
+    std::string d;
+    auto num = [&d](const char* n, double x, double y) {
+        if (x != y)
+            d += std::string(d.empty() ? "" : " ") + n + "=" + std::to_string(x) + "->" +
+                 std::to_string(y);
+    };
+    auto flag = [&d](const char* n, bool x, bool y) {
+        if (x != y)
+            d += std::string(d.empty() ? "" : " ") + n + "=" + (x ? "1" : "0") + "->" +
+                 (y ? "1" : "0");
+    };
+    num("safety_contour", a.safety_contour, b.safety_contour);
+    num("shallow_contour", a.shallow_contour, b.shallow_contour);
+    num("deep_contour", a.deep_contour, b.deep_contour);
+    num("safety_depth", a.safety_depth, b.safety_depth);
+    num("size_scale", a.size_scale, b.size_scale);
+    num("text_size_scale", a.text_size_scale, b.text_size_scale);
+    num("sounding_size_scale", a.sounding_size_scale, b.sounding_size_scale);
+    flag("four_shade_water", a.four_shade_water, b.four_shade_water);
+    flag("display_base", a.display_base, b.display_base);
+    flag("display_standard", a.display_standard, b.display_standard);
+    flag("display_other", a.display_other, b.display_other);
+    flag("data_quality", a.data_quality, b.data_quality);
+    flag("show_inform_callouts", a.show_inform_callouts, b.show_inform_callouts);
+    flag("show_meta_bounds", a.show_meta_bounds, b.show_meta_bounds);
+    flag("simplified_points", a.simplified_points, b.simplified_points);
+    flag("show_full_sector_lines", a.show_full_sector_lines, b.show_full_sector_lines);
+    flag("text_names", a.text_names, b.text_names);
+    flag("text_other", a.text_other, b.text_other);
+    flag("show_light_descriptions", a.show_light_descriptions, b.show_light_descriptions);
+    flag("ignore_scamin", a.ignore_scamin, b.ignore_scamin);
+    flag("show_overscale", a.show_overscale, b.show_overscale);
+    flag("date_dependent", a.date_dependent, b.date_dependent);
+    if (a.viewing_groups_off_len != b.viewing_groups_off_len)
+        d += " viewing_groups_len=" + std::to_string(a.viewing_groups_off_len) + "->" +
+             std::to_string(b.viewing_groups_off_len);
+    if (a.viewing_groups_off != b.viewing_groups_off)
+        d += " viewing_groups_PTR(moved)"; // the vector reallocated: hashed, but not a change
+    if (d.empty())
+        d = "(no named field changed — PADDING or an unlisted field)";
+    return d;
+}
+
 uint64_t mariner_hash(const tile57_mariner& m) {
     uint64_t h = 1469598103934665603ull;
     auto mix = [&h](const void* p, size_t n) {
@@ -1699,10 +1747,13 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     uint64_t mh = mariner_hash(m);
     if (mh != tiles_mhash_) {
         if (dbg_cache && tiles_mhash_)
-            wxLogMessage("tile57 DBG: tile cache CLEARED (%zu tiles) mariner hash %llx -> %llx",
-                         tiles_.size(), (unsigned long long)tiles_mhash_, (unsigned long long)mh);
+            wxLogMessage("tile57 DBG: tile cache CLEARED (%zu tiles) mariner hash %llx -> %llx "
+                         "changed: %s",
+                         tiles_.size(), (unsigned long long)tiles_mhash_, (unsigned long long)mh,
+                         mariner_diff(tiles_m_, m).c_str());
         clear_tiles();
         tiles_mhash_ = mh;
+        tiles_m_ = m; // the settings this cache is portrayed under (for the diff above)
     }
 
     // Motion (pan, zoom or TURN) this frame — used only to gate the offscreen supersample
