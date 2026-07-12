@@ -5,6 +5,7 @@
 #include "tile57.h"
 
 #include <wx/button.h>
+#include <wx/event.h>
 #include <wx/fileconf.h>
 #include <wx/filename.h>
 #include <wx/filepicker.h>
@@ -25,9 +26,17 @@
 
 namespace fs = std::filesystem;
 
+// Posted by the engine's bake threads (progress) and by the coordinator (completion).
+// wxQueueEvent is thread-safe; the handlers run on the main thread.
+wxDEFINE_EVENT(TILE57_EVT_BAKE_PROGRESS, wxThreadEvent);
+wxDEFINE_EVENT(TILE57_EVT_BAKE_DONE, wxThreadEvent);
+
 namespace {
 
-constexpr int kTimerMs = 200;
+// The timer is now only a FALLBACK: it keeps elapsed/ETA ticking between charts (a slow
+// chart can be many seconds) and re-checks finished_ in case a completion event is ever
+// missed. Progress and completion are event-driven — see ProgressTick.
+constexpr int kTimerMs = 250;
 
 // Persisted config in a PLUGIN-OWNED ini file (wxStandardPaths user-config dir) —
 // deliberately NOT GetOCPNConfigObject(): that host symbol is resolved lazily via
@@ -209,6 +218,9 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     Bind(wxEVT_CLOSE_WINDOW, &BuildChartsDialog::OnClose, this);
     timer_.SetOwner(this);
     Bind(wxEVT_TIMER, &BuildChartsDialog::OnTimer, this);
+    // The bake threads drive the UI through these (see ProgressTick).
+    Bind(TILE57_EVT_BAKE_PROGRESS, [this](wxThreadEvent&) { RefreshUI(); });
+    Bind(TILE57_EVT_BAKE_DONE, [this](wxThreadEvent&) { Finish(); });
     wxLogMessage("tile57: BuildChartsDialog ctor end, size=%dx%d", GetSize().GetWidth(),
                  GetSize().GetHeight());
 }
@@ -233,13 +245,19 @@ void BuildChartsDialog::SetRunningUI(bool running) {
     outPicker_->Enable(!running);
 }
 
-// Engine bake thread — atomics only. Returning false cancels the bake (tile57 stops
-// picking up charts; the ones in flight finish), which is what lets StopBake() join
-// promptly instead of blocking for the whole tree.
+// Engine bake thread. Stores the counts, then PUSHES an event at the GUI thread rather
+// than leaving the UI to poll (see the header: polling via wxEVT_TIMER never fired inside
+// OpenCPN, so the dialog stayed frozen for a whole bake). wxQueueEvent is safe off the
+// GUI thread; nothing here touches a widget.
+//
+// Returning false cancels the bake (tile57 stops picking up charts; the ones in flight
+// finish), which is what lets StopBake() join promptly instead of blocking for the tree.
 bool BuildChartsDialog::ProgressTick(void* ctx, uint32_t done, uint32_t total) {
     auto* self = static_cast<BuildChartsDialog*>(ctx);
     self->total_.store(total);
     self->done_.store(done);
+    // Cheap enough at a few charts/second; the handler just reads the atomics back.
+    wxQueueEvent(self, new wxThreadEvent(TILE57_EVT_BAKE_PROGRESS));
     return !self->cancel_.load();
 }
 
@@ -308,6 +326,7 @@ void BuildChartsDialog::StartBuild(bool force) {
     failed_.store(false);
     err_msg_.clear();
     running_.store(true);
+    ui_finished_ = false;
     start_time_ = std::chrono::steady_clock::now();
     gauge_->SetValue(0);
     SetRunningUI(true);
@@ -333,19 +352,30 @@ void BuildChartsDialog::StartBuild(bool force) {
             failed_.store(true);
             err_msg_ = err.message[0] ? err.message : tile57_status_str(st);
         }
-        finished_.store(true); // the timer joins us
+        finished_.store(true);
+        // Tell the GUI thread we're done. Finish() joins this thread, which is safe: by
+        // the time the event is handled we are on our way out of the thread function.
+        wxQueueEvent(this, new wxThreadEvent(TILE57_EVT_BAKE_DONE));
     });
     timer_.Start(kTimerMs);
 }
 
+// Fallback only — the bake's own events drive progress and completion. This keeps
+// elapsed/ETA moving while a slow chart bakes, and re-checks finished_ so a missed
+// completion event can't strand the dialog mid-bake.
 void BuildChartsDialog::OnTimer(wxTimerEvent&) {
-    const uint32_t total = total_.load();
-    const uint32_t done = done_.load();
-
     if (finished_.load()) {
         Finish();
         return;
     }
+    RefreshUI();
+}
+
+void BuildChartsDialog::RefreshUI() {
+    if (!running_.load())
+        return;
+    const uint32_t total = total_.load();
+    const uint32_t done = done_.load();
 
     // total is 0 until the engine's first tick — it walks the tree and skips the
     // already-current archives before it bakes anything, and on a big tree that takes a
@@ -370,6 +400,11 @@ void BuildChartsDialog::OnTimer(wxTimerEvent&) {
 }
 
 void BuildChartsDialog::Finish() {
+    // Reachable from the completion event, the timer fallback, and Cancel — run once.
+    if (ui_finished_)
+        return;
+    ui_finished_ = true;
+
     // Timer is still on the main thread; stop it before joining so it can't re-enter
     // while the coordinator winds down.
     timer_.Stop();

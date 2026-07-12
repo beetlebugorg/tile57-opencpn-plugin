@@ -23,6 +23,7 @@
 #pragma once
 
 #include <wx/dialog.h>
+#include <wx/event.h>
 #include <wx/timer.h>
 
 #include <atomic>
@@ -35,6 +36,11 @@ class wxDirPickerCtrl;
 class wxButton;
 class wxGauge;
 class wxStaticText;
+
+// Posted at the dialog by the engine's bake threads (progress) and by the coordinator
+// (completion) via wxQueueEvent — the thread-safe way to reach the GUI thread.
+wxDECLARE_EVENT(TILE57_EVT_BAKE_PROGRESS, wxThreadEvent);
+wxDECLARE_EVENT(TILE57_EVT_BAKE_DONE, wxThreadEvent);
 
 class BuildChartsDialog : public wxDialog {
   public:
@@ -53,6 +59,7 @@ class BuildChartsDialog : public wxDialog {
     void OnTimer(wxTimerEvent&);
 
     void StartBuild(bool force); // shared by Build (resume) + Rebuild (force)
+    void RefreshUI();            // main thread: paint gauge/status/stats from the atomics
     void Finish();               // main-thread completion: register dir, reset UI
     void SetRunningUI(bool running);
 
@@ -60,8 +67,14 @@ class BuildChartsDialog : public wxDialog {
     // empty. Never empty.
     std::string DestDir() const;
 
-    // tile57_bake_progress: called CONCURRENTLY from the engine's bake threads, so it
-    // may only touch atomics — no wx, no UI. Returns false to cancel the bake.
+    // tile57_bake_progress: called CONCURRENTLY from the engine's bake threads. It stores
+    // the counts in the atomics below and POSTS an event to this dialog — wxQueueEvent is
+    // the one wx call that is safe from a non-GUI thread; the handler then paints on the
+    // main thread. It must not touch a widget itself. Returns false to cancel the bake.
+    //
+    // Do NOT go back to polling these atomics from a wxTimer: inside OpenCPN the dialog's
+    // wxEVT_TIMER never arrived, so the gauge sat frozen at "Scanning…" through an entire
+    // bake and completion never ran. The bake thread has to push, not the UI poll.
     static bool ProgressTick(void* ctx, uint32_t done, uint32_t total);
 
     // --- widgets ---
@@ -91,6 +104,9 @@ class BuildChartsDialog : public wxDialog {
     // (archives deleted up front). Touched only on the main thread.
     std::string dest_;
     bool force_ = false;
+    // Main thread only: Finish() can be reached from the completion event, from the timer
+    // fallback, and from Cancel, so it latches to run exactly once per bake.
+    bool ui_finished_ = true;
     std::chrono::steady_clock::time_point start_time_;
 
     std::thread coordinator_; // makes the one blocking tile57_bake_tree call
