@@ -67,7 +67,7 @@ double display_size_scale(double csf) {
     // (non-HiDPI / Linux) makes this a no-op. IMPORTANT: csf must be the RENDER-time
     // value — at construction OCPN_GetDisplayContentScaleFactor() returns 1 (the chart's
     // canvas isn't on its display yet), so render_pass recomputes this when csf is known.
-    // cull_bias = log2(size_scale) (render_pass) tracks the result. TILE57_SIZE trims.
+    // TILE57_SIZE trims. (This scales SIZES only — the SCAMIN cull is not coupled to it.)
     if (!(csf > 0.0))
         csf = 1.0;
     double s = (sw * csf / mm) / kTile57RefPxPerMm * size_cal_factor();
@@ -782,22 +782,22 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
         (csf > 1.0 && fbw == (uint32_t)std::lround(vp.pix_width * csf)) ? csf : 1.0;
     double zoom = zoom_for_ppm(ppm); // geographic (un-bumped)
     last_zoom_ = zoom;               // remembered for the object-query pick tolerance / SCAMIN
-    // SCAMIN cull bias: symbols are drawn at true physical size by size_scale (the px/mm
-    // chain, incl. the HiDPI csf), while the SCAMIN thresholds are calibrated at
-    // size_scale=1 — so drop SCAMIN'd features out log2(size_scale) mercator levels
-    // earlier to keep the intended on-screen density as symbols grow. Derived live from
-    // size_scale, so it tracks the display automatically (when the ×csf fix doubled
-    // size_scale on HiDPI, this bias went from ~0 to ~1 level, i.e. the compensation is
-    // now actually active). Symbols only — they can't declutter (S-52 allow-overlap);
-    // text + soundings self-declutter via the dep and are drawn at TRUE zoom (see
-    // render()), so this bias never touches labels.
-    // TILE57_DECLUTTER=<levels> overrides: 0 = match native (no compensation), higher = more.
+    // SCAMIN cull bias: 0 by default — native parity. This used to default to
+    // log2(size_scale) ("symbols are drawn enlarged, so thin them early"), but native
+    // OpenCPN enlarges its symbols for display DPI too and STILL culls at the raw
+    // denominator (chart_scale > Scamin, nothing else), so the bias made every SCAMIN'd
+    // symbol and sounding appear ~log2(size_scale) zoom levels later than the native
+    // charts — on any real display (size_scale is px/mm-derived and >1 everywhere):
+    // soundings "way too late". Worse, it applied to the base pass only, while labels
+    // culled at the true denominator (render()), so in the window between denom and
+    // denom*2^bias a feature showed its TEXT with no SYMBOL.
+    // TILE57_DECLUTTER=<levels> opts back in (applied to ALL layers, labels included, so
+    // symbol + label still hide together): 0 = native, higher = thin earlier.
     static const double declutter_override = [] {
         const char* e = std::getenv("TILE57_DECLUTTER");
-        return e ? std::atof(e) : -1.0; // <0 sentinel: use the size_scale-derived default
+        return e ? std::atof(e) : -1.0; // <0 sentinel: no bias (native parity)
     }();
-    double cull_bias = declutter_override >= 0.0 ? declutter_override
-                                                 : std::log2(std::max(1.0, mariner_.size_scale));
+    double cull_bias = declutter_override >= 0.0 ? declutter_override : 0.0;
 
     // The SCAMIN cull compares the host's REAL display scale denominator against each
     // feature's SCAMIN — the same test native OpenCPN applies to its own ENCs:

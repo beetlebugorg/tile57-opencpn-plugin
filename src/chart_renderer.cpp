@@ -1672,10 +1672,10 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     // than the feature allows, i.e. denom > SCAMIN. 0 disables the cull entirely (OpenCPN's
     // "Use SCAMIN" off), since 0 can never exceed any SCAMIN.
     //
-    // Symbols/text are drawn at true physical size (size_scale, incl. the HiDPI content
-    // scale) while SCAMIN is authored against unenlarged symbology, so enlarged symbology is
-    // dropped cull_bias mercator levels early to hold the intended on-screen density. A bias
-    // of B levels is a factor 2^B on the denominator (one zoom level = one doubling of 1:N).
+    // cull_bias is 0 unless the user opted into extra thinning (TILE57_DECLUTTER): a bias
+    // of B levels is a factor 2^B on the denominator (one zoom level = one doubling of 1:N),
+    // applied to EVERY layer — labels included — so a feature's symbol and text always hide
+    // at the same zoom.
     float cull_denom = (float)(scamin_display_denom * std::pow(2.0, cull_bias));
     if (scamin_display_denom <= 0.0)
         cull_denom = 0.0f; // cull off — keep it exactly 0, don't let the bias resurrect it
@@ -1829,14 +1829,12 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
             labels_pending_ =
                 true; // moved this frame — refresh once motion stops (ask for a redraw)
         }
-        // Draw labels at the TRUE display denominator, NOT the biased cull_denom. cull_bias
-        // (= log2(size_scale)) pulls the SCAMIN cull down to thin the un-declutterable
-        // enlarged SYMBOLS; but text + soundings already self-declutter via the dep's
-        // shared grid, so biasing them just hides labels ~log2(size_scale) levels early
-        // — on a Retina display (size_scale ~3) that erased most labels, lights first
-        // (they carry a SCAMIN). At the true display scale, S-52 SCAMIN governs label
-        // visibility and the declutter grid handles crowding.
-        draw_view_labels(scale_px, (float)scamin_display_denom, w, h, vwx, vwy, rot);
+        // Labels cull at the SAME denominator as every other layer. SCAMIN hides the
+        // whole feature — symbol and text together; when this pass used the unbiased
+        // denominator while the base pass biased its cull, features in the gap drew
+        // their TEXT with no SYMBOL. cull_denom == the true display denominator unless
+        // the user opted into TILE57_DECLUTTER, and then the bias moves both in lockstep.
+        draw_view_labels(scale_px, cull_denom, w, h, vwx, vwy, rot);
     }
 
     if (ss) {

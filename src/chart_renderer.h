@@ -39,8 +39,9 @@ class ChartRenderer {
     // vp.chart_scale). Each feature's SCAMIN rides to the GPU as itself and is compared
     // against this, exactly as native OpenCPN does — no zoom-threshold formula, so no
     // equator assumption. 0 disables the cull ("Use SCAMIN" off).
-    // cull_bias = zoom levels of extra culling for enlarged symbology (HiDPI /
-    // TILE57_DECLUTTER); one level = one doubling of the denominator.
+    // cull_bias = zoom levels of extra culling (TILE57_DECLUTTER opt-in, normally 0);
+    // one level = one doubling of the denominator, applied to every layer alike so a
+    // feature's symbol and label always hide at the same zoom.
     // rotation = OpenCPN's ViewPort rotation in radians (course-up etc; 0 = north-up),
     // applied about the viewport centre on the GPU. It is a pure VIEW transform: the
     // portrayed geometry stays north-up in world space, so the tile + label caches
