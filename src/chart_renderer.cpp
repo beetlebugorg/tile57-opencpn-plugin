@@ -1370,6 +1370,14 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
         }
     }
 
+    // TILE57_DEBUG: portraying is the expensive path — a healthy steady frame portrays 0
+    // tiles. This line printing every frame with the SAME z and a cache pinned at the LRU
+    // cap means eviction churn; alternating z values mean the zoom is flapping across a
+    // band boundary; see also the "cache CLEARED" line (mariner-hash flap) in render().
+    static const bool dbg_portray = std::getenv("TILE57_DEBUG") != nullptr;
+    if (dbg_portray && portrayed > 0)
+        wxLogMessage("tile57 DBG: portrayed %d tiles z=%d range=%ux%u cache=%zu pending=%d",
+                     portrayed, z, x1 - x0 + 1, y1 - y0 + 1, tiles_.size(), (int)tiles_pending_);
     // Bound cache memory: drop least-recently-drawn tiles (never this frame's target OR
     // backdrop — both just stamped used_ms=now, so they sort last and survive; the gathered
     // pointers stay valid across erases of OTHER elements).
@@ -1634,8 +1642,16 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     }
     // The tile cache is the ONLY geometry source. Invalidate it when the mariner
     // settings change (they change the portrayal).
+    // TILE57_DEBUG: a cache clear is supposed to be RARE (an options change). If the
+    // log shows this line every frame the hash is flapping — portray cost then explodes
+    // to a full re-tessellation per frame, which is exactly what an 80%-in-ensure_tile
+    // profile looks like. The hash values identify WHICH two states it flaps between.
+    static const bool dbg_cache = std::getenv("TILE57_DEBUG") != nullptr;
     uint64_t mh = mariner_hash(m);
     if (mh != tiles_mhash_) {
+        if (dbg_cache && tiles_mhash_)
+            wxLogMessage("tile57 DBG: tile cache CLEARED (%zu tiles) mariner hash %llx -> %llx",
+                         tiles_.size(), (unsigned long long)tiles_mhash_, (unsigned long long)mh);
         clear_tiles();
         tiles_mhash_ = mh;
     }
