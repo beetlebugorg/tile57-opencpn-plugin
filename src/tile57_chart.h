@@ -118,7 +118,10 @@ class ChartTile57 : public PlugInChartBaseExtended {
     void draw_calibration() const;
 
     // Shared per-pass render: ViewPort -> tile57 camera -> draw `pass` buffers.
-    int render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass, bool stencil_clip);
+    // clip_region: the quilt patch this cell owns (OpenCPN disables its own clip and
+    // hands it to us); null = the whole canvas.
+    int render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass, bool stencil_clip,
+                    const wxRegion* clip_region = nullptr);
     wxBitmap& transparent_bitmap(const PlugIn_ViewPort& vp);
     // Pull OpenCPN's S52/vector-chart options (soundings, display category,
     // text, contours, …) into the tile57 mariner. Cheap: re-reads only when

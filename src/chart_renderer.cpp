@@ -1729,7 +1729,10 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_DEPTH_TEST);
-    glDisable(GL_STENCIL_TEST);
+    // Do NOT touch GL_STENCIL_TEST: the caller may have a quilt-patch mask enabled in it
+    // (see QuiltClip in tile57_chart.cpp). Disabling it here is what let every cell in the
+    // quilt paint the whole canvas. We never WRITE stencil (the mask is 0 there), so leaving
+    // the caller's test enabled is safe; when there is no clip it is simply off already.
 
     // GEOMETRY (base pass / unquilted): compose from cached tiles. Pick the tile zoom
     // (the baked band the view falls in) and the visible x/y range, clamped to the

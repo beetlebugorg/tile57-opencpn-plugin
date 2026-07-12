@@ -589,8 +589,151 @@ void ChartTile57::draw_calibration() const {
     glPopMatrix();
 }
 
+// Clip this chart's drawing to the quilt patch it actually OWNS.
+//
+// OpenCPN hands an EXTENDED plugin chart its patch region and then takes its OWN clip away:
+//
+//     glChartCanvas::SetClipRect(VPoint, VPoint.rv_rect, false);  // clean slate: whole view
+//     glChartCanvas::DisableClipRegion();                         // <- core clip REMOVED
+//     wxRegion *r = RectRegion.GetNew_wxRegion();
+//     ppicb_x->RenderRegionViewOnGLNoText(glc, pivp, *r, s_b_useStencil);
+//
+// (the LEGACY PlugInChartBaseGL path right below it loops the rects and scissors each one
+// itself — the newer Extended path we implement does not, so clipping is OUR job). The
+// region is pqp->ActiveRegion: the part of the screen this cell owns after finer cells have
+// carved themselves out of coarser ones.
+//
+// Ignoring it — as this chart did — let EVERY cell in the quilt paint its whole extent over
+// the whole canvas: the coarse cell underneath drew its own soundings, symbols and labels
+// across the entire view on top of the fine cells drawing theirs. Everything rendered two or
+// three times over, at every zoom. That is not a SCAMIN problem; no cull can fix drawing the
+// same water twice.
+namespace {
+class QuiltClip {
+  public:
+    // `scale` is logical canvas px -> framebuffer px: the same device_scale the projection
+    // uses (1 when the host hands us a physical-px ViewPort, contentScale on a HiDPI canvas).
+    // Deriving it from fbw/vp.pix_width instead would be wrong exactly where it matters —
+    // OpenCPN hands charts an EXPANDED ViewPort under rotation (rv_rect) and in the text
+    // pass, so pix_width is not the canvas width there, while the region rects always are.
+    QuiltClip(const wxRegion& region, double scale, uint32_t fbw, uint32_t fbh, bool have_stencil) {
+        const double sx = scale > 0 ? scale : 1.0, sy = sx;
+        std::vector<std::array<GLint, 4>> rects;
+        for (wxRegionIterator it(region); it; ++it) {
+            const wxRect r = it.GetRect();
+            if (r.width <= 0 || r.height <= 0)
+                continue;
+            // GL scissor/window origin is BOTTOM-left; wx rects are top-left.
+            GLint x = (GLint)std::lround(r.x * sx);
+            GLint w = (GLint)std::lround(r.width * sx);
+            GLint h = (GLint)std::lround(r.height * sy);
+            GLint y = (GLint)std::lround((double)fbh - (r.y + r.height) * sy);
+            rects.push_back({x, y, w, h});
+        }
+        if (rects.empty()) {
+            empty_ = true; // this cell owns none of the screen this frame — draw nothing
+            return;
+        }
+        // Whole-viewport single rect: nothing to clip (the common unquilted case).
+        if (rects.size() == 1 && rects[0][0] <= 0 && rects[0][1] <= 0 &&
+            rects[0][2] >= (GLint)fbw && rects[0][3] >= (GLint)fbh)
+            return;
+
+        glGetBooleanv(GL_SCISSOR_TEST, &prev_scissor_);
+        glGetIntegerv(GL_SCISSOR_BOX, prev_box_);
+        if (rects.size() == 1) { // one rect -> a scissor is exact and free
+            scissor_ = true;
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(rects[0][0], rects[0][1], rects[0][2], rects[0][3]);
+            return;
+        }
+        if (!have_stencil) {
+            // No stencil to build a real mask in. A bounding box over-draws (a coarse cell's
+            // patch is typically a RING around the fine cells, whose bbox is the whole
+            // screen), so this is a poor fallback — say so once rather than silently.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                wxLogMessage("tile57: quilt patch has %zu rects but the host reports no "
+                             "stencil — falling back to a bounding-box clip; overlapping "
+                             "cells may double-draw.",
+                             rects.size());
+            }
+            GLint x0 = rects[0][0], y0 = rects[0][1];
+            GLint x1 = x0 + rects[0][2], y1 = y0 + rects[0][3];
+            for (const auto& r : rects) {
+                x0 = std::min(x0, r[0]);
+                y0 = std::min(y0, r[1]);
+                x1 = std::max(x1, r[0] + r[2]);
+                y1 = std::max(y1, r[1] + r[3]);
+            }
+            scissor_ = true;
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(x0, y0, x1 - x0, y1 - y0);
+            return;
+        }
+        // Several rects: build a real mask. Use stencil BIT 1 — the core writes bit 0
+        // (glStencilMask(0x1) in SetClipRegion), so leave its bit alone.
+        stencil_ = true;
+        glDisable(GL_SCISSOR_TEST); // the clear below must reach the whole buffer
+        glUseProgram(0);
+        glEnable(GL_STENCIL_TEST);
+        glStencilMask(0x2);
+        glClearStencil(0);
+        glClear(GL_STENCIL_BUFFER_BIT); // masked: clears only OUR bit
+        glStencilFunc(GL_ALWAYS, 0x2, 0x2);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        glDisable(GL_DEPTH_TEST);
+        glMatrixMode(GL_PROJECTION);
+        glPushMatrix();
+        glLoadIdentity();
+        glOrtho(0, (GLdouble)fbw, 0, (GLdouble)fbh, -1, 1); // bottom-left, like the rects
+        glMatrixMode(GL_MODELVIEW);
+        glPushMatrix();
+        glLoadIdentity();
+        glBegin(GL_QUADS);
+        for (const auto& r : rects) {
+            glVertex2i(r[0], r[1]);
+            glVertex2i(r[0] + r[2], r[1]);
+            glVertex2i(r[0] + r[2], r[1] + r[3]);
+            glVertex2i(r[0], r[1] + r[3]);
+        }
+        glEnd();
+        glMatrixMode(GL_PROJECTION);
+        glPopMatrix();
+        glMatrixMode(GL_MODELVIEW);
+        glPopMatrix();
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glStencilMask(0x0); // draw, don't write
+        glStencilFunc(GL_EQUAL, 0x2, 0x2);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    }
+    ~QuiltClip() {
+        if (stencil_) {
+            glStencilMask(0xFF);
+            glDisable(GL_STENCIL_TEST);
+        }
+        if (scissor_) {
+            if (prev_scissor_)
+                glScissor(prev_box_[0], prev_box_[1], prev_box_[2], prev_box_[3]);
+            else
+                glDisable(GL_SCISSOR_TEST);
+        }
+    }
+    QuiltClip(const QuiltClip&) = delete;
+    QuiltClip& operator=(const QuiltClip&) = delete;
+    bool empty() const { return empty_; }
+
+  private:
+    bool empty_ = false, scissor_ = false, stencil_ = false;
+    GLboolean prev_scissor_ = GL_FALSE;
+    GLint prev_box_[4] = {0, 0, 0, 0};
+};
+} // namespace
+
 int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
-                             bool stencil_clip) {
+                             bool stencil_clip, const wxRegion* clip_region) {
     if (!vp.bValid)
         return false;
     if (!renderer_.has_chart())
@@ -718,8 +861,17 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
                          vp.rv_rect.height, vp.pix_width, vp.pix_height, fbw, fbh);
         }
     }
-    renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip, device_scale,
-                     cull_bias, rot, scamin_display_denom);
+    // Clip to the patch this cell owns BEFORE drawing anything (see QuiltClip). Scoped, so
+    // the GL clip state is restored however we leave.
+    {
+        QuiltClip clip(clip_region ? *clip_region
+                                   : wxRegion(0, 0, (int)vp.pix_width, (int)vp.pix_height),
+                       device_scale, fbw, fbh, stencil_clip);
+        if (clip.empty())
+            return true; // this cell owns none of the screen this frame
+        renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip,
+                         device_scale, cull_bias, rot, scamin_display_denom);
+    }
     // The tiled renderer portrays only a budget of new tiles per frame (so a big
     // first-visit burst doesn't freeze one frame). If it deferred some, schedule
     // another redraw so they fill in progressively.
@@ -741,23 +893,25 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
 }
 
 int ChartTile57::RenderRegionViewOnGL(const wxGLContext& /*glc*/, const PlugIn_ViewPort& vp,
-                                      const wxRegion& /*Region*/, bool /*b_use_stencil*/) {
-    // Single-chart (unquilted) path: the core wrapper scissors per rect; draw all.
-    return render_pass(vp, t57::ChartRenderer::Pass::kAll, false);
+                                      const wxRegion& Region, bool b_use_stencil) {
+    // Single-chart (unquilted) path. Region is normally the whole canvas here, but honour it
+    // anyway — it costs nothing and it is the same contract as the quilted passes.
+    return render_pass(vp, t57::ChartRenderer::Pass::kAll, b_use_stencil, &Region);
 }
 
 int ChartTile57::RenderRegionViewOnGLNoText(const wxGLContext& /*glc*/, const PlugIn_ViewPort& vp,
-                                            const wxRegion& /*Region*/, bool b_use_stencil) {
-    // Quilt geometry pass. The core pre-writes this chart's patch region into
-    // the stencil buffer (SetClipRegion) and expects the chart to clip itself.
-    return render_pass(vp, t57::ChartRenderer::Pass::kBase, b_use_stencil);
+                                            const wxRegion& Region, bool b_use_stencil) {
+    // Quilt geometry pass. The core does NOT pre-clip for an Extended plugin chart — it
+    // disables its own clip and hands us the patch region to apply ourselves (see QuiltClip).
+    return render_pass(vp, t57::ChartRenderer::Pass::kBase, b_use_stencil, &Region);
 }
 
 int ChartTile57::RenderRegionViewOnGLTextOnly(const wxGLContext& /*glc*/, const PlugIn_ViewPort& vp,
-                                              const wxRegion& /*Region*/, bool /*b_use_stencil*/) {
-    // Quilt text pass: once across the whole quilt, unclipped (text declutters
-    // across patch boundaries).
-    return render_pass(vp, t57::ChartRenderer::Pass::kText, false);
+                                              const wxRegion& Region, bool b_use_stencil) {
+    // Quilt text pass. Clipped to this cell's patch like the geometry: the core calls this
+    // once PER CHART, so an unclipped text pass drew every cell's labels over the whole
+    // canvas — the coarse cell's names and light descriptions stacked on the fine cell's.
+    return render_pass(vp, t57::ChartRenderer::Pass::kText, b_use_stencil, &Region);
 }
 
 // ---- object query (S-52 §10.8 pick) ----------------------------------------
