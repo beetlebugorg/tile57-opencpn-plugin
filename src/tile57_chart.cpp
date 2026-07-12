@@ -400,12 +400,17 @@ void ChartTile57::apply_canvas_enc_options() {
 }
 
 void ChartTile57::refresh_mariner() {
-    // The per-canvas ENC toggles are live and cheap — always re-read them.
-    apply_canvas_enc_options();
-
-    // Everything else re-reads only when OpenCPN says the S52 state changed:
-    // PI_GetPLIBStateHash bumps on any S52/vector-chart option, and the "OpenCPN Config"
-    // message bumps its own generation. Between changes this is two int compares.
+    // ORDER MATTERS. apply_canvas_enc_options() consumes state this function LOADS
+    // (light_desc_cfg_, important_text_only_), so it has to run AFTER the loads below, not
+    // before. It used to run first, which meant a chart's FIRST frame portrayed every tile
+    // with the not-yet-loaded defaults, the loads then changed them, and the SECOND frame saw
+    // a different mariner hash and threw the whole cache away — a full double portray on
+    // every chart open. OpenCPN purges and reopens charts constantly (its chart cache holds
+    // ~20 while a quilt walks hundreds of cells), so that was being paid over and over.
+    //
+    // The loads are gated on OpenCPN's S52 state hash + our config-message generation, so
+    // between actual settings changes this whole block is two int compares; the canvas ENC
+    // toggles at the bottom are live and cheap, and run every frame.
     const int hash = PI_GetPLIBStateHash();
     uint64_t gen;
     {
@@ -413,11 +418,39 @@ void ChartTile57::refresh_mariner() {
         std::lock_guard<std::mutex> lk(c.mtx);
         gen = c.gen;
     }
-    if (hash == plib_hash_ && gen == s52_msg_gen_)
-        return;
-    plib_hash_ = hash;
-    s52_msg_gen_ = gen;
+    if (hash != plib_hash_ || gen != s52_msg_gen_) {
+        plib_hash_ = hash;
+        s52_msg_gen_ = gen;
+        load_s52_state();
+    }
 
+    // Live per-canvas ENC toggles (Chart Panel flyout / ENC menu). These read the canvas
+    // directly every frame, and now see the settings loaded above on the very first one.
+    apply_canvas_enc_options();
+    // important_text_only_ may have just moved; recompose the text gate it feeds.
+    mariner_.text_other = mariner_.text_names && !important_text_only_;
+
+    // SUPER-SCAMIN: impute a SCAMIN for features this cell left ungated, from the cell's own
+    // compilation scale (ChartRenderer::feature_scamin explains why; s52plib does the same).
+    // It rides the host's "Use SCAMIN" switch — turning SCAMIN off must show EVERYTHING, and
+    // an imputed threshold is still a SCAMIN. TILE57_SUPERSCAMIN=0 disables it on its own,
+    // which is the A/B for "is the imputation what's hiding this feature".
+    //
+    // NOT wired to OpenCPN's own UseSUPER_SCAMIN flag, whose default is OFF (navutil.cpp
+    // reads it with default 0): the core can afford that because its quilt rarely puts a fine
+    // cell under a coarse view, while every tile57 chart IS one cell and lands under any view
+    // the quilt hands it. Defaulting to the core's OFF would just restore the carpet.
+    static const bool super_off = [] {
+        const char* e = std::getenv("TILE57_SUPERSCAMIN");
+        return e && std::atoi(e) == 0;
+    }();
+    renderer_.set_super_scamin(!super_off && !mariner_.ignore_scamin, (double)m_Chart_Scale);
+}
+
+// The S52 state OpenCPN only changes when the user changes a setting: the PI_GetPLIB*
+// getters, the config file, and the pushed "OpenCPN Config" message. Split out of
+// refresh_mariner so the ordering above is stated once and cannot drift back.
+void ChartTile57::load_s52_state() {
     mariner_.safety_contour = PI_GetPLIBMarinerSafetyContour();
     // PI_GetPLIBSymbolStyle/BoundaryStyle return S52 LUP table names:
     // 'L' simplified / 'R' paper-chart points; 'N' plain / 'O' symbolized.
@@ -520,9 +553,6 @@ void ChartTile57::refresh_mariner() {
         text_factor_ = c.text_factor;
         sounding_factor_ = c.sounding_factor;
     }
-    // important_text_only_ may have just moved; recompose the text gate it feeds.
-    mariner_.text_other = mariner_.text_names && !important_text_only_;
-
     // The ENC Text / ENC Sounding sliders, scaled the way OpenCPN scales them. These sit ON
     // TOP of size_scale (the physical/DPI calibration + the Chart Object slider, both folded
     // in above), because that is how OpenCPN stacks them: the object factor moves symbols,
@@ -531,22 +561,6 @@ void ChartTile57::refresh_mariner() {
     // — which is exactly why this cannot be done on our side of the API.
     mariner_.text_size_scale = enc_text_scale(text_factor_);
     mariner_.sounding_size_scale = enc_sounding_scale(sounding_factor_);
-
-    // SUPER-SCAMIN: impute a SCAMIN for features this cell left ungated, from the cell's own
-    // compilation scale (ChartRenderer::feature_scamin explains why; s52plib does the same).
-    // It rides the host's "Use SCAMIN" switch — turning SCAMIN off must show EVERYTHING, and
-    // an imputed threshold is still a SCAMIN. TILE57_SUPERSCAMIN=0 disables it on its own,
-    // which is the A/B for "is the imputation what's hiding this feature".
-    //
-    // NOT wired to OpenCPN's own UseSUPER_SCAMIN flag, whose default is OFF (navutil.cpp
-    // reads it with default 0): the core can afford that because its quilt rarely puts a fine
-    // cell under a coarse view, while every tile57 chart IS one cell and lands under any view
-    // the quilt hands it. Defaulting to the core's OFF would just restore the carpet.
-    static const bool super_off = [] {
-        const char* e = std::getenv("TILE57_SUPERSCAMIN");
-        return e && std::atoi(e) == 0;
-    }();
-    renderer_.set_super_scamin(!super_off && !mariner_.ignore_scamin, (double)m_Chart_Scale);
 }
 
 void ChartTile57::draw_calibration() const {
@@ -911,6 +925,17 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
                        device_scale, fbw, fbh, stencil_clip);
         if (clip.empty())
             return true; // this cell owns none of the screen this frame
+        // The patch's bounding box in framebuffer px (top-left origin — the frame the shader
+        // projects into; QuiltClip's own rects are GL bottom-left, hence the separate math).
+        // Handed to render() so a quilted cell portrays only the tiles it can actually paint.
+        int patch_fb[4] = {0, 0, (int)fbw, (int)fbh};
+        if (clip_region) {
+            const wxRect b = clip_region->GetBox();
+            patch_fb[0] = (int)std::lround(b.x * device_scale);
+            patch_fb[1] = (int)std::lround(b.y * device_scale);
+            patch_fb[2] = (int)std::lround(b.width * device_scale);
+            patch_fb[3] = (int)std::lround(b.height * device_scale);
+        }
         if (clip.multipass()) {
             // No stencil: the patch is drawn rect by rect, each under an exact scissor. The
             // scene is identical every pass — only the scissor moves — so the tile cache and
@@ -918,11 +943,11 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
             for (const auto& r : clip.rects()) {
                 glScissor(r[0], r[1], r[2], r[3]);
                 renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip,
-                                 device_scale, cull_bias, rot, scamin_display_denom);
+                                 device_scale, cull_bias, rot, scamin_display_denom, patch_fb);
             }
         } else {
             renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip,
-                             device_scale, cull_bias, rot, scamin_display_denom);
+                             device_scale, cull_bias, rot, scamin_display_denom, patch_fb);
         }
     }
     // The tiled renderer portrays only a budget of new tiles per frame (so a big

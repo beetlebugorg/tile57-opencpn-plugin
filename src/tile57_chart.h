@@ -127,6 +127,10 @@ class ChartTile57 : public PlugInChartBaseExtended {
     // text, contours, …) into the tile57 mariner. Cheap: re-reads only when
     // PI_GetPLIBStateHash() changes.
     void refresh_mariner();
+    // The S52 state that only moves when the user changes a setting (PI_GetPLIB* getters,
+    // config file, pushed config message). refresh_mariner calls this BEFORE the live canvas
+    // toggles, which consume what it loads — see the ordering note there.
+    void load_s52_state();
 
     // Pull the per-canvas ENC state (OpenCPN's "Chart Panel Options": text, soundings,
     // lights, light descriptions, display category) into the mariner. Separate from

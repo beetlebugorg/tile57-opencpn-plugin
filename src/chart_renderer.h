@@ -53,9 +53,14 @@ class ChartRenderer {
     // applied about the viewport centre on the GPU. It is a pure VIEW transform: the
     // portrayed geometry stays north-up in world space, so the tile + label caches
     // survive a turn untouched and rotating re-portrays nothing.
+    // patch_fb = the quilt patch this chart owns, {x, y, w, h} in framebuffer px (top-left
+    // origin, like the shader's screen frame); null = the whole viewport. Tiles outside it
+    // can never appear on screen, so they are never portrayed — without this every cell in a
+    // quilt tessellates the whole canvas and the scissor discards nearly all of it.
     void render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                 const tile57_mariner& m, Pass pass, bool stencil_clip, double device_scale = 1.0,
-                double cull_bias = 0.0, double rotation = 0.0, double scamin_display_denom = 0.0);
+                double cull_bias = 0.0, double rotation = 0.0, double scamin_display_denom = 0.0,
+                const int* patch_fb = nullptr);
     void shutdown();
     bool has_chart() const { return chart_ != nullptr; }
     // True when the last render deferred work that a follow-up redraw would finish:

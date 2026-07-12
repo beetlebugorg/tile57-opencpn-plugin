@@ -1722,7 +1722,7 @@ void ChartRenderer::rotated_half_extent(uint32_t w, uint32_t h, double scale_px,
 void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                            const tile57_mariner& m, Pass pass, bool stencil_clip,
                            double device_scale, double cull_bias, double rotation,
-                           double scamin_display_denom) {
+                           double scamin_display_denom, const int* patch_fb) {
     if (!chart_ || !ensure_gl())
         return;
     if (!have_range_) {
@@ -1865,6 +1865,36 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         rotated_half_extent(w, h, scale_px, rot, half_wx, half_wy);
         double wminx = vwx - half_wx, wmaxx = vwx + half_wx;
         double wminy = vwy - half_wy, wmaxy = vwy + half_wy;
+        // Narrow the range to the QUILT PATCH this chart owns, not the whole viewport. A
+        // quilted cell paints a sliver of the screen — often a thin strip — but the range
+        // above is the entire view, so every chart was portraying (pmtiles decode + gunzip +
+        // earcut) every tile under the WHOLE canvas and then letting the scissor throw nearly
+        // all of it away. With a dozen cells in a quilt that is the same ground tessellated a
+        // dozen times and discarded: the profile's 82% in ensure_tile. Tiles OUTSIDE the
+        // patch cannot appear on screen, so they need never be portrayed.
+        if (patch_fb) {
+            // Invert the shader's transform for the patch's 4 corners: it maps
+            //   screen = R*(world - view)*scale_px + centre  =>  world = view + R^-1*(screen - centre)/scale
+            // R^-1 is R transposed (a rotation), so this stays exact under a turned chart.
+            const double cx = w * 0.5, cy = h * 0.5;
+            const double xs[2] = {(double)patch_fb[0], (double)(patch_fb[0] + patch_fb[2])};
+            const double ys[2] = {(double)patch_fb[1], (double)(patch_fb[1] + patch_fb[3])};
+            double pminx = 1e30, pmaxx = -1e30, pminy = 1e30, pmaxy = -1e30;
+            for (int i = 0; i < 2; ++i)
+                for (int j = 0; j < 2; ++j) {
+                    const double sx = xs[i] - cx, sy = ys[j] - cy;
+                    const double ux = (sx * rot.c + sy * rot.s) / scale_px; // R^-1 * screen
+                    const double uy = (-sx * rot.s + sy * rot.c) / scale_px;
+                    pminx = std::min(pminx, vwx + ux);
+                    pmaxx = std::max(pmaxx, vwx + ux);
+                    pminy = std::min(pminy, vwy + uy);
+                    pmaxy = std::max(pmaxy, vwy + uy);
+                }
+            wminx = std::max(wminx, pminx);
+            wmaxx = std::min(wmaxx, pmaxx);
+            wminy = std::max(wminy, pminy);
+            wmaxy = std::min(wmaxy, pmaxy);
+        }
         if (have_bounds_) {
             double nwx, nwy, sex, sey;
             lonlat_to_world(b_w_, b_n_, nwx, nwy); // NW -> (min x, min y)
