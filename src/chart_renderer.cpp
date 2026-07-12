@@ -21,21 +21,28 @@ namespace t57 {
 
 namespace {
 constexpr double kPi = 3.14159265358979323846;
-// SCAMIN gate constant (tile57 render/resolve.zig DENOM_Z0): a feature shows at
-// zoom >= log2(DENOM_Z0 / scamin).
-constexpr double kDenomZ0 = 279541132.0;
-constexpr float kAlwaysVisible = -1e30f;
+// A feature with no SCAMIN is never scale-culled: give it an effectively infinite one, so
+// the "display denominator > SCAMIN" test below can stay branchless.
+constexpr float kNeverCulled = 1e30f;
 
 void lonlat_to_world(double lon, double lat, double& wx, double& wy) {
     wx = (lon + 180.0) / 360.0;
     double s = std::sin(lat * kPi / 180.0);
     wy = 0.5 - std::log((1.0 + s) / (1.0 - s)) / (4.0 * kPi);
 }
-float scamin_threshold(int64_t scamin) {
-    if (scamin <= 0)
-        return kAlwaysVisible;
-    return (float)std::log2(kDenomZ0 / (double)scamin);
-}
+// SCAMIN travels to the GPU AS ITSELF — the raw 1:N denominator — and is compared against
+// the host's actual display denominator (see render's scamin_denom / the uScaminDenom
+// uniform). That is exactly what native OpenCPN does:
+//
+//     if (vp_plib.chart_scale > rzRules->obj->Scamin) b_visible = false;   // s52plib.cpp
+//
+// This used to convert SCAMIN into a web-mercator zoom threshold, log2(DENOM_Z0 / scamin),
+// and compare zooms. That is MapLibre's convention and it bakes in the EQUATOR: the scale
+// denominator at a given zoom shrinks with cos(latitude), so the formula drifted from the
+// real display scale by log2(cos lat) — ~0.36 of a zoom level at latitude 39, i.e. features
+// popping in and out ~28% of a scale step away from where the native charts do it.
+// The host knows its own scale exactly; there is nothing to model.
+float scamin_denom(int64_t scamin) { return scamin > 0 ? (float)scamin : kNeverCulled; }
 uint64_t mariner_hash(const tile57_mariner& m) {
     uint64_t h = 1469598103934665603ull;
     auto mix = [&h](const void* p, size_t n) {
@@ -61,7 +68,7 @@ uint64_t mariner_hash(const tile57_mariner& m) {
 // Rings are decimated to the portrayal's pixel grid first — dropping sub-half-
 // pixel detail cuts the triangle count hugely on dense coastlines/depth areas
 // (the per-frame draw cost, hence the zoom framerate) with no visible change.
-void ChartRenderer::on_fill_area(const tile57_world_rings* p, tile57_rgba c, float thresh) {
+void ChartRenderer::on_fill_area(const tile57_world_rings* p, tile57_rgba c, float scamin) {
     if (!p || p->n < 3)
         return;
     using Pt = std::array<double, 2>;
@@ -90,7 +97,7 @@ void ChartRenderer::on_fill_area(const tile57_world_rings* p, tile57_rgba c, flo
     for (size_t i = 0; i + 2 < idx.size(); i += 3)
         for (int k = 0; k < 3; ++k) {
             double wx = flat[idx[i + k]][0] - ref_wx_, wy = flat[idx[i + k]][1] - ref_wy_;
-            area_.push_back({(float)wx, (float)wy, 0, 0, c.r, c.g, c.b, c.a, thresh, 0.0f});
+            area_.push_back({(float)wx, (float)wy, 0, 0, c.r, c.g, c.b, c.a, scamin, 0.0f});
         }
 }
 
@@ -98,7 +105,7 @@ void ChartRenderer::on_fill_area(const tile57_world_rings* p, tile57_rgba c, flo
 // endpoint (world), aPost carries the perpendicular * half-width in px, applied
 // AFTER the world transform so the line is a constant screen width at any zoom.
 void ChartRenderer::on_stroke_line(const tile57_world_rings* p, float width_px, tile57_rgba c,
-                                   float thresh) {
+                                   float scamin) {
     if (!p || p->n < 2)
         return;
     float hw = std::max(0.5f, width_px * 0.5f);
@@ -121,7 +128,7 @@ void ChartRenderer::on_stroke_line(const tile57_world_rings* p, float width_px, 
                 continue;
             float nx = (float)(-dy / len) * hw, ny = (float)(dx / len) * hw; // px offset
             auto v = [&](double wx, double wy, float ox, float oy) {
-                line_.push_back({(float)wx, (float)wy, ox, oy, c.r, c.g, c.b, c.a, thresh, 1.0f});
+                line_.push_back({(float)wx, (float)wy, ox, oy, c.r, c.g, c.b, c.a, scamin, 1.0f});
             };
             v(ax, ay, nx, ny);
             v(bx, by, nx, ny);
@@ -137,7 +144,7 @@ void ChartRenderer::on_stroke_line(const tile57_world_rings* p, float width_px, 
 // even-odd rule (group rings by containment parity so counters cut out and no
 // triangles bridge between letters), anchored at one world point via aWorld.
 static void tess_local_even_odd(const tile57_local_rings* p, double awx, double awy, tile57_rgba c,
-                                float thresh, float postrot, std::vector<ChartRenderer::Vtx>& out) {
+                                float scamin, float postrot, std::vector<ChartRenderer::Vtx>& out) {
     if (!p || p->n < 3)
         return;
     using Pt = std::array<float, 2>;
@@ -199,13 +206,13 @@ static void tess_local_even_odd(const tile57_local_rings* p, double awx, double 
         for (size_t t = 0; t + 2 < idx.size(); t += 3)
             for (int k = 0; k < 3; ++k)
                 out.push_back({(float)awx, (float)awy, flat[idx[t + k]][0], flat[idx[t + k]][1],
-                               c.r, c.g, c.b, c.a, thresh});
+                               c.r, c.g, c.b, c.a, scamin});
     }
 }
 
 void ChartRenderer::on_draw_symbol(tile57_world_point anchor, const tile57_local_rings* p,
                                    tile57_rgba c, int even_odd, float stroke_w,
-                                   tile57_rot_align align, float thresh) {
+                                   tile57_rot_align align, float scamin) {
     (void)even_odd;
     double awx = anchor.x - ref_wx_, awy = anchor.y - ref_wy_;
     // The outline arrives already turned to the symbol's own angle; MAP means that angle is
@@ -226,7 +233,7 @@ void ChartRenderer::on_draw_symbol(tile57_world_point anchor, const tile57_local
                 float nx = -dy / len * hw, ny = dx / len * hw;
                 auto v = [&](float ox, float oy) {
                     symbol_.push_back(
-                        {(float)awx, (float)awy, ox, oy, c.r, c.g, c.b, c.a, thresh, postrot});
+                        {(float)awx, (float)awy, ox, oy, c.r, c.g, c.b, c.a, scamin, postrot});
                 };
                 v(ax + nx, ay + ny);
                 v(bx + nx, by + ny);
@@ -237,14 +244,14 @@ void ChartRenderer::on_draw_symbol(tile57_world_point anchor, const tile57_local
             }
         }
     } else {
-        tess_local_even_odd(p, awx, awy, c, thresh, postrot, symbol_);
+        tess_local_even_odd(p, awx, awy, c, scamin, postrot, symbol_);
     }
 }
 
 void ChartRenderer::on_draw_text(tile57_world_point anchor, const tile57_local_rings* g,
                                  tile57_rgba c, tile57_rgba /*halo*/, tile57_rot_align align,
-                                 float thresh) {
-    tess_local_even_odd(g, anchor.x - ref_wx_, anchor.y - ref_wy_, c, thresh,
+                                 float scamin) {
+    tess_local_even_odd(g, anchor.x - ref_wx_, anchor.y - ref_wy_, c, scamin,
                         (align == TILE57_ALIGN_MAP) ? 1.0f : 0.0f, text_);
 }
 
@@ -506,7 +513,7 @@ uint32_t decode_utf8(const char* s, size_t len, size_t& i) {
 // anchor, rotated, mapped to the symbol's atlas cell (AA'd by texture filtering).
 void ChartRenderer::on_draw_sprite(const char* name, size_t len, tile57_world_point anchor,
                                    float rot_deg, tile57_rot_align align, float hw, float hh,
-                                   float thresh) {
+                                   float scamin) {
     if (!g_atlas.ok || hw <= 0 || hh <= 0)
         return;
     auto it = g_atlas.uv.find(std::string(name, len));
@@ -520,7 +527,7 @@ void ChartRenderer::on_draw_sprite(const char* name, size_t len, tile57_world_po
     // or a cached tile would go stale on every degree of a turn.
     const float postrot = (align == TILE57_ALIGN_MAP) ? 1.0f : 0.0f;
     auto corner = [&](float lx, float ly, float u, float vv) {
-        sprite_.push_back({awx, awy, lx * c - ly * s, lx * s + ly * c, u, vv, thresh, postrot});
+        sprite_.push_back({awx, awy, lx * c - ly * s, lx * s + ly * c, u, vv, scamin, postrot});
     };
     corner(-hw, -hh, r.u0, r.v0);
     corner(hw, -hh, r.u1, r.v0);
@@ -533,12 +540,12 @@ void ChartRenderer::on_draw_sprite(const char* name, size_t len, tile57_world_po
 // Area fill pattern: tessellate the polygon and tile the pattern cell across it
 // (world-anchored, constant screen size) via the pattern program.
 void ChartRenderer::on_draw_pattern(const char* name, size_t len, const tile57_world_rings* p,
-                                    float thresh) {
+                                    float scamin) {
     if (!g_atlas.ok || !p || p->n < 3)
         return;
     auto it = g_atlas.uv.find("pat:" + std::string(name, len));
     if (it == g_atlas.uv.end()) { // unknown pattern -> flat translucent tint
-        on_fill_area(p, tile57_rgba{160, 160, 170, 140}, thresh);
+        on_fill_area(p, tile57_rgba{160, 160, 170, 140}, scamin);
         return;
     }
     const AtlasRect& r = it->second;
@@ -571,7 +578,7 @@ void ChartRenderer::on_draw_pattern(const char* name, size_t len, const tile57_w
         for (int k = 0; k < 3; ++k) {
             float wx = (float)(flat[idx[i + k]][0] - ref_wx_),
                   wy = (float)(flat[idx[i + k]][1] - ref_wy_);
-            pattern_.push_back({wx, wy, r.u0, r.v0, r.u1, r.v1, tw, th, thresh});
+            pattern_.push_back({wx, wy, r.u0, r.v0, r.u1, r.v1, tw, th, scamin});
         }
 }
 
@@ -581,7 +588,7 @@ void ChartRenderer::on_draw_pattern(const char* name, size_t len, const tile57_w
 void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float oy,
                                      const char* text, size_t len, float size_px, float rot_deg,
                                      tile57_rot_align align, tile57_rgba c, tile57_rgba /*halo*/,
-                                     float thresh) {
+                                     float scamin) {
     if (!g_glyph.ok || size_px <= 0 || !text)
         return;
     float awx = (float)(anchor.x - ref_wx_), awy = (float)(anchor.y - ref_wy_);
@@ -608,7 +615,7 @@ void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float 
             float x1 = x0 + g.w * size_px, y1 = y0 + g.h * size_px;
             auto v = [&](float px, float py, float u, float vv) {
                 glyph_.push_back({awx, awy, px * rc - py * rs, px * rs + py * rc, u, vv, c.r, c.g,
-                                  c.b, c.a, thresh, postrot});
+                                  c.b, c.a, scamin, postrot});
             };
             v(x0, y0, g.u0, g.v0);
             v(x1, y0, g.u1, g.v0);
@@ -622,39 +629,39 @@ void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float 
 }
 
 // ---- C surface trampolines (ctx == ChartRenderer*) -------------------------
-static float feat_thresh(const tile57_feature* f) { return scamin_threshold(f ? f->scamin : 0); }
+static float feat_scamin(const tile57_feature* f) { return scamin_denom(f ? f->scamin : 0); }
 static void tr_fill(void* c, const tile57_feature* f, const tile57_world_rings* r, tile57_rgba col,
                     int) {
-    static_cast<ChartRenderer*>(c)->on_fill_area(r, col, feat_thresh(f));
+    static_cast<ChartRenderer*>(c)->on_fill_area(r, col, feat_scamin(f));
 }
 static void tr_stroke(void* c, const tile57_feature* f, const tile57_world_rings* l, float w, float,
                       float, tile57_rgba col) {
-    static_cast<ChartRenderer*>(c)->on_stroke_line(l, w, col, feat_thresh(f));
+    static_cast<ChartRenderer*>(c)->on_stroke_line(l, w, col, feat_scamin(f));
 }
 static void tr_symbol(void* c, const tile57_feature* f, tile57_world_point a,
                       const tile57_local_rings* r, tile57_rgba col, int eo, float sw,
                       tile57_rot_align align) {
-    static_cast<ChartRenderer*>(c)->on_draw_symbol(a, r, col, eo, sw, align, feat_thresh(f));
+    static_cast<ChartRenderer*>(c)->on_draw_symbol(a, r, col, eo, sw, align, feat_scamin(f));
 }
 static void tr_text(void* c, const tile57_feature* f, tile57_world_point a,
                     const tile57_local_rings* g, tile57_rgba col, tile57_rgba halo, float,
                     tile57_rot_align align) {
-    static_cast<ChartRenderer*>(c)->on_draw_text(a, g, col, halo, align, feat_thresh(f));
+    static_cast<ChartRenderer*>(c)->on_draw_text(a, g, col, halo, align, feat_scamin(f));
 }
 static void tr_sprite(void* c, const tile57_feature* f, const char* name, size_t len,
                       tile57_world_point a, float rot, tile57_rot_align align, float hw, float hh) {
     static_cast<ChartRenderer*>(c)->on_draw_sprite(name, len, a, rot, align, hw, hh,
-                                                   feat_thresh(f));
+                                                   feat_scamin(f));
 }
 static void tr_pattern(void* c, const tile57_feature* f, const char* name, size_t len,
                        const tile57_world_rings* rings) {
-    static_cast<ChartRenderer*>(c)->on_draw_pattern(name, len, rings, feat_thresh(f));
+    static_cast<ChartRenderer*>(c)->on_draw_pattern(name, len, rings, feat_scamin(f));
 }
 static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, float ox, float oy,
                         const char* text, size_t len, float size, float rot, tile57_rot_align align,
                         tile57_rgba col, tile57_rgba halo) {
     static_cast<ChartRenderer*>(c)->on_draw_text_str(a, ox, oy, text, len, size, rot, align, col,
-                                                     halo, feat_thresh(f));
+                                                     halo, feat_scamin(f));
 }
 
 // ---- chart / GL lifecycle --------------------------------------------------
@@ -719,17 +726,17 @@ static const char* VS = R"(
 attribute vec2 aWorld;
 attribute vec2 aPost;
 attribute vec4 aColor;
-attribute float aThresh;
+attribute float aScamin;
 attribute float aPostRot;
 uniform float uScale;
 uniform vec2 uOrigin;
 uniform vec2 uVp;
-uniform float uZoom;
+uniform float uScaminDenom;
 uniform vec2 uRot;
 varying vec4 vCol;
 vec2 t57rot(vec2 p){ return vec2(p.x*uRot.x - p.y*uRot.y, p.x*uRot.y + p.y*uRot.x); }
 void main(){
-  if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); vCol = vec4(0.0); return; }
+  if (uScaminDenom > aScamin) { gl_Position = vec4(2.0,2.0,2.0,1.0); vCol = vec4(0.0); return; }
   vec2 screen = t57rot(aWorld*uScale) + uOrigin + mix(aPost, t57rot(aPost), aPostRot);
   vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
   gl_Position = vec4(ndc, 0.0, 1.0);
@@ -747,17 +754,17 @@ static const char* VS_SPRITE = R"(
 attribute vec2 aWorld;
 attribute vec2 aPost;
 attribute vec2 aUV;
-attribute float aThresh;
+attribute float aScamin;
 attribute float aPostRot;
 uniform float uScale;
 uniform vec2 uOrigin;
 uniform vec2 uVp;
-uniform float uZoom;
+uniform float uScaminDenom;
 uniform vec2 uRot;
 varying vec2 vUV;
 vec2 t57rot(vec2 p){ return vec2(p.x*uRot.x - p.y*uRot.y, p.x*uRot.y + p.y*uRot.x); }
 void main(){
-  if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); vUV = vec2(0.0); return; }
+  if (uScaminDenom > aScamin) { gl_Position = vec4(2.0,2.0,2.0,1.0); vUV = vec2(0.0); return; }
   // MAP-aligned sprites (ORIENT'd lights, linestyle bricks) turn their quad with the chart;
   // VIEWPORT-aligned ones (buoys, beacons) stay upright. aPostRot picks, per sprite.
   vec2 screen = t57rot(aWorld*uScale) + uOrigin + mix(aPost, t57rot(aPost), aPostRot);
@@ -779,17 +786,17 @@ static const char* VS_PAT = R"(
 attribute vec2 aWorld;
 attribute vec4 aRect;
 attribute vec2 aTile;
-attribute float aThresh;
+attribute float aScamin;
 uniform float uScale;
 uniform vec2 uOrigin;
 uniform vec2 uVp;
-uniform float uZoom;
+uniform float uScaminDenom;
 uniform vec2 uRot;
 varying vec4 vRect;
 varying vec2 vTile;
 varying vec2 vWorldPx;
 void main(){
-  if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); return; }
+  if (uScaminDenom > aScamin) { gl_Position = vec4(2.0,2.0,2.0,1.0); return; }
   vec2 wpx = aWorld*uScale;
   vec2 screen = vec2(wpx.x*uRot.x - wpx.y*uRot.y, wpx.x*uRot.y + wpx.y*uRot.x) + uOrigin;
   vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
@@ -820,18 +827,18 @@ attribute vec2 aWorld;
 attribute vec2 aPost;
 attribute vec2 aUV;
 attribute vec4 aColor;
-attribute float aThresh;
+attribute float aScamin;
 attribute float aPostRot;
 uniform float uScale;
 uniform vec2 uOrigin;
 uniform vec2 uVp;
-uniform float uZoom;
+uniform float uScaminDenom;
 uniform vec2 uRot;
 varying vec2 vUV;
 varying vec4 vCol;
 vec2 t57rot(vec2 p){ return vec2(p.x*uRot.x - p.y*uRot.y, p.x*uRot.y + p.y*uRot.x); }
 void main(){
-  if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); vUV = vec2(0.0); vCol = vec4(0.0); return; }
+  if (uScaminDenom > aScamin) { gl_Position = vec4(2.0,2.0,2.0,1.0); vUV = vec2(0.0); vCol = vec4(0.0); return; }
   // The anchor always turns with the chart. The glyph quad turns only for a MAP-aligned
   // label — a depth-contour value, which must follow its contour; an ordinary label is
   // VIEWPORT-aligned and stays upright and readable.
@@ -890,10 +897,10 @@ namespace {
 // instance, so all the render code that reads prog_/u_scale_/… is unchanged.
 struct GlPrograms {
     uint32_t prog = 0, prog_sprite = 0, prog_pat = 0, prog_glyph = 0, prog_blit = 0, vbo_quad = 0;
-    int u_scale = -1, u_origin = -1, u_vp = -1, u_zoom = -1, u_rot = -1;
-    int su_scale = -1, su_origin = -1, su_vp = -1, su_zoom = -1, su_atlas = -1, su_rot = -1;
-    int pu_scale = -1, pu_origin = -1, pu_vp = -1, pu_zoom = -1, pu_atlas = -1, pu_rot = -1;
-    int gu_scale = -1, gu_origin = -1, gu_vp = -1, gu_zoom = -1, gu_atlas = -1, gu_rot = -1;
+    int u_scale = -1, u_origin = -1, u_vp = -1, u_denom = -1, u_rot = -1;
+    int su_scale = -1, su_origin = -1, su_vp = -1, su_denom = -1, su_atlas = -1, su_rot = -1;
+    int pu_scale = -1, pu_origin = -1, pu_vp = -1, pu_denom = -1, pu_atlas = -1, pu_rot = -1;
+    int gu_scale = -1, gu_origin = -1, gu_vp = -1, gu_denom = -1, gu_atlas = -1, gu_rot = -1;
     int bu_tex = -1;
     bool ready = false;
 };
@@ -907,13 +914,13 @@ void build_programs() {
     glBindAttribLocation(g.prog, 0, "aWorld");
     glBindAttribLocation(g.prog, 1, "aPost");
     glBindAttribLocation(g.prog, 2, "aColor");
-    glBindAttribLocation(g.prog, 3, "aThresh");
+    glBindAttribLocation(g.prog, 3, "aScamin");
     glBindAttribLocation(g.prog, 4, "aPostRot");
     glLinkProgram(g.prog);
     g.u_scale = glGetUniformLocation(g.prog, "uScale");
     g.u_origin = glGetUniformLocation(g.prog, "uOrigin");
     g.u_vp = glGetUniformLocation(g.prog, "uVp");
-    g.u_zoom = glGetUniformLocation(g.prog, "uZoom");
+    g.u_denom = glGetUniformLocation(g.prog, "uScaminDenom");
     g.u_rot = glGetUniformLocation(g.prog, "uRot");
 
     // Sprite program (textured point symbols).
@@ -923,13 +930,13 @@ void build_programs() {
     glBindAttribLocation(g.prog_sprite, 0, "aWorld");
     glBindAttribLocation(g.prog_sprite, 1, "aPost");
     glBindAttribLocation(g.prog_sprite, 2, "aUV");
-    glBindAttribLocation(g.prog_sprite, 3, "aThresh");
+    glBindAttribLocation(g.prog_sprite, 3, "aScamin");
     glBindAttribLocation(g.prog_sprite, 4, "aPostRot");
     glLinkProgram(g.prog_sprite);
     g.su_scale = glGetUniformLocation(g.prog_sprite, "uScale");
     g.su_origin = glGetUniformLocation(g.prog_sprite, "uOrigin");
     g.su_vp = glGetUniformLocation(g.prog_sprite, "uVp");
-    g.su_zoom = glGetUniformLocation(g.prog_sprite, "uZoom");
+    g.su_denom = glGetUniformLocation(g.prog_sprite, "uScaminDenom");
     g.su_atlas = glGetUniformLocation(g.prog_sprite, "uAtlas");
     g.su_rot = glGetUniformLocation(g.prog_sprite, "uRot");
 
@@ -940,12 +947,12 @@ void build_programs() {
     glBindAttribLocation(g.prog_pat, 0, "aWorld");
     glBindAttribLocation(g.prog_pat, 1, "aRect");
     glBindAttribLocation(g.prog_pat, 2, "aTile");
-    glBindAttribLocation(g.prog_pat, 3, "aThresh");
+    glBindAttribLocation(g.prog_pat, 3, "aScamin");
     glLinkProgram(g.prog_pat);
     g.pu_scale = glGetUniformLocation(g.prog_pat, "uScale");
     g.pu_origin = glGetUniformLocation(g.prog_pat, "uOrigin");
     g.pu_vp = glGetUniformLocation(g.prog_pat, "uVp");
-    g.pu_zoom = glGetUniformLocation(g.prog_pat, "uZoom");
+    g.pu_denom = glGetUniformLocation(g.prog_pat, "uScaminDenom");
     g.pu_atlas = glGetUniformLocation(g.prog_pat, "uAtlas");
     g.pu_rot = glGetUniformLocation(g.prog_pat, "uRot");
 
@@ -957,13 +964,13 @@ void build_programs() {
     glBindAttribLocation(g.prog_glyph, 1, "aPost");
     glBindAttribLocation(g.prog_glyph, 2, "aUV");
     glBindAttribLocation(g.prog_glyph, 3, "aColor");
-    glBindAttribLocation(g.prog_glyph, 4, "aThresh");
+    glBindAttribLocation(g.prog_glyph, 4, "aScamin");
     glBindAttribLocation(g.prog_glyph, 5, "aPostRot");
     glLinkProgram(g.prog_glyph);
     g.gu_scale = glGetUniformLocation(g.prog_glyph, "uScale");
     g.gu_origin = glGetUniformLocation(g.prog_glyph, "uOrigin");
     g.gu_vp = glGetUniformLocation(g.prog_glyph, "uVp");
-    g.gu_zoom = glGetUniformLocation(g.prog_glyph, "uZoom");
+    g.gu_denom = glGetUniformLocation(g.prog_glyph, "uScaminDenom");
     g.gu_atlas = glGetUniformLocation(g.prog_glyph, "uAtlas");
     g.gu_rot = glGetUniformLocation(g.prog_glyph, "uRot");
 
@@ -996,27 +1003,27 @@ bool ChartRenderer::ensure_gl() {
     u_scale_ = g.u_scale;
     u_origin_ = g.u_origin;
     u_vp_ = g.u_vp;
-    u_zoom_ = g.u_zoom;
+    u_denom_ = g.u_denom;
     u_rot_ = g.u_rot;
     prog_sprite_ = g.prog_sprite;
     su_scale_ = g.su_scale;
     su_origin_ = g.su_origin;
     su_vp_ = g.su_vp;
-    su_zoom_ = g.su_zoom;
+    su_denom_ = g.su_denom;
     su_atlas_ = g.su_atlas;
     su_rot_ = g.su_rot;
     prog_pat_ = g.prog_pat;
     pu_scale_ = g.pu_scale;
     pu_origin_ = g.pu_origin;
     pu_vp_ = g.pu_vp;
-    pu_zoom_ = g.pu_zoom;
+    pu_denom_ = g.pu_denom;
     pu_atlas_ = g.pu_atlas;
     pu_rot_ = g.pu_rot;
     prog_glyph_ = g.prog_glyph;
     gu_scale_ = g.gu_scale;
     gu_origin_ = g.gu_origin;
     gu_vp_ = g.gu_vp;
-    gu_zoom_ = g.gu_zoom;
+    gu_denom_ = g.gu_denom;
     gu_atlas_ = g.gu_atlas;
     gu_rot_ = g.gu_rot;
     prog_blit_ = g.prog_blit;
@@ -1277,7 +1284,7 @@ void ChartRenderer::evict_lru(size_t cap) {
 // then draw the cached tile VBOs in paint order, each with its own per-tile origin
 // uniform. Layer indices: 0 area, 1 line, 2 symbol, 3 text, 4 sprite, 5 pattern,
 // 6 glyph. Batched by program (one program bind per layer, inner loop over tiles).
-void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, float cull_zoom,
+void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, float cull_denom,
                                  double vwx, double vwy, double scale_px, int z, uint32_t x0,
                                  uint32_t x1, uint32_t y0, uint32_t y1, int budget,
                                  int max_portray_ms, Rot rot) {
@@ -1384,12 +1391,12 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
     // Whether a vertex's local px offset turns with the chart is now PER-VERTEX (aPostRot),
     // because tile57 reports rotation-alignment per feature and one buffer mixes both kinds.
     auto layer = [&](const std::vector<const TileGeom*>& list, int prog, int u_scale, int u_vp,
-                     int u_zoom, int u_origin, int u_rot, int idx,
+                     int u_denom, int u_origin, int u_rot, int idx,
                      void (ChartRenderer::*drawfn)(uint32_t, uint32_t), uint32_t tex, int u_atlas) {
         glUseProgram(prog);
         glUniform1f(u_scale, (float)scale_px);
         glUniform2fv(u_vp, 1, vp);
-        glUniform1f(u_zoom, cull_zoom);
+        glUniform1f(u_denom, cull_denom);
         glUniform2fv(u_rot, 1, rv);
         if (tex) {
             glActiveTexture(GL_TEXTURE0);
@@ -1409,17 +1416,17 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
     auto draw_layers = [&](const std::vector<const TileGeom*>& list) {
         if (list.empty())
             return;
-        layer(list, prog_, u_scale_, u_vp_, u_zoom_, u_origin_, u_rot_, 0,
+        layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 0,
               &ChartRenderer::draw_range, 0, -1); // area
         if (g_atlas.ok)
-            layer(list, prog_pat_, pu_scale_, pu_vp_, pu_zoom_, pu_origin_, pu_rot_, 5,
+            layer(list, prog_pat_, pu_scale_, pu_vp_, pu_denom_, pu_origin_, pu_rot_, 5,
                   &ChartRenderer::draw_pat_range, g_atlas.tex, pu_atlas_); // pattern
-        layer(list, prog_, u_scale_, u_vp_, u_zoom_, u_origin_, u_rot_, 1,
+        layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 1,
               &ChartRenderer::draw_range, 0, -1); // line
-        layer(list, prog_, u_scale_, u_vp_, u_zoom_, u_origin_, u_rot_, 2,
+        layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 2,
               &ChartRenderer::draw_range, 0, -1); // symbol (tessellated)
         if (g_atlas.ok)
-            layer(list, prog_sprite_, su_scale_, su_vp_, su_zoom_, su_origin_, su_rot_, 4,
+            layer(list, prog_sprite_, su_scale_, su_vp_, su_denom_, su_origin_, su_rot_, 4,
                   &ChartRenderer::draw_sprite_range, g_atlas.tex, su_atlas_); // sprite
     };
     draw_layers(back_vis); // coarser fallback zoom underneath (only when target incomplete)
@@ -1460,7 +1467,7 @@ void ChartRenderer::portray_view_labels(double lon, double lat, double zoom, dou
 // per-tile origin math as render_tiled. When the cache was portrayed THIS frame lbl_ref_*
 // == the view centre, so the origin is just (w/2, h/2); when reused across a pan/zoom the
 // labels ride the view correctly.
-void ChartRenderer::draw_view_labels(double scale_px, float cull_zoom, uint32_t w, uint32_t h,
+void ChartRenderer::draw_view_labels(double scale_px, float cull_denom, uint32_t w, uint32_t h,
                                      double vwx, double vwy, Rot rot) {
     if (!n_vtext_ && !n_vglyph_)
         return;
@@ -1477,7 +1484,7 @@ void ChartRenderer::draw_view_labels(double scale_px, float cull_zoom, uint32_t 
         glUniform1f(u_scale_, (float)scale_px);
         glUniform2fv(u_origin_, 1, origin);
         glUniform2fv(u_vp_, 1, vp);
-        glUniform1f(u_zoom_, cull_zoom);
+        glUniform1f(u_denom_, cull_denom);
         glUniform2fv(u_rot_, 1, rv);
         draw_range(vbo_vtext_, n_vtext_);
     }
@@ -1486,7 +1493,7 @@ void ChartRenderer::draw_view_labels(double scale_px, float cull_zoom, uint32_t 
         glUniform1f(gu_scale_, (float)scale_px);
         glUniform2fv(gu_origin_, 1, origin);
         glUniform2fv(gu_vp_, 1, vp);
-        glUniform1f(gu_zoom_, cull_zoom);
+        glUniform1f(gu_denom_, cull_denom);
         glUniform2fv(gu_rot_, 1, rv);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_glyph.tex);
@@ -1508,7 +1515,7 @@ void ChartRenderer::draw_range(uint32_t vbo, uint32_t count) {
     glEnableVertexAttribArray(2);
     glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vtx), (void*)offsetof(Vtx, r));
     glEnableVertexAttribArray(3);
-    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)offsetof(Vtx, thresh));
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)offsetof(Vtx, scamin));
     glEnableVertexAttribArray(4);
     glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)offsetof(Vtx, postrot));
     glDrawArrays(GL_TRIANGLES, 0, (GLsizei)count);
@@ -1532,7 +1539,7 @@ void ChartRenderer::draw_pat_range(uint32_t vbo, uint32_t count) {
     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, tw));
     glEnableVertexAttribArray(3);
     glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(PatVtx),
-                          (void*)offsetof(PatVtx, thresh));
+                          (void*)offsetof(PatVtx, scamin));
     glDrawArrays(GL_TRIANGLES, 0, (GLsizei)count);
     glDisableVertexAttribArray(0);
     glDisableVertexAttribArray(1);
@@ -1556,7 +1563,7 @@ void ChartRenderer::draw_sprite_range(uint32_t vbo, uint32_t count) {
                           (void*)offsetof(SpriteVtx, u));
     glEnableVertexAttribArray(3);
     glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx),
-                          (void*)offsetof(SpriteVtx, thresh));
+                          (void*)offsetof(SpriteVtx, scamin));
     glEnableVertexAttribArray(4);
     glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx),
                           (void*)offsetof(SpriteVtx, postrot));
@@ -1586,7 +1593,7 @@ void ChartRenderer::draw_glyph_range(uint32_t vbo, uint32_t count) {
                           (void*)offsetof(GlyphVtx, r));
     glEnableVertexAttribArray(4);
     glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx),
-                          (void*)offsetof(GlyphVtx, thresh));
+                          (void*)offsetof(GlyphVtx, scamin));
     glEnableVertexAttribArray(5);
     glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx),
                           (void*)offsetof(GlyphVtx, postrot));
@@ -1609,7 +1616,8 @@ void ChartRenderer::rotated_half_extent(uint32_t w, uint32_t h, double scale_px,
 
 void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                            const tile57_mariner& m, Pass pass, bool stencil_clip,
-                           double device_scale, double cull_bias, double rotation) {
+                           double device_scale, double cull_bias, double rotation,
+                           double scamin_display_denom) {
     if (!chart_ || !ensure_gl())
         return;
     if (!have_range_) {
@@ -1659,10 +1667,18 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     // (a 2x HiDPI framebuffer gets 2x px per world unit; zoom — and the SCAMIN cull
     // below — stays geographic).
     double scale_px = 256.0 * std::pow(2.0, zoom) * device_scale; // px per world[0,1]
-    // SCAMIN cull zoom: symbols/text are enlarged (content scale on HiDPI), so pull the
-    // cull zoom DOWN by cull_bias — bigger symbols drop out that many mercator levels
-    // earlier, keeping decluttering while zoomed out.
-    float cull_zoom = (float)(zoom - cull_bias);
+    // The SCAMIN cull denominator: the host's real display scale (1:N), compared per vertex
+    // against the feature's own SCAMIN — hide when the display is SMALLER scale (zoomed out)
+    // than the feature allows, i.e. denom > SCAMIN. 0 disables the cull entirely (OpenCPN's
+    // "Use SCAMIN" off), since 0 can never exceed any SCAMIN.
+    //
+    // Symbols/text are drawn at true physical size (size_scale, incl. the HiDPI content
+    // scale) while SCAMIN is authored against unenlarged symbology, so enlarged symbology is
+    // dropped cull_bias mercator levels early to hold the intended on-screen density. A bias
+    // of B levels is a factor 2^B on the denominator (one zoom level = one doubling of 1:N).
+    float cull_denom = (float)(scamin_display_denom * std::pow(2.0, cull_bias));
+    if (scamin_display_denom <= 0.0)
+        cull_denom = 0.0f; // cull off — keep it exactly 0, don't let the bias resurrect it
 
     // When OpenCPN can't use FBOs it clips quilt patches with the STENCIL buffer and
     // passes b_use_stencil=true (arrives here as stencil_clip) on the base pass. Our
@@ -1762,7 +1778,7 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         int budget = moving ? 256 : 4096;
         int portray_ms = moving ? 8 : 30;
         if (wmaxx >= wminx && wmaxy >= wminy && (x1 - x0 + 1) * (y1 - y0 + 1) <= 4096)
-            render_tiled(w, h, m, cull_zoom, vwx, vwy, scale_px, z, (uint32_t)x0, (uint32_t)x1,
+            render_tiled(w, h, m, cull_denom, vwx, vwy, scale_px, z, (uint32_t)x0, (uint32_t)x1,
                          (uint32_t)y0, (uint32_t)y1, budget, portray_ms, rot);
     }
     // LABELS (text pass / unquilted): portray the whole view's text with a single
@@ -1810,14 +1826,14 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
             labels_pending_ =
                 true; // moved this frame — refresh once motion stops (ask for a redraw)
         }
-        // Draw labels at the TRUE zoom, NOT the biased cull_zoom. cull_bias
+        // Draw labels at the TRUE display denominator, NOT the biased cull_denom. cull_bias
         // (= log2(size_scale)) pulls the SCAMIN cull down to thin the un-declutterable
         // enlarged SYMBOLS; but text + soundings already self-declutter via the dep's
         // shared grid, so biasing them just hides labels ~log2(size_scale) levels early
         // — on a Retina display (size_scale ~3) that erased most labels, lights first
-        // (they carry a SCAMIN). At true zoom, S-52 SCAMIN governs label visibility and
-        // the declutter grid handles crowding.
-        draw_view_labels(scale_px, (float)zoom, w, h, vwx, vwy, rot);
+        // (they carry a SCAMIN). At the true display scale, S-52 SCAMIN governs label
+        // visibility and the declutter grid handles crowding.
+        draw_view_labels(scale_px, (float)scamin_display_denom, w, h, vwx, vwy, rot);
     }
 
     if (ss) {

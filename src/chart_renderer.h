@@ -13,7 +13,7 @@
 //   aPost   a screen-space px offset applied AFTER the world transform: 0 for
 //           areas, perp*halfwidth for lines, the local glyph/symbol px for
 //           anchored symbols & text (so those stay a constant screen size).
-//   aThresh SCAMIN cull: the vertex is dropped when the view zoom < aThresh.
+//   aScamin SCAMIN cull: the vertex is dropped when the view zoom < aScamin.
 #pragma once
 #include "tile57.h"
 #include <cstdint>
@@ -35,15 +35,19 @@ class ChartRenderer {
     // regardless of display density. w/h = the GL viewport (physical px). device_scale
     // = the framebuffer/logical px ratio (contentScale on HiDPI): the projection
     // scales by it so geometry fills the physical framebuffer while SCAMIN does not.
-    // cull_bias = zoom levels subtracted from the SCAMIN cull zoom: enlarged symbols
-    // (on HiDPI, or via TILE57_DECLUTTER) drop out that many mercator levels earlier.
+    // scamin_display_denom = the host's TRUE display scale denominator (OpenCPN's
+    // vp.chart_scale). Each feature's SCAMIN rides to the GPU as itself and is compared
+    // against this, exactly as native OpenCPN does — no zoom-threshold formula, so no
+    // equator assumption. 0 disables the cull ("Use SCAMIN" off).
+    // cull_bias = zoom levels of extra culling for enlarged symbology (HiDPI /
+    // TILE57_DECLUTTER); one level = one doubling of the denominator.
     // rotation = OpenCPN's ViewPort rotation in radians (course-up etc; 0 = north-up),
     // applied about the viewport centre on the GPU. It is a pure VIEW transform: the
     // portrayed geometry stays north-up in world space, so the tile + label caches
     // survive a turn untouched and rotating re-portrays nothing.
     void render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                 const tile57_mariner& m, Pass pass, bool stencil_clip, double device_scale = 1.0,
-                double cull_bias = 0.0, double rotation = 0.0);
+                double cull_bias = 0.0, double rotation = 0.0, double scamin_display_denom = 0.0);
     void shutdown();
     bool has_chart() const { return chart_ != nullptr; }
     // True when the last render deferred work that a follow-up redraw would finish:
@@ -68,23 +72,23 @@ class ChartRenderer {
     struct Vtx {
         float wx, wy, px, py;
         uint8_t r, g, b, a;
-        float thresh, postrot;
+        float scamin, postrot;
     };
     // Sprite vertex: world anchor + screen-px quad corner + atlas UV + SCAMIN.
     struct SpriteVtx {
-        float wx, wy, px, py, u, v, thresh, postrot;
+        float wx, wy, px, py, u, v, scamin, postrot;
     };
     // Pattern vertex: world position + atlas cell rect + tile screen px + SCAMIN.
     // (No postrot: a pattern has no local px offset — the fill lattice rides the chart.)
     struct PatVtx {
-        float wx, wy, u0, v0, u1, v1, tw, th, thresh;
+        float wx, wy, u0, v0, u1, v1, tw, th, scamin;
     };
     // Glyph vertex: world anchor + screen-px quad corner + SDF atlas UV + colour
     // + SCAMIN (text drawn as SDF quads from the glyph atlas).
     struct GlyphVtx {
         float wx, wy, px, py, u, v;
         uint8_t r, g, b, a;
-        float thresh, postrot;
+        float scamin, postrot;
     };
 
     // Geometry sinks the C surface callbacks append to (public for the
@@ -101,22 +105,22 @@ class ChartRenderer {
     double size_scale_ = 1.0;
     // Callback handlers (world/local geometry -> Vtx). `align` is tile57's per-feature
     // rotation-alignment; it becomes the vertex's postrot (see the note above).
-    void on_fill_area(const tile57_world_rings* r, tile57_rgba c, float thresh);
-    void on_stroke_line(const tile57_world_rings* l, float width_px, tile57_rgba c, float thresh);
+    void on_fill_area(const tile57_world_rings* r, tile57_rgba c, float scamin);
+    void on_stroke_line(const tile57_world_rings* l, float width_px, tile57_rgba c, float scamin);
     void on_draw_symbol(tile57_world_point anchor, const tile57_local_rings* r, tile57_rgba c,
-                        int even_odd, float stroke_w, tile57_rot_align align, float thresh);
+                        int even_odd, float stroke_w, tile57_rot_align align, float scamin);
     void on_draw_text(tile57_world_point anchor, const tile57_local_rings* g, tile57_rgba c,
-                      tile57_rgba halo, tile57_rot_align align, float thresh);
+                      tile57_rgba halo, tile57_rot_align align, float scamin);
     void on_draw_sprite(const char* name, size_t len, tile57_world_point anchor, float rot_deg,
-                        tile57_rot_align align, float half_w, float half_h, float thresh);
+                        tile57_rot_align align, float half_w, float half_h, float scamin);
     void on_draw_pattern(const char* name, size_t len, const tile57_world_rings* rings,
-                         float thresh);
+                         float scamin);
     // Lay out `text` from the SDF glyph atlas at (anchor + origin px), size in px, the whole
     // run turned by rot_deg about the anchor (a depth-contour value arrives with its
     // contour's tangent), appending one quad per glyph to glyph_.
     void on_draw_text_str(tile57_world_point anchor, float ox, float oy, const char* text,
                           size_t len, float size_px, float rot_deg, tile57_rot_align align,
-                          tile57_rgba color, tile57_rgba halo, float thresh);
+                          tile57_rgba color, tile57_rgba halo, float scamin);
 
     // ---- tiled path (MapLibre model): portray+tessellate each baked tile ONCE,
     // cache its GPU geometry, compose the view from cached tiles. This is the only
@@ -150,7 +154,7 @@ class ChartRenderer {
     static void rotated_half_extent(uint32_t w, uint32_t h, double scale_px, Rot rot,
                                     double& half_wx, double& half_wy, double slack = 0.0);
     // Tiled path helpers (chart_renderer.cpp).
-    void render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, float cull_zoom, double vwx,
+    void render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, float cull_denom, double vwx,
                       double vwy, double scale_px, int z, uint32_t x0, uint32_t x1, uint32_t y0,
                       uint32_t y1, int budget, int max_portray_ms, Rot rot);
     TileGeom& ensure_tile(int z, uint32_t x, uint32_t y, const tile57_mariner& m);
@@ -162,7 +166,7 @@ class ChartRenderer {
     // rotation: its geometry is cached and must stay north-up, per tile57_chart_tile_surface.)
     void portray_view_labels(double lon, double lat, double zoom, double rotation, uint32_t w,
                              uint32_t h, const tile57_mariner& m);
-    void draw_view_labels(double scale_px, float cull_zoom, uint32_t w, uint32_t h, double vwx,
+    void draw_view_labels(double scale_px, float cull_denom, uint32_t w, uint32_t h, double vwx,
                           double vwy, Rot rot);
     static uint64_t tile_key(int z, uint32_t x, uint32_t y) {
         return ((uint64_t)(z & 0x1f) << 58) | ((uint64_t)(x & 0x1fffffff) << 29) | (y & 0x1fffffff);
@@ -170,16 +174,16 @@ class ChartRenderer {
 
     tile57_chart* chart_ = nullptr;
     uint32_t prog_ = 0; // solid Vtx program (area/line/symbol/text tile layers)
-    int u_scale_ = -1, u_origin_ = -1, u_vp_ = -1, u_zoom_ = -1, u_rot_ = -1;
+    int u_scale_ = -1, u_origin_ = -1, u_vp_ = -1, u_denom_ = -1, u_rot_ = -1;
     // Sprite (textured point symbols) program.
     uint32_t prog_sprite_ = 0;
-    int su_scale_ = -1, su_origin_ = -1, su_vp_ = -1, su_zoom_ = -1, su_atlas_ = -1, su_rot_ = -1;
+    int su_scale_ = -1, su_origin_ = -1, su_vp_ = -1, su_denom_ = -1, su_atlas_ = -1, su_rot_ = -1;
     // Pattern (tiled-texture area fills) program.
     uint32_t prog_pat_ = 0;
-    int pu_scale_ = -1, pu_origin_ = -1, pu_vp_ = -1, pu_zoom_ = -1, pu_atlas_ = -1, pu_rot_ = -1;
+    int pu_scale_ = -1, pu_origin_ = -1, pu_vp_ = -1, pu_denom_ = -1, pu_atlas_ = -1, pu_rot_ = -1;
     // Glyph (SDF text) program.
     uint32_t prog_glyph_ = 0;
-    int gu_scale_ = -1, gu_origin_ = -1, gu_vp_ = -1, gu_zoom_ = -1, gu_atlas_ = -1, gu_rot_ = -1;
+    int gu_scale_ = -1, gu_origin_ = -1, gu_vp_ = -1, gu_denom_ = -1, gu_atlas_ = -1, gu_rot_ = -1;
     // Composite program + fullscreen quad: draw the resolved MSAA texture (a
     // shared multisampled FBO, see chart_renderer.cpp) over OpenCPN's FBO. MSAA
     // antialiases tessellated text/lines/area edges at ~1x fill cost.

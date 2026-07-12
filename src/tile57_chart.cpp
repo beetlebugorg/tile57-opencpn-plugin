@@ -655,17 +655,37 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     }();
     double cull_bias = declutter_override >= 0.0 ? declutter_override
                                                  : std::log2(std::max(1.0, mariner_.size_scale));
-    // TILE57_DEBUG: one line per zoom step exposing the HiDPI coupling — cull_zoom is what
-    // the SCAMIN shader test uses (show if cull_zoom >= feature threshold). gate = fbw vs
-    // pix_width*csf shows why device_scale resolves to 1 (physical-px ViewPort).
+
+    // The SCAMIN cull compares the host's REAL display scale denominator against each
+    // feature's SCAMIN — the same test native OpenCPN applies to its own ENCs:
+    //     if (vp_plib.chart_scale > rzRules->obj->Scamin) b_visible = false;  // s52plib.cpp
+    // vp.chart_scale IS that number (ChartCanvas: m_canvas_scale_factor / view_scale_ppm), so
+    // it already carries the display's true DPI and the view latitude. Deriving a denominator
+    // from the web-mercator zoom instead would assume the equator and drift by log2(cos lat)
+    // — about a third of a zoom level at latitude 39. Fall back to computing one only if the
+    // host hands us no scale at all.
+    //
+    // "Use SCAMIN" OFF (OpenCPN's toggle, mariner ignore_scamin) => 0, which culls nothing:
+    // the flag has to act HERE, because tile57 reports every feature's SCAMIN regardless of
+    // it (its surface path emits ungated and leaves the scale cull to the host), so left to
+    // itself the shader would go on culling and the toggle would do nothing at all.
+    double scamin_display_denom =
+        mariner_.ignore_scamin
+            ? 0.0
+            : (vp.chart_scale > 0 ? (double)vp.chart_scale : scale_denom(zoom, vp.clat));
+    // TILE57_DEBUG: one line per zoom step exposing the HiDPI coupling — scamin_denom is what
+    // the SCAMIN shader test uses (a feature hides when scamin_denom > its SCAMIN; 0 = cull
+    // off). gate = fbw vs pix_width*csf shows why device_scale resolves to 1.
     static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
     if (dbg && pass != t57::ChartRenderer::Pass::kText) {
         static double dbg_last = 1e9;
         if (std::fabs(zoom - dbg_last) > 0.02) {
             dbg_last = zoom;
-            wxLogMessage("tile57 DBG: zoom=%.3f cull_zoom=%.3f cull_bias=%.2f dev_scale=%.2f "
-                         "csf=%.2f pixW=%d fbW=%u gate(pixW*csf)=%ld size_scale=%.3f ppm=%.5f",
-                         zoom, zoom - cull_bias, cull_bias, device_scale, csf, vp.pix_width, fbw,
+            wxLogMessage("tile57 DBG: zoom=%.3f scamin_denom=1:%.0f (chart_scale=1:%.0f "
+                         "bias=%.2f) dev_scale=%.2f csf=%.2f pixW=%d fbW=%u gate(pixW*csf)=%ld "
+                         "size_scale=%.3f ppm=%.5f",
+                         zoom, scamin_display_denom * std::pow(2.0, cull_bias),
+                         (double)vp.chart_scale, cull_bias, device_scale, csf, vp.pix_width, fbw,
                          std::lround(vp.pix_width * csf), mariner_.size_scale, ppm);
         }
     }
@@ -699,7 +719,7 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
         }
     }
     renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip, device_scale,
-                     cull_bias, rot);
+                     cull_bias, rot, scamin_display_denom);
     // The tiled renderer portrays only a budget of new tiles per frame (so a big
     // first-visit burst doesn't freeze one frame). If it deferred some, schedule
     // another redraw so they fill in progressively.
