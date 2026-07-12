@@ -146,6 +146,11 @@ class ChartTile57 : public PlugInChartBaseExtended {
     uint64_t s52_msg_gen_ = 0;     // last "OpenCPN Config" message generation folded in
     double last_zoom_ = 0;         // last rendered view zoom, for the object-query pick
     double size_scale_csf_ = -1.0; // content-scale mariner_.size_scale was computed at
+    // The "ENC Text Scale" / "ENC Sounding factor" sliders, as their raw -5..+5 positions
+    // (0 = catalogue size). Seeded from the config file, kept live by the pushed S52 message;
+    // refresh_mariner turns them into multipliers. They scale text / soundings ALONE, which
+    // is why they cannot ride on size_scale (that moves symbols and line widths too).
+    int text_factor_ = 0, sounding_factor_ = 0;
 
     double center_lat_ = 0.0;
     double bounds_west_ = 0.0, bounds_south_ = 0.0, bounds_east_ = 0.0, bounds_north_ = 0.0;
