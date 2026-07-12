@@ -648,7 +648,17 @@ void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float 
     // ordinary label with 0. Turn the laid-out run about the anchor by it (same convention as
     // the sprite quad). The VIEW rotation is NOT folded in here: it is added per frame in the
     // shader for a MAP-aligned label, so the cached label buffer survives a turn.
-    const float rad = rot_deg * (float)kPi / 180.0f;
+    //
+    // TILE57_TEXTROT=-1 negates the angle. Both frames READ as y-down/clockwise — tile57's
+    // glyph metrics are stb-style (yoff negative above the baseline) and its own renderer
+    // turns outlines with this same matrix — so the two should agree; but contour labels come
+    // out leaning the MIRROR of their contour on screen. This switch settles which sense is
+    // real without a rebuild, instead of flipping a sign on a hunch.
+    static const float rot_sign = [] {
+        const char* e = std::getenv("TILE57_TEXTROT");
+        return (e && std::atof(e) < 0) ? -1.0f : 1.0f;
+    }();
+    const float rad = rot_sign * rot_deg * (float)kPi / 180.0f;
     const float rc = std::cos(rad), rs = std::sin(rad);
     const float postrot = (align == TILE57_ALIGN_MAP) ? 1.0f : 0.0f;
     float pen = 0;
