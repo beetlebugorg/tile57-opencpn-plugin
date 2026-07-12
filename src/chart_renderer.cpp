@@ -746,6 +746,19 @@ static void tr_pattern(void* c, const tile57_feature* f, const char* name, size_
 static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, float ox, float oy,
                         const char* text, size_t len, float size, float rot, tile57_rot_align align,
                         tile57_rgba col, tile57_rgba halo) {
+    // TILE57_DEBUG: what the engine actually hands us per label. A depth-contour value must
+    // arrive MAP-aligned with its contour's tangent; an ordinary label VIEWPORT + 0. If a
+    // contour label draws upright on screen, this line says whether the angle never arrived
+    // (engine/ABI) or arrived and we failed to apply it (this file). Capped — labels are many.
+    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
+    static int dbg_left = 40;
+    if (dbg && dbg_left > 0) {
+        --dbg_left;
+        wxLogMessage("tile57 TXT: cls=%-8s align=%-8s rot=%7.2f size=%.1f ox=%.1f oy=%.1f \"%.*s\"",
+                     (f && f->cls) ? f->cls : "?",
+                     align == TILE57_ALIGN_MAP ? "MAP" : "VIEWPORT", rot, size, ox, oy, (int)len,
+                     text);
+    }
     static_cast<ChartRenderer*>(c)->on_draw_text_str(a, ox, oy, text, len, size, rot, align, col,
                                                      halo, feat_scamin(c, f));
 }
