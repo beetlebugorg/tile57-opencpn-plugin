@@ -24,6 +24,10 @@ constexpr double kPi = 3.14159265358979323846;
 // A feature with no SCAMIN is never scale-culled: give it an effectively infinite one, so
 // the "display denominator > SCAMIN" test below can stay branchless.
 constexpr float kNeverCulled = 1e30f;
+// SUPER-SCAMIN (see ChartRenderer::feature_scamin): how far past its own compilation scale a
+// cell's SCAMIN-LESS detail may still draw. OpenCPN uses 2x (s52plib.cpp: SuperScamin =
+// chart_ref_scale * 2), so a 1:12,000 cell's ungated symbology dies at 1:24,000.
+constexpr double kSuperScaminUnderzoom = 2.0;
 
 void lonlat_to_world(double lon, double lat, double& wx, double& wy) {
     wx = (lon + 180.0) / 360.0;
@@ -629,39 +633,73 @@ void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float 
 }
 
 // ---- C surface trampolines (ctx == ChartRenderer*) -------------------------
-static float feat_scamin(const tile57_feature* f) { return scamin_denom(f ? f->scamin : 0); }
+// The scale denominator a feature is culled at — the ONE place the rule lives, so every
+// draw kind (area, line, symbol, sprite, pattern, text) gates identically.
+//
+// SUPER-SCAMIN. An ENC may leave SCAMIN off a feature entirely, and S-52 reads that as
+// "never scale-cull me". Honoured literally, a 1:12,000 harbour cell's SCAMIN-less buoys,
+// lights and soundings keep drawing however far you zoom out — at 1:1.5M the whole cell
+// lands on screen at once and the chart is a carpet of symbology. OpenCPN has the same
+// problem with the same ENCs and solves it by IMPUTING a SCAMIN from the cell's own
+// compilation scale (s52plib.cpp, m_bUseSUPER_SCAMIN):
+//
+//     if (obj->Scamin > 9e6)                      // i.e. undefined
+//         obj->SuperScamin = chart_ref_scale * 2;
+//     if (SuperScamin > 0 && vp_plib.chart_scale > obj->SuperScamin) b_visible = false;
+//
+// so a cell's ungated detail survives to 2x its compilation scale and no further. We do
+// the same, with the same factor.
+//
+// DISPLAY BASE is exempt — land areas, depth areas, the coastline: the skeleton that must
+// remain at every scale (OpenCPN spells this as an explicit class list, LNDARE/DEPARE/
+// COALNE/DRGARE/...; tile57 hands us the category directly, which is the same rule stated
+// once). SCAMIN never applies to it, imputed or authored.
+float ChartRenderer::feature_scamin(const tile57_feature* f) const {
+    if (!f)
+        return kNeverCulled;
+    if (f->disp_cat == TILE57_DISP_BASE)
+        return kNeverCulled; // the chart's skeleton: never scale-culled (tile57.h)
+    if (f->scamin > 0)
+        return (float)f->scamin; // the producer said so
+    if (!super_scamin_ || native_scale_ <= 0)
+        return kNeverCulled; // no imputation possible / turned off
+    return (float)(native_scale_ * kSuperScaminUnderzoom);
+}
+static float feat_scamin(void* c, const tile57_feature* f) {
+    return static_cast<ChartRenderer*>(c)->feature_scamin(f);
+}
 static void tr_fill(void* c, const tile57_feature* f, const tile57_world_rings* r, tile57_rgba col,
                     int) {
-    static_cast<ChartRenderer*>(c)->on_fill_area(r, col, feat_scamin(f));
+    static_cast<ChartRenderer*>(c)->on_fill_area(r, col, feat_scamin(c, f));
 }
 static void tr_stroke(void* c, const tile57_feature* f, const tile57_world_rings* l, float w, float,
                       float, tile57_rgba col) {
-    static_cast<ChartRenderer*>(c)->on_stroke_line(l, w, col, feat_scamin(f));
+    static_cast<ChartRenderer*>(c)->on_stroke_line(l, w, col, feat_scamin(c, f));
 }
 static void tr_symbol(void* c, const tile57_feature* f, tile57_world_point a,
                       const tile57_local_rings* r, tile57_rgba col, int eo, float sw,
                       tile57_rot_align align) {
-    static_cast<ChartRenderer*>(c)->on_draw_symbol(a, r, col, eo, sw, align, feat_scamin(f));
+    static_cast<ChartRenderer*>(c)->on_draw_symbol(a, r, col, eo, sw, align, feat_scamin(c, f));
 }
 static void tr_text(void* c, const tile57_feature* f, tile57_world_point a,
                     const tile57_local_rings* g, tile57_rgba col, tile57_rgba halo, float,
                     tile57_rot_align align) {
-    static_cast<ChartRenderer*>(c)->on_draw_text(a, g, col, halo, align, feat_scamin(f));
+    static_cast<ChartRenderer*>(c)->on_draw_text(a, g, col, halo, align, feat_scamin(c, f));
 }
 static void tr_sprite(void* c, const tile57_feature* f, const char* name, size_t len,
                       tile57_world_point a, float rot, tile57_rot_align align, float hw, float hh) {
     static_cast<ChartRenderer*>(c)->on_draw_sprite(name, len, a, rot, align, hw, hh,
-                                                   feat_scamin(f));
+                                                   feat_scamin(c, f));
 }
 static void tr_pattern(void* c, const tile57_feature* f, const char* name, size_t len,
                        const tile57_world_rings* rings) {
-    static_cast<ChartRenderer*>(c)->on_draw_pattern(name, len, rings, feat_scamin(f));
+    static_cast<ChartRenderer*>(c)->on_draw_pattern(name, len, rings, feat_scamin(c, f));
 }
 static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, float ox, float oy,
                         const char* text, size_t len, float size, float rot, tile57_rot_align align,
                         tile57_rgba col, tile57_rgba halo) {
     static_cast<ChartRenderer*>(c)->on_draw_text_str(a, ox, oy, text, len, size, rot, align, col,
-                                                     halo, feat_scamin(f));
+                                                     halo, feat_scamin(c, f));
 }
 
 // ---- chart / GL lifecycle --------------------------------------------------
@@ -1247,6 +1285,17 @@ ChartRenderer::TileGeom& ChartRenderer::ensure_tile(int z, uint32_t x, uint32_t 
         glBufferData(GL_ARRAY_BUFFER, src[i].bytes, src[i].data, GL_STATIC_DRAW);
     }
     return tiles_.emplace(key, t).first->second;
+}
+
+// The cell's compilation scale (1:N) + whether to impute SCAMIN from it. Both feed
+// feature_scamin, which runs at PORTRAY time and bakes the result into the vertex buffers —
+// so a change here invalidates every cached tile and the label cache with them.
+void ChartRenderer::set_super_scamin(bool on, double native_scale) {
+    if (on == super_scamin_ && native_scale == native_scale_)
+        return;
+    super_scamin_ = on;
+    native_scale_ = native_scale;
+    clear_tiles();
 }
 
 void ChartRenderer::clear_tiles() {

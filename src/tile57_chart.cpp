@@ -531,6 +531,22 @@ void ChartTile57::refresh_mariner() {
     // — which is exactly why this cannot be done on our side of the API.
     mariner_.text_size_scale = enc_text_scale(text_factor_);
     mariner_.sounding_size_scale = enc_sounding_scale(sounding_factor_);
+
+    // SUPER-SCAMIN: impute a SCAMIN for features this cell left ungated, from the cell's own
+    // compilation scale (ChartRenderer::feature_scamin explains why; s52plib does the same).
+    // It rides the host's "Use SCAMIN" switch — turning SCAMIN off must show EVERYTHING, and
+    // an imputed threshold is still a SCAMIN. TILE57_SUPERSCAMIN=0 disables it on its own,
+    // which is the A/B for "is the imputation what's hiding this feature".
+    //
+    // NOT wired to OpenCPN's own UseSUPER_SCAMIN flag, whose default is OFF (navutil.cpp
+    // reads it with default 0): the core can afford that because its quilt rarely puts a fine
+    // cell under a coarse view, while every tile57 chart IS one cell and lands under any view
+    // the quilt hands it. Defaulting to the core's OFF would just restore the carpet.
+    static const bool super_off = [] {
+        const char* e = std::getenv("TILE57_SUPERSCAMIN");
+        return e && std::atoi(e) == 0;
+    }();
+    renderer_.set_super_scamin(!super_off && !mariner_.ignore_scamin, (double)m_Chart_Scale);
 }
 
 void ChartTile57::draw_calibration() const {
@@ -845,11 +861,13 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
         if (std::fabs(zoom - dbg_last) > 0.02) {
             dbg_last = zoom;
             wxLogMessage("tile57 DBG: zoom=%.3f scamin_denom=1:%.0f (chart_scale=1:%.0f "
-                         "bias=%.2f) dev_scale=%.2f csf=%.2f pixW=%d fbW=%u gate(pixW*csf)=%ld "
-                         "size_scale=%.3f ppm=%.5f",
+                         "bias=%.2f) super_scamin=1:%.0f cell=1:%d dev_scale=%.2f csf=%.2f "
+                         "pixW=%d fbW=%u gate(pixW*csf)=%ld size_scale=%.3f ppm=%.5f",
                          zoom, scamin_display_denom * std::pow(2.0, cull_bias),
-                         (double)vp.chart_scale, cull_bias, device_scale, csf, vp.pix_width, fbw,
-                         std::lround(vp.pix_width * csf), mariner_.size_scale, ppm);
+                         (double)vp.chart_scale, cull_bias,
+                         mariner_.ignore_scamin ? 0.0 : m_Chart_Scale * 2.0, m_Chart_Scale,
+                         device_scale, csf, vp.pix_width, fbw, std::lround(vp.pix_width * csf),
+                         mariner_.size_scale, ppm);
         }
     }
     // Chart rotation (course-up / head-up, and the manual rotate control). OpenCPN does NOT

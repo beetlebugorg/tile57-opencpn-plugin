@@ -29,6 +29,13 @@ class ChartRenderer {
 
     bool open_chart(const std::string& pmtiles_path); // baked .pmtiles archive
     bool ensure_gl();
+    // SUPER-SCAMIN: impute a SCAMIN for features the ENC left ungated, from this cell's
+    // compilation scale (see feature_scamin). `native_scale` is the cell's 1:N denominator.
+    // Changing either clears the tile cache — the value is baked into the vertex buffers.
+    void set_super_scamin(bool on, double native_scale);
+    // The 1:N denominator this feature is culled at (authored SCAMIN, imputed super-SCAMIN,
+    // or "never"). Public because the C surface trampolines route every draw call through it.
+    float feature_scamin(const tile57_feature* f) const;
     // Portray (if needed) for this view, then draw into the current framebuffer.
     // lon/lat = view centre, zoom = the GEOGRAPHIC (chart-scale) web-mercator zoom —
     // used for tile detail + the SCAMIN cull, so those track the physical chart scale
@@ -104,6 +111,10 @@ class ChartRenderer {
     double decimate_eps_ = 0;
     // Display scale (mariner size_scale) — pattern tile screen size.
     double size_scale_ = 1.0;
+    // Super-SCAMIN state (see feature_scamin / set_super_scamin): the cell's compilation
+    // scale, and whether to impute a SCAMIN from it for features the ENC left ungated.
+    double native_scale_ = 0.0;
+    bool super_scamin_ = true;
     // Callback handlers (world/local geometry -> Vtx). `align` is tile57's per-feature
     // rotation-alignment; it becomes the vertex's postrot (see the note above).
     void on_fill_area(const tile57_world_rings* r, tile57_rgba c, float scamin);
