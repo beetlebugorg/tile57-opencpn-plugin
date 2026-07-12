@@ -667,6 +667,16 @@ bool ChartRenderer::get_info(tile57_info& out) const {
 // View rotation (course-up et al). uRot = (cos, sin) of the OpenCPN ViewPort rotation;
 // (1,0) is north-up. The world term is always rotated — that IS the chart turning.
 //
+// The 2x2 must match ViewPort::GetPixFromLL or the chart turns AGAINST the core's overlays
+// (ownship, routes, AIS). OpenCPN rotates in a y-UP frame and flips y only at the end:
+//     dxr = epix*cos + npix*sin;  dyr = npix*cos - epix*sin;   // npix = +NORTH
+//     screen = (w/2 + dxr, h/2 - dyr);                         // <- y flipped here
+// Our world is web-mercator y-DOWN, so npix = -uy, and that reduces to the STANDARD
+// rotation — NOT its transpose (which is what rotating naively in the y-down frame gives,
+// and which counter-rotates the chart):
+//     sx = ux*cos - uy*sin
+//     sy = ux*sin + uy*cos
+//
 // aPost is NOT: it is a screen-px offset, and whether it turns with the chart depends on
 // what it means (uPostRot selects, per draw):
 //   uPostRot=1  CHART-relative — a line's half-width normal, derived from the segment's
@@ -693,7 +703,7 @@ uniform float uZoom;
 uniform vec2 uRot;
 uniform float uPostRot;
 varying vec4 vCol;
-vec2 t57rot(vec2 p){ return vec2(p.x*uRot.x + p.y*uRot.y, -p.x*uRot.y + p.y*uRot.x); }
+vec2 t57rot(vec2 p){ return vec2(p.x*uRot.x - p.y*uRot.y, p.x*uRot.y + p.y*uRot.x); }
 void main(){
   if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); vCol = vec4(0.0); return; }
   vec2 screen = t57rot(aWorld*uScale) + uOrigin + mix(aPost, t57rot(aPost), uPostRot);
@@ -723,7 +733,7 @@ varying vec2 vUV;
 void main(){
   if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); vUV = vec2(0.0); return; }
   vec2 wp = aWorld*uScale;
-  vec2 screen = vec2(wp.x*uRot.x + wp.y*uRot.y, -wp.x*uRot.y + wp.y*uRot.x) + uOrigin + aPost;
+  vec2 screen = vec2(wp.x*uRot.x - wp.y*uRot.y, wp.x*uRot.y + wp.y*uRot.x) + uOrigin + aPost;
   vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
   gl_Position = vec4(ndc, 0.0, 1.0);
   vUV = aUV;
@@ -754,7 +764,7 @@ varying vec2 vWorldPx;
 void main(){
   if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); return; }
   vec2 wpx = aWorld*uScale;
-  vec2 screen = vec2(wpx.x*uRot.x + wpx.y*uRot.y, -wpx.x*uRot.y + wpx.y*uRot.x) + uOrigin;
+  vec2 screen = vec2(wpx.x*uRot.x - wpx.y*uRot.y, wpx.x*uRot.y + wpx.y*uRot.x) + uOrigin;
   vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
   gl_Position = vec4(ndc, 0.0, 1.0);
   // vWorldPx stays UNROTATED: the fill lattice is anchored in the CHART frame, so the
@@ -795,7 +805,7 @@ void main(){
   if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); vUV = vec2(0.0); vCol = vec4(0.0); return; }
   // Anchor turns with the chart; the glyph quad (aPost) does not — labels stay upright.
   vec2 wp = aWorld*uScale;
-  vec2 screen = vec2(wp.x*uRot.x + wp.y*uRot.y, -wp.x*uRot.y + wp.y*uRot.x) + uOrigin + aPost;
+  vec2 screen = vec2(wp.x*uRot.x - wp.y*uRot.y, wp.x*uRot.y + wp.y*uRot.x) + uOrigin + aPost;
   vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
   gl_Position = vec4(ndc, 0.0, 1.0);
   vUV = aUV; vCol = aColor;
@@ -1334,8 +1344,8 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
     // about the viewport centre: screen = R*(world) + [C + R*(ref - view)].
     auto set_origin = [&](int uloc, const TileGeom* t) {
         const double ox = (t->ref_wx - vwx) * scale_px, oy = (t->ref_wy - vwy) * scale_px;
-        float o[2] = {(float)(ox * rot.c + oy * rot.s + w * 0.5),
-                      (float)(-ox * rot.s + oy * rot.c + h * 0.5)};
+        float o[2] = {(float)(ox * rot.c - oy * rot.s + w * 0.5),
+                      (float)(ox * rot.s + oy * rot.c + h * 0.5)};
         glUniform2fv(uloc, 1, o);
     };
     // u_postrot: only the solid program declares uPostRot — pass -1 for the others (a
@@ -1428,8 +1438,8 @@ void ChartRenderer::draw_view_labels(double scale_px, float cull_zoom, uint32_t 
     // screen THROUGH the rotation, so the labels ride the turning chart. Their glyph quads
     // (aPost) are left unrotated by the shaders, so the text itself stays upright.
     const double ox = (lbl_ref_wx_ - vwx) * scale_px, oy = (lbl_ref_wy_ - vwy) * scale_px;
-    const float origin[2] = {(float)(ox * rot.c + oy * rot.s + w * 0.5),
-                             (float)(-ox * rot.s + oy * rot.c + h * 0.5)};
+    const float origin[2] = {(float)(ox * rot.c - oy * rot.s + w * 0.5),
+                             (float)(ox * rot.s + oy * rot.c + h * 0.5)};
     const float vp[2] = {(float)w, (float)h};
     const float rv[2] = {(float)rot.c, (float)rot.s};
     if (n_vtext_) { // tessellated fallback (usually empty)
@@ -1598,8 +1608,10 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     // pre-rotated on the CPU in set_origin). R is the view rotation about the viewport
     // centre, in the y-DOWN screen frame — the same 2x2 OpenCPN's ViewPort::GetPixFromLL
     // applies, so our geometry lands where the core's overlays (ownship, routes, AIS) do:
-    //   sx =  ux*cos + uy*sin
-    //   sy = -ux*sin + uy*cos
+    //   sx = ux*cos - uy*sin
+    //   sy = ux*sin + uy*cos
+    // (See the VS comment: OpenCPN rotates y-UP and flips y last, so this is the STANDARD
+    // matrix. Using its transpose here turned the chart the wrong way.)
     const Rot rot{std::cos(rotation), std::sin(rotation)};
     double vwx, vwy;
     lonlat_to_world(lon, lat, vwx, vwy);
