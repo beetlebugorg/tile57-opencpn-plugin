@@ -1,11 +1,25 @@
 // build_charts.h — "Build Charts" settings dialog + bake pipeline.
 //
-// A modeless wxDialog (surfaced via the plugin's ShowPreferencesDialog) that
-// lets the user pick an ENC source folder + a destination, then bakes every
-// .000 cell to dest/<stem>.pmtiles on a bounded worker pool. When the sweep
-// finishes it auto-registers the destination as a chart directory so the baked
-// charts appear. All OpenCPN API calls (AddChartDirectory/ForceChartDBUpdate)
+// A modeless wxDialog (surfaced via the plugin's ShowPreferencesDialog) that lets the
+// user pick an ENC source folder and an output folder, then hands the whole tree to
+// tile57_bake_tree: the engine walks the source for *.000, bakes each chart in
+// parallel to the SAME relative path under the output dir (ENC_ROOT/d1/US4CT1AA.000 ->
+// out/d1/US4CT1AA.pmtiles, plus a .sha sidecar), and skips any chart whose archive is
+// already newer than its input — so Build is an incremental resume by construction.
+// When the sweep finishes it registers the output dir as a chart directory so the
+// baked charts appear. All OpenCPN API calls (AddChartDirectory/ForceChartDBUpdate)
 // happen on the main thread from the progress timer — never a worker.
+//
+// Threading/lifetime: ONE coordinator std::thread makes the (blocking) bake_tree call;
+// the engine owns the worker pool inside it. tile57_bake_progress fires from those
+// engine threads, so the callback touches ONLY atomics, and returning false cancels
+// the bake. The main-thread timer polls those atomics for the gauge/status and, on
+// finished_, joins the coordinator and registers the destination. StopBake() sets
+// cancel_ (so the next progress tick aborts the bake), stops the timer, and joins the
+// coordinator; it's called on Cancel, dialog Close, and DeInit. That join is what
+// makes unload safe: libtile57 is linked INTO this plugin's shared object, so a bake
+// thread must never outlive the module OpenCPN is about to dlclose(). Cancellation is
+// at chart granularity, so the join returns within about one chart's bake time.
 #pragma once
 
 #include <wx/dialog.h>
@@ -13,17 +27,14 @@
 
 #include <atomic>
 #include <chrono>
-#include <deque>
-#include <mutex>
+#include <cstdint>
 #include <string>
 #include <thread>
-#include <vector>
 
 class wxDirPickerCtrl;
 class wxButton;
 class wxGauge;
 class wxStaticText;
-class wxChoice;
 
 class BuildChartsDialog : public wxDialog {
   public:
@@ -42,34 +53,45 @@ class BuildChartsDialog : public wxDialog {
     void OnTimer(wxTimerEvent&);
 
     void StartBuild(bool force); // shared by Build (resume) + Rebuild (force)
-    void StartWorkers(std::vector<std::string> cells);
-    void Finish(); // main-thread completion: register dir, reset UI
+    void Finish();               // main-thread completion: register dir, reset UI
     void SetRunningUI(bool running);
+
+    // The output dir the user picked, or the default cache path when the field is
+    // empty. Never empty.
+    std::string DestDir() const;
+
+    // tile57_bake_progress: called CONCURRENTLY from the engine's bake threads, so it
+    // may only touch atomics — no wx, no UI. Returns false to cancel the bake.
+    static bool ProgressTick(void* ctx, uint32_t done, uint32_t total);
 
     // --- widgets ---
     wxDirPickerCtrl* encPicker_ = nullptr;
+    wxDirPickerCtrl* outPicker_ = nullptr; // defaults to the XDG cache charts dir
     wxButton* buildBtn_ = nullptr;
-    wxButton* rebuildBtn_ = nullptr; // force re-bake (ignore existing outputs)
+    wxButton* rebuildBtn_ = nullptr; // force re-bake (delete existing archives first)
     wxButton* cancelBtn_ = nullptr;
     wxGauge* gauge_ = nullptr;
     wxStaticText* status_ = nullptr;
     wxStaticText* stats_ = nullptr; // elapsed / rate / ETA
     wxTimer timer_;
 
-    // --- bake state (shared with workers) ---
-    // done_ = cells processed (incl. skipped already-baked); baked_ = cells actually
-    // baked THIS run (drives the rate/ETA so a resume's instant skips don't skew it).
-    std::atomic<int> total_{0}, done_{0}, baked_{0}, failed_{0};
+    // --- bake state (shared with the engine's bake threads via ProgressTick) ---
+    // total_ is what the ENGINE reports: the charts it will bake THIS run (already-
+    // current archives are skipped before the first tick), so it is 0 until the first
+    // progress callback and is NOT the cell count of the whole tree.
+    std::atomic<uint32_t> total_{0}, done_{0};
     std::atomic<bool> cancel_{false}, running_{false}, finished_{false};
-    std::mutex status_mtx_;
-    std::string current_cell_;
+    // The engine's out_baked: charts that actually produced an archive this run.
+    std::atomic<uint32_t> baked_{0};
+    // Set when the bake_tree call itself failed; err_msg_ is written by the coordinator
+    // before it flips finished_, and read on the main thread after the join.
+    std::atomic<bool> failed_{false};
+    std::string err_msg_;
+    // Resolved output dir for the run in flight, and whether it was a forced Rebuild
+    // (archives deleted up front). Touched only on the main thread.
     std::string dest_;
-    std::atomic<bool> force_{false};                   // Rebuild: overwrite existing outputs
-    std::chrono::steady_clock::time_point start_time_; // set when a run begins
+    bool force_ = false;
+    std::chrono::steady_clock::time_point start_time_;
 
-    // Work queue + worker pool, driven by a single coordinator thread.
-    std::deque<std::string> queue_;
-    std::mutex queue_mtx_;
-    std::thread coordinator_;
-    std::vector<std::thread> workers_;
+    std::thread coordinator_; // makes the one blocking tile57_bake_tree call
 };

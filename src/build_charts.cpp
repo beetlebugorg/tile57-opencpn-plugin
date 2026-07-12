@@ -1,28 +1,16 @@
 // build_charts.cpp — see build_charts.h.
-//
-// Threading/lifetime: ONE coordinator std::thread launches N worker threads
-// (~hardware_concurrency, one bake per core — a single-chart bake is
-// single-threaded) that pull cell paths from a shared deque. The
-// coordinator joins all workers then flips finished_. The main-thread timer
-// polls the atomics for the gauge/status and, on finished_, joins the
-// coordinator, stops the timer, and (if not cancelled) registers the
-// destination — the only place OpenCPN API calls happen. StopBake() sets
-// cancel_, stops the timer (so it can't touch state mid-teardown) and joins the
-// coordinator; it's called on Cancel, dialog Close, and DeInit, guaranteeing
-// every thread is joined before this dialog (which owns the shared state) dies.
 #include "build_charts.h"
 
 #include "ocpn_plugin.h"
 #include "tile57.h"
-#include <cstdint>
 
 #include <wx/button.h>
-#include <wx/choice.h>
 #include <wx/fileconf.h>
 #include <wx/filename.h>
 #include <wx/filepicker.h>
 #include <wx/gauge.h>
 #include <wx/log.h>
+#include <wx/msgdlg.h>
 #include <wx/sizer.h>
 #include <wx/stattext.h>
 #include <wx/stdpaths.h>
@@ -32,7 +20,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
+#include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -49,35 +38,83 @@ wxString ConfigPath() {
     return wxFileName(wxStandardPaths::Get().GetUserConfigDir(), _T("tile57_pi.ini")).GetFullPath();
 }
 
-// Baked charts always land in a FIXED XDG-cache dir (no picker) — the plugin reads its
-// OWN *.pmtiles from here (never the raw .000), which is the whole "load tiles only" win.
-std::string FixedDest() {
+// Where baked charts land when the user hasn't chosen somewhere else: an XDG-cache dir
+// the plugin owns. The output dir is the plugin's OWN chart library — it reads its
+// *.pmtiles from here, never the raw .000 — so it defaults somewhere private and
+// disposable, but nothing depends on the location: tile57_bake_tree lets the caller own
+// the cache, so pointing it at an existing baked tree (one the tile57 CLI or another
+// host filled) works and simply skips everything already current.
+std::string DefaultDest() {
     const char* xdg = std::getenv("XDG_CACHE_HOME");
     const char* home = std::getenv("HOME");
     fs::path base = (xdg && *xdg) ? fs::path(xdg) : fs::path(home ? home : "/tmp") / ".cache";
     return (base / "tile57" / "charts").string();
 }
 
-void LoadPaths(wxString& enc) {
+void LoadPaths(wxString& enc, wxString& out) {
     wxFileConfig cfg(wxEmptyString, wxEmptyString, ConfigPath(), wxEmptyString,
                      wxCONFIG_USE_LOCAL_FILE);
     cfg.SetPath(_T("/tile57"));
     cfg.Read(_T("EncSource"), &enc, wxEmptyString);
+    cfg.Read(_T("OutputDir"), &out, wxEmptyString);
 }
 
-void SavePaths(const wxString& enc) {
+void SavePaths(const wxString& enc, const wxString& out) {
     wxFileConfig cfg(wxEmptyString, wxEmptyString, ConfigPath(), wxEmptyString,
                      wxCONFIG_USE_LOCAL_FILE);
     cfg.SetPath(_T("/tile57"));
     cfg.Write(_T("EncSource"), enc);
+    cfg.Write(_T("OutputDir"), out);
     cfg.Flush();
 }
 
-bool IsDotZeroZeroZero(const fs::path& p) {
-    std::string ext = p.extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
-    return ext == ".000";
+// The archives (and .sha sidecars) tile57_bake_tree writes. Rebuild All deletes exactly
+// these and nothing else: the output dir is now user-chosen, so it may hold files the
+// plugin didn't create and has no business removing.
+bool IsBakeOutput(const fs::path& p) {
+    const std::string s = p.filename().string();
+    auto ends_with = [&](const char* suf) {
+        const size_t n = std::char_traits<char>::length(suf);
+        return s.size() > n && s.compare(s.size() - n, n, suf) == 0;
+    };
+    return ends_with(".pmtiles") || ends_with(".pmtiles.sha");
+}
+
+// Does `dir` hold any S-57 base cell at all? tile57_bake_tree reports "baked 0" both for
+// a warm cache AND for a directory with nothing to bake, so without this an ENC folder
+// picked by mistake would come back as the cheerful "up to date". Stops at the first hit.
+bool HasEncCells(const std::string& dir) {
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(
+             dir, fs::directory_options::skip_permission_denied, ec);
+         it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        std::string ext = it->path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        if (ext == ".000" && it->is_regular_file(ec))
+            return true;
+    }
+    return false;
+}
+
+std::vector<fs::path> FindBakeOutputs(const std::string& dir) {
+    std::vector<fs::path> v;
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(
+             dir, fs::directory_options::skip_permission_denied, ec);
+         it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        if (it->is_regular_file(ec) && IsBakeOutput(it->path()))
+            v.push_back(it->path());
+    }
+    return v;
 }
 
 // Seconds -> "M:SS" (or "H:MM:SS" past an hour) for the timing readout.
@@ -93,7 +130,7 @@ wxString FmtDur(double secs) {
 } // namespace
 
 BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
-    : wxDialog(parent, wxID_ANY, _T("Build Charts — tile57"), wxDefaultPosition, wxSize(520, 260),
+    : wxDialog(parent, wxID_ANY, _T("Build Charts — tile57"), wxDefaultPosition, wxSize(520, 300),
                wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER) {
     wxLogMessage("tile57: BuildChartsDialog ctor begin");
     // ONE left/right margin for every row (labels AND inputs) so they align; all
@@ -115,9 +152,12 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     row(encPicker_);
 
     top->AddSpacer(16);
-    row(new wxStaticText(
-        this, wxID_ANY,
-        wxString::Format(_T("Output: %s"), wxString::FromUTF8(FixedDest().c_str()))));
+    label(_T("Output (baked charts):"));
+    // No wxDIRP_DIR_MUST_EXIST: the destination is created on demand, and the default
+    // cache dir legitimately doesn't exist until the first bake.
+    outPicker_ = new wxDirPickerCtrl(this, wxID_ANY, wxEmptyString, _T("Select output folder"),
+                                     wxDefaultPosition, wxDefaultSize, wxDIRP_USE_TEXTCTRL);
+    row(outPicker_);
 
     top->AddSpacer(24);
     gauge_ = new wxGauge(this, wxID_ANY, 100);
@@ -148,12 +188,19 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     SetSize(wxSize(600, GetSize().GetHeight())); // widen for readable paths
     SetMinSize(GetSize());
 
-    // Restore persisted settings.
+    // Restore persisted settings. The output field is left EMPTY when unset rather than
+    // pre-filled with the default: an empty field means "use the default", so the
+    // default can move (or the plugin can be reinstalled) without a stale path stuck in
+    // the ini. The placeholder below shows what empty resolves to.
     wxLogMessage("tile57: BuildChartsDialog loading config");
-    wxString enc;
-    LoadPaths(enc);
+    wxString enc, out;
+    LoadPaths(enc, out);
     if (!enc.IsEmpty())
         encPicker_->SetPath(enc);
+    if (!out.IsEmpty())
+        outPicker_->SetPath(out);
+    else
+        outPicker_->SetPath(wxString::FromUTF8(DefaultDest().c_str()));
 
     buildBtn_->Bind(wxEVT_BUTTON, &BuildChartsDialog::OnBuild, this);
     rebuildBtn_->Bind(wxEVT_BUTTON, &BuildChartsDialog::OnRebuild, this);
@@ -162,8 +209,6 @@ BuildChartsDialog::BuildChartsDialog(wxWindow* parent)
     Bind(wxEVT_CLOSE_WINDOW, &BuildChartsDialog::OnClose, this);
     timer_.SetOwner(this);
     Bind(wxEVT_TIMER, &BuildChartsDialog::OnTimer, this);
-    // Size in the log confirms which build is loaded: this (padded) build fits to ~600
-    // wide with a Rebuild All button; an older build reads ~560 or ~520 and no Rebuild.
     wxLogMessage("tile57: BuildChartsDialog ctor end, size=%dx%d", GetSize().GetWidth(),
                  GetSize().GetHeight());
 }
@@ -173,11 +218,29 @@ BuildChartsDialog::~BuildChartsDialog() { StopBake(); }
 void BuildChartsDialog::OnBuild(wxCommandEvent&) { StartBuild(false); }
 void BuildChartsDialog::OnRebuild(wxCommandEvent&) { StartBuild(true); }
 
+std::string BuildChartsDialog::DestDir() const {
+    const wxString p = outPicker_->GetPath();
+    if (p.IsEmpty())
+        return DefaultDest();
+    return std::string(p.mb_str());
+}
+
 void BuildChartsDialog::SetRunningUI(bool running) {
     buildBtn_->Enable(!running);
     rebuildBtn_->Enable(!running);
     cancelBtn_->Enable(running);
     encPicker_->Enable(!running);
+    outPicker_->Enable(!running);
+}
+
+// Engine bake thread — atomics only. Returning false cancels the bake (tile57 stops
+// picking up charts; the ones in flight finish), which is what lets StopBake() join
+// promptly instead of blocking for the whole tree.
+bool BuildChartsDialog::ProgressTick(void* ctx, uint32_t done, uint32_t total) {
+    auto* self = static_cast<BuildChartsDialog*>(ctx);
+    self->total_.store(total);
+    self->done_.store(done);
+    return !self->cancel_.load();
 }
 
 void BuildChartsDialog::StartBuild(bool force) {
@@ -185,182 +248,130 @@ void BuildChartsDialog::StartBuild(bool force) {
         return;
 
     const std::string enc = std::string(encPicker_->GetPath().mb_str());
-    const std::string dest = FixedDest(); // always the fixed XDG-cache charts dir
+    const std::string dest = DestDir();
 
     std::error_code ec;
     if (enc.empty() || !fs::is_directory(enc, ec)) {
         status_->SetLabel(_T("ENC source folder does not exist"));
         return;
     }
+    if (!HasEncCells(enc)) {
+        status_->SetLabel(_T("No .000 cells found under the ENC source folder"));
+        return;
+    }
     fs::create_directories(dest, ec);
     if (ec || !fs::is_directory(dest, ec)) {
-        status_->SetLabel(_T("Cannot create the output cache folder"));
+        status_->SetLabel(_T("Cannot create the output folder"));
         return;
     }
 
-    SavePaths(encPicker_->GetPath());
-
-    // Enumerate .000 cells (case-insensitive) recursively under enc.
-    std::vector<std::string> cells;
-    for (auto it = fs::recursive_directory_iterator(
-             enc, fs::directory_options::skip_permission_denied, ec);
-         it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (ec) {
-            ec.clear();
-            continue;
+    // Rebuild All: tile57_bake_tree is incremental by construction (it skips any archive
+    // already newer than its chart), so forcing a re-bake means removing what's there.
+    // The output dir is user-chosen, so confirm first and delete only our own outputs.
+    if (force) {
+        const std::vector<fs::path> outs = FindBakeOutputs(dest);
+        if (!outs.empty()) {
+            const wxString q =
+                wxString::Format(_T("Rebuild All deletes %d baked file(s) under\n\n%s\n\n"
+                                    "and bakes every chart again. Continue?"),
+                                 (int)outs.size(), wxString::FromUTF8(dest.c_str()));
+            if (wxMessageBox(q, _T("Rebuild All — tile57"),
+                             wxYES_NO | wxNO_DEFAULT | wxICON_WARNING, this) != wxYES)
+                return;
+            // A file we fail to delete stays newer than its chart, so the engine would
+            // skip it and "Rebuild All" would quietly not rebuild it. Say so instead.
+            int undeleted = 0;
+            for (const auto& p : outs) {
+                std::error_code rm;
+                fs::remove(p, rm);
+                if (rm)
+                    ++undeleted;
+            }
+            if (undeleted > 0) {
+                status_->SetLabel(wxString::Format(
+                    _T("Could not delete %d baked file(s) — they will not be rebuilt"), undeleted));
+                return;
+            }
         }
-        if (it->is_regular_file(ec) && IsDotZeroZeroZero(it->path()))
-            cells.push_back(it->path().string());
     }
 
-    if (cells.empty()) {
-        status_->SetLabel(_T("No .000 cells found"));
-        return;
-    }
+    SavePaths(encPicker_->GetPath(), outPicker_->GetPath());
 
-    // Arm shared state, flip the UI to "running", and hand the work off.
+    // Arm shared state, flip the UI to "running", and hand the whole tree to the engine.
     dest_ = dest;
-    force_.store(force);
-    total_.store((int)cells.size());
+    force_ = force;
+    total_.store(0);
     done_.store(0);
     baked_.store(0);
-    failed_.store(0);
     cancel_.store(false);
     finished_.store(false);
+    failed_.store(false);
+    err_msg_.clear();
     running_.store(true);
     start_time_ = std::chrono::steady_clock::now();
-    {
-        std::lock_guard<std::mutex> lk(status_mtx_);
-        current_cell_.clear();
-    }
-    gauge_->SetRange((int)cells.size());
     gauge_->SetValue(0);
     SetRunningUI(true);
-    status_->SetLabel(force ? wxString::Format(_T("Rebuilding %d cells…"), (int)cells.size())
-                            : wxString::Format(_T("Baking %d cells…"), (int)cells.size()));
+    // The chart count isn't known until the engine has walked the tree and applied the
+    // incremental skip, so the first tick is what fills it in.
+    status_->SetLabel(force ? _T("Rebuilding — scanning…") : _T("Scanning…"));
     stats_->SetLabel(wxEmptyString);
 
-    StartWorkers(std::move(cells));
+    coordinator_ = std::thread([this, enc, dest]() {
+        // workers is a MEMORY bound, not a core count: each concurrent bake holds a
+        // whole chart's parse+portray+raster working set. One per core (less the UI
+        // thread), capped at 8.
+        const unsigned hw = std::thread::hardware_concurrency();
+        const uint32_t workers = hw > 1 ? std::min(8u, hw - 1) : 1u;
+
+        uint32_t baked = 0;
+        tile57_error err{};
+        const tile57_status st =
+            tile57_bake_tree(enc.c_str(), dest.c_str(), workers, &BuildChartsDialog::ProgressTick,
+                             this, &baked, &err);
+        baked_.store(baked);
+        if (st != TILE57_OK) {
+            failed_.store(true);
+            err_msg_ = err.message[0] ? err.message : tile57_status_str(st);
+        }
+        finished_.store(true); // the timer joins us
+    });
     timer_.Start(kTimerMs);
 }
 
-void BuildChartsDialog::StartWorkers(std::vector<std::string> cells) {
-    {
-        std::lock_guard<std::mutex> lk(queue_mtx_);
-        queue_.assign(cells.begin(), cells.end());
-    }
-
-    coordinator_ = std::thread([this]() {
-        // A single-chart bake (tile57_bake_chart_bytes) is SINGLE-THREADED — the
-        // engine's parallel unit is the chart, so one core per bake. The outer
-        // pool is therefore what uses the machine: one worker per core (less one
-        // for the UI/coordinator), capped at 8 as a memory bound (each concurrent
-        // bake holds a whole chart's parse+portray+raster working set).
-        unsigned hw = std::thread::hardware_concurrency();
-        unsigned n = hw > 1 ? std::min(8u, hw - 1) : 1;
-
-        auto worker = [this]() {
-            for (;;) {
-                if (cancel_.load())
-                    break;
-                std::string path;
-                {
-                    std::lock_guard<std::mutex> lk(queue_mtx_);
-                    if (queue_.empty())
-                        break;
-                    path = std::move(queue_.front());
-                    queue_.pop_front();
-                }
-
-                fs::path in(path);
-                const fs::path out = fs::path(dest_) / (in.stem().string() + ".pmtiles");
-
-                std::error_code ec;
-                if (!force_.load() && fs::exists(out, ec)) { // idempotent resume (Build)
-                    {
-                        std::lock_guard<std::mutex> lk(status_mtx_);
-                        current_cell_ = in.stem().string();
-                    }
-                    done_.fetch_add(1);
-                    continue;
-                }
-
-                {
-                    std::lock_guard<std::mutex> lk(status_mtx_);
-                    current_cell_ = in.stem().string();
-                }
-
-                // The engine bakes the chart's native band zoom range (v0.3 owns
-                // the zoom cap the plugin used to compute per cell).
-                uint8_t* bytes = nullptr;
-                size_t len = 0;
-                if (tile57_bake_chart_bytes(path.c_str(), &bytes, &len, nullptr) == TILE57_OK &&
-                    bytes) {
-                    const fs::path tmp = out.string() + ".tmp";
-                    {
-                        std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
-                        ofs.write(reinterpret_cast<const char*>(bytes), (std::streamsize)len);
-                    }
-                    tile57_free(bytes);
-                    fs::rename(tmp, out, ec);
-                    if (ec) {
-                        fs::remove(tmp, ec);
-                        failed_.fetch_add(1);
-                    }
-                } else {
-                    if (bytes)
-                        tile57_free(bytes);
-                    failed_.fetch_add(1);
-                }
-                baked_.fetch_add(1); // actually baked this run (drives the rate)
-                done_.fetch_add(1);
-            }
-        };
-
-        workers_.reserve(n);
-        for (unsigned i = 0; i < n; ++i)
-            workers_.emplace_back(worker);
-        for (auto& t : workers_)
-            t.join();
-        workers_.clear();
-        finished_.store(true);
-    });
-}
-
 void BuildChartsDialog::OnTimer(wxTimerEvent&) {
-    const int total = total_.load();
-    const int done = done_.load();
-    gauge_->SetRange(std::max(1, total));
-    gauge_->SetValue(std::min(done, total));
+    const uint32_t total = total_.load();
+    const uint32_t done = done_.load();
 
     if (finished_.load()) {
         Finish();
         return;
     }
 
-    std::string cur;
-    {
-        std::lock_guard<std::mutex> lk(status_mtx_);
-        cur = current_cell_;
+    // total is 0 until the engine's first tick — it walks the tree and skips the
+    // already-current archives before it bakes anything, and on a big tree that takes a
+    // moment. Pulse rather than show a bogus 0/0 bar.
+    if (total == 0) {
+        gauge_->Pulse();
+        return;
     }
-    status_->SetLabel(wxString::Format(_T("%s %s (%d/%d)…"),
-                                       force_.load() ? _T("Rebuilding") : _T("Baking"),
-                                       wxString::FromUTF8(cur.c_str()), done, total));
+    gauge_->SetRange((int)total);
+    gauge_->SetValue((int)std::min(done, total));
+    status_->SetLabel(
+        wxString::Format(_T("%s… (%u/%u)"), force_ ? _T("Rebuilding") : _T("Baking"), done, total));
 
-    // Rate/ETA count ONLY cells actually baked this run (baked_), not the instant skips
-    // of a resume — otherwise hundreds of near-zero-time skips inflate cells/s wildly.
-    const int baked = baked_.load();
+    // Every tick is a chart actually baked this run (the engine skips current archives
+    // BEFORE the first tick, so they never inflate the rate).
     const double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time_).count();
-    const double rate = (baked > 0 && elapsed > 0.3) ? baked / elapsed : 0.0; // baked/s
+    const double rate = (done > 0 && elapsed > 0.3) ? done / elapsed : 0.0; // charts/s
     const double eta = rate > 1e-6 ? (total - done) / rate : -1.0;
-    stats_->SetLabel(wxString::Format(_T("elapsed %s   ·   %.1f cells/s   ·   ETA %s"),
+    stats_->SetLabel(wxString::Format(_T("elapsed %s   ·   %.1f charts/s   ·   ETA %s"),
                                       FmtDur(elapsed), rate, FmtDur(eta)));
 }
 
 void BuildChartsDialog::Finish() {
-    // Timer is still on the main thread; stop it before joining so it can't
-    // re-enter while the coordinator winds down.
+    // Timer is still on the main thread; stop it before joining so it can't re-enter
+    // while the coordinator winds down.
     timer_.Stop();
     if (coordinator_.joinable())
         coordinator_.join();
@@ -368,52 +379,63 @@ void BuildChartsDialog::Finish() {
     running_.store(false);
     SetRunningUI(false);
 
-    const int total = total_.load();
-    const int failed = failed_.load();
-    const int done = done_.load();
-    const int baked = baked_.load();
+    const uint32_t total = total_.load();
+    const uint32_t done = done_.load();
+    const uint32_t baked = baked_.load();
     const double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time_).count();
     const double rate = (baked > 0 && elapsed > 0.1) ? baked / elapsed : 0.0;
-    if (cancel_.load()) {
-        status_->SetLabel(_T("Cancelled"));
-        stats_->SetLabel(
-            wxString::Format(_T("stopped after %s · %d/%d cells"), FmtDur(elapsed), done, total));
+    gauge_->SetRange((int)std::max(1u, total));
+    gauge_->SetValue((int)std::min(done, total));
+
+    if (failed_.load()) {
+        status_->SetLabel(_T("Bake failed"));
+        stats_->SetLabel(wxString::FromUTF8(err_msg_.c_str()));
         return;
     }
 
-    // Main thread: register the fixed cache dir as a chart directory and rescan.
-    wxString destWx = wxString::FromUTF8(dest_.c_str());
+    if (cancel_.load()) {
+        // Cancelling is not a failure: every archive the engine finished is complete, so
+        // Build picks up from here (it re-skips them).
+        status_->SetLabel(_T("Cancelled"));
+        stats_->SetLabel(wxString::Format(
+            _T("stopped after %s · %u chart(s) baked — Build resumes"), FmtDur(elapsed), baked));
+        return;
+    }
+
+    // A warm cache ticks nothing at all: the engine skipped every chart, so there was
+    // never a first progress callback. That's success, not an empty run.
+    if (total == 0) {
+        status_->SetLabel(_T("Up to date — nothing to bake"));
+        stats_->SetLabel(wxString::Format(_T("every chart under %s is current"),
+                                          wxString::FromUTF8(dest_.c_str())));
+    } else {
+        const uint32_t failed = done > baked ? done - baked : 0;
+        wxString msg = wxString::Format(_T("Done — %u chart(s) baked"), baked);
+        if (failed > 0)
+            msg += wxString::Format(_T(" (%u failed)"), failed);
+        status_->SetLabel(msg);
+        stats_->SetLabel(wxString::Format(_T("baked %u in %s   ·   %.1f charts/s avg"), baked,
+                                          FmtDur(elapsed), rate));
+    }
+
+    // Main thread only: register the output dir as a chart directory and rescan. Done
+    // even on a warm cache — the user may be pointing OpenCPN at an already-baked tree,
+    // which is exactly the case a fixed cache path used to make impossible.
+    wxString destWx = wxString::FromUTF8(dest_.c_str()); // AddChartDirectory takes wxString&
     AddChartDirectory(destWx);
     ForceChartDBUpdate();
-
-    const int added = total - failed;
-    wxString msg = wxString::Format(_T("Done — %d charts"), added);
-    if (failed > 0)
-        msg += wxString::Format(_T(" (%d failed)"), failed);
-    status_->SetLabel(msg);
-    const int skipped = total - baked;
-    wxString st = wxString::Format(_T("baked %d cells in %s   ·   %.1f cells/s avg"),
-                                   baked - failed, FmtDur(elapsed), rate);
-    if (skipped > 0)
-        st += wxString::Format(_T("   ·   %d already cached"), skipped);
-    stats_->SetLabel(st);
 }
 
 void BuildChartsDialog::OnCancel(wxCommandEvent&) {
     if (!running_.load())
         return;
+    // Cancelling is not instant — the charts already in flight still have to finish — so
+    // say so and paint it before StopBake() blocks on the join.
     status_->SetLabel(_T("Cancelling…"));
+    Update();
     StopBake();
-    // StopBake joins everything; reflect the cancelled end-state now.
-    running_.store(false);
-    SetRunningUI(false);
-    gauge_->SetValue(done_.load());
-    const double elapsed =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time_).count();
-    status_->SetLabel(_T("Cancelled"));
-    stats_->SetLabel(wxString::Format(_T("stopped after %s · %d/%d cells"), FmtDur(elapsed),
-                                      done_.load(), total_.load()));
+    Finish();
 }
 
 void BuildChartsDialog::OnClose(wxCloseEvent& e) {
@@ -425,9 +447,12 @@ void BuildChartsDialog::OnClose(wxCloseEvent& e) {
 }
 
 void BuildChartsDialog::StopBake() {
-    timer_.Stop(); // never let the timer touch state mid-teardown
+    // Never let the timer touch state mid-teardown.
+    timer_.Stop();
+    // The engine's next progress tick reads this, returns false, and unwinds the bake —
+    // so the join below returns in about one chart's bake time, not one tree's.
     cancel_.store(true);
     if (coordinator_.joinable())
-        coordinator_.join(); // joins workers, then returns
+        coordinator_.join();
     running_.store(false);
 }

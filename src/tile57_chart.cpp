@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -66,6 +67,18 @@ constexpr double kPxPerMetre = 96.0 / 0.0254;
 
 // Live registry of open charts, so the plugin's mouse handler can find the ones
 // covering the cursor to query them.
+//
+// MUST be locked. OpenCPN builds the chart database on a THREAD POOL for plugins at
+// API 118+ (it only defers chart tickets to the main thread for older plugins, which it
+// assumes aren't thread-safe), so adding a chart directory constructs many ChartTile57
+// concurrently — an unsynchronised push_back here corrupted the vector mid-scan. The
+// mouse handler then reads the registry from the main thread while that scan is still
+// running, so instances() hands back a SNAPSHOT rather than a reference into a vector a
+// scan thread may be reallocating.
+std::mutex& registry_mtx() {
+    static std::mutex m;
+    return m;
+}
 std::vector<ChartTile57*>& chart_registry() {
     static std::vector<ChartTile57*> v;
     return v;
@@ -106,12 +119,18 @@ ChartTile57::ChartTile57() {
     // Placeholder — csf reads 1 here (canvas not yet realized); render_pass recomputes
     // it once the real content-scale is known.
     mariner_.size_scale = display_size_scale(OCPN_GetDisplayContentScaleFactor());
-    chart_registry().push_back(this);
+    {
+        std::lock_guard<std::mutex> lk(registry_mtx());
+        chart_registry().push_back(this);
+    }
 }
 
 ChartTile57::~ChartTile57() {
-    auto& reg = chart_registry();
-    reg.erase(std::remove(reg.begin(), reg.end(), this), reg.end());
+    {
+        std::lock_guard<std::mutex> lk(registry_mtx());
+        auto& reg = chart_registry();
+        reg.erase(std::remove(reg.begin(), reg.end(), this), reg.end());
+    }
     renderer_.shutdown();
 }
 
@@ -584,7 +603,10 @@ wxString build_query_html(const std::vector<QueryHit>& hits) {
 }
 } // namespace
 
-const std::vector<ChartTile57*>& ChartTile57::instances() { return chart_registry(); }
+std::vector<ChartTile57*> ChartTile57::instances() {
+    std::lock_guard<std::mutex> lk(registry_mtx());
+    return chart_registry(); // a snapshot — the DB scan may be adding charts right now
+}
 
 wxString ChartTile57::QueryDescription(double lon, double lat) const {
     tile57_chart* ch = renderer_.chart_handle();

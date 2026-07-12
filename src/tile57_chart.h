@@ -95,7 +95,9 @@ class ChartTile57 : public PlugInChartBaseExtended {
     // instances() is the live registry of open charts.
     wxString QueryDescription(double lon, double lat) const;
     bool covers(double lon, double lat) const;
-    static const std::vector<ChartTile57*>& instances();
+    // A snapshot, by value: OpenCPN constructs plugin charts on a thread pool during the
+    // chart-DB scan, so the registry can be growing while the caller iterates.
+    static std::vector<ChartTile57*> instances();
 
   private:
     // Extract bbox / native scale / M_COVR coverage from an open chart handle into
