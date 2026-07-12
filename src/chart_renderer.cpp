@@ -38,11 +38,20 @@ float scamin_threshold(int64_t scamin) {
 }
 uint64_t mariner_hash(const tile57_mariner& m) {
     uint64_t h = 1469598103934665603ull;
-    const uint8_t* b = reinterpret_cast<const uint8_t*>(&m);
-    for (size_t i = 0; i < sizeof(m); ++i) {
-        h ^= b[i];
-        h *= 1099511628211ull;
-    }
+    auto mix = [&h](const void* p, size_t n) {
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(p);
+        for (size_t i = 0; i < n; ++i) {
+            h ^= b[i];
+            h *= 1099511628211ull;
+        }
+    };
+    mix(&m, sizeof(m));
+    // viewing_groups_off is a POINTER in the struct, so the bytes above hash the address,
+    // not the groups. Hash what it points AT as well — otherwise swapping one denied
+    // group for another (same buffer, same length) leaves the hash unchanged and the tile
+    // cache would keep serving geometry portrayed under the old settings.
+    if (m.viewing_groups_off && m.viewing_groups_off_len)
+        mix(m.viewing_groups_off, m.viewing_groups_off_len * sizeof(int32_t));
     return h;
 }
 } // namespace

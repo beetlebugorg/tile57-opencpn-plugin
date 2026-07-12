@@ -14,9 +14,9 @@
 #include <wx/html/htmlwin.h>
 #include <wx/wx.h>
 
-class Tile57Plugin : public opencpn_plugin_118 {
+class Tile57Plugin : public opencpn_plugin_119 {
   public:
-    explicit Tile57Plugin(void* pmgr) : opencpn_plugin_118(pmgr) {}
+    explicit Tile57Plugin(void* pmgr) : opencpn_plugin_119(pmgr) {}
 
     int Init() override {
         wxLogMessage("tile57_pi: initialised [build " __DATE__ " " __TIME__ ", TILE57_DEBUG=%s]",
@@ -26,7 +26,17 @@ class Tile57Plugin : public opencpn_plugin_118 {
         // ChartTile57 and the GL thread first renders.
         tile57_warmup();
         return INSTALLS_PLUGIN_CHART | INSTALLS_PLUGIN_CHART_GL | WANTS_MOUSE_EVENTS |
-               WANTS_CURSOR_LATLON | WANTS_PREFERENCES; // the "Build Charts" settings panel
+               WANTS_CURSOR_LATLON | WANTS_PREFERENCES | // the "Build Charts" settings panel
+               WANTS_PLUGIN_MESSAGING;                   // the "OpenCPN Config" S52 state push
+    }
+
+    // OpenCPN broadcasts its live S52PLIB configuration as a JSON message whenever the
+    // S52 state is reconfigured. It is the only channel that carries some of the mariner
+    // settings — notably the per-canvas data-quality toggle, which the canvas pushes
+    // straight into the s52plib and never writes to the config object a plugin can read.
+    void SetPluginMessage(wxString& message_id, wxString& message_body) override {
+        if (message_id == _T("OpenCPN Config"))
+            ChartTile57::ApplyS52ConfigMessage(message_body);
     }
     bool DeInit() override {
         if (query_dlg_) {
@@ -58,7 +68,10 @@ class Tile57Plugin : public opencpn_plugin_118 {
     }
 
     int GetAPIVersionMajor() override { return 1; }
-    int GetAPIVersionMinor() override { return 18; }
+    // 1.19, not 1.18: only 1.19+ exposes the per-canvas ENC display state (text,
+    // soundings, lights, light descriptions, display category) that the chart mirrors
+    // into tile57's mariner settings. See CMakeLists.
+    int GetAPIVersionMinor() override { return 19; }
     int GetPlugInVersionMajor() override { return 0; }
     int GetPlugInVersionMinor() override { return 1; }
     wxBitmap* GetPlugInBitmap() override {

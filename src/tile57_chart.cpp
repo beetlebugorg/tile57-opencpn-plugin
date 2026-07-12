@@ -13,7 +13,19 @@
 #include <wx/fileconf.h>
 #include <wx/filename.h>
 #include <wx/image.h>
+#include <wx/jsonreader.h>
+#include <wx/jsonval.h>
 #include <wx/log.h>
+
+// OpenCPN 5.12 DECLARES GetEnableLightDescriptionsDisplay in the 1.19 API header but does
+// NOT export it from the executable — the setter (EnableLightDescriptionsDisplay) is
+// exported, the getter is not. Calling it normally would leave the plugin with a symbol
+// the host cannot resolve. Declare it weak: on a host that lacks it the address is null
+// and we fall back to the config file, and on one that has it we get the live value.
+#if defined(__GNUC__) || defined(__clang__)
+extern DECL_EXP bool GetEnableLightDescriptionsDisplay(int CanvasIndex) __attribute__((weak));
+#define TILE57_WEAK_LIGHTDESC 1
+#endif
 
 // wxWidgets can create ChartTile57 by class name; OpenCPN uses this to
 // instantiate the chart for each matching file it finds in a chart directory.
@@ -82,6 +94,31 @@ std::mutex& registry_mtx() {
 std::vector<ChartTile57*>& chart_registry() {
     static std::vector<ChartTile57*> v;
     return v;
+}
+
+// S-52 §14.5 viewing group for light (LIGHTS) in the S-101 portrayal catalogue. OpenCPN's
+// "Show Lights" has no tile57_mariner field of its own — lights are a viewing group, so
+// switching them off means denying this group.
+constexpr int32_t kVGLights = 27070;
+
+// The S52 settings OpenCPN pushes as the "OpenCPN Config" message. Written on the main
+// thread from SetPluginMessage, read on the main thread during render; the mutex is
+// belt-and-braces (OpenCPN constructs plugin charts on a scan thread pool, so a chart's
+// first refresh can race a message). `gen` bumps per message so a chart knows to re-fold
+// it in. `have` stays false until the first message: until then the config file (which
+// OpenCPN DOES refresh from the Options dialog) is the fallback.
+struct S52Config {
+    std::mutex mtx;
+    uint64_t gen = 0;
+    bool have = false;
+    bool meta = false, important_text_only = false, use_scamin = true;
+    bool anchor = false, quality_of_data = false;
+    bool two_shades = false;
+    double safety_depth = 0, shallow_contour = 0, deep_contour = 0;
+};
+S52Config& s52cfg() {
+    static S52Config c;
+    return c;
 }
 
 // OpenCPN's Mercator scale constant: toSM easting = dLon_rad * a * k0 and
@@ -258,13 +295,103 @@ void ChartTile57::GetValidCanvasRegion(const PlugIn_ViewPort& vp, wxRegion* pVal
         *pValidRegion = wxRegion(0, 0, vp.pix_width, vp.pix_height);
 }
 
+// Parse the "OpenCPN Config" message body. OpenCPN emits a flat JSON object of its live
+// S52PLIB state (PlugInManager::SendS52ConfigToAllPlugIns).
+void ChartTile57::ApplyS52ConfigMessage(const wxString& body) {
+    wxJSONValue root;
+    wxJSONReader reader;
+    if (reader.Parse(body, &root) > 0) // >0 == parse errors
+        return;
+
+    auto get_bool = [&](const char* key, bool dflt) {
+        const wxJSONValue v = root.Get(key, wxJSONValue(dflt));
+        return v.IsBool() ? v.AsBool() : (v.IsInt() ? v.AsInt() != 0 : dflt);
+    };
+    auto get_double = [&](const char* key, double dflt) {
+        const wxJSONValue v = root.Get(key, wxJSONValue(dflt));
+        return v.IsDouble() ? v.AsDouble() : (v.IsInt() ? (double)v.AsInt() : dflt);
+    };
+
+    S52Config& c = s52cfg();
+    std::lock_guard<std::mutex> lk(c.mtx);
+    c.meta = get_bool("OpenCPN S52PLIB MetaDisplay", c.meta);
+    c.important_text_only =
+        get_bool("OpenCPN S52PLIB ShowImportantTextOnly", c.important_text_only);
+    c.use_scamin = get_bool("OpenCPN S52PLIB UseSCAMIN", c.use_scamin);
+    c.anchor = get_bool("OpenCPN S52PLIB ShowAnchorConditions", c.anchor);
+    c.quality_of_data = get_bool("OpenCPN S52PLIB ShowQualityOfData", c.quality_of_data);
+    // ColorShades is S52_MAR_TWO_SHADES: 1 == two shades, 0 == four.
+    c.two_shades = get_double("OpenCPN S52PLIB ColorShades", c.two_shades ? 1.0 : 0.0) != 0.0;
+    c.safety_depth = get_double("OpenCPN S52PLIB Safety Depth", c.safety_depth);
+    c.shallow_contour = get_double("OpenCPN S52PLIB Shallow Contour", c.shallow_contour);
+    c.deep_contour = get_double("OpenCPN S52PLIB Deep Contour", c.deep_contour);
+    c.have = true;
+    ++c.gen;
+}
+
+// The per-canvas ENC state — OpenCPN's "Chart Panel Options" flyout (and the ENC menu /
+// keyboard toggles). These live ONLY on the ChartCanvas: it pushes them straight into
+// OpenCPN's s52plib at render time and never writes them to the config object, so before
+// API 1.19 a plugin simply could not see them. Read every refresh rather than behind the
+// PLIB-hash gate below: they are trivial accessors, and the canvas can change one without
+// the plib hash having been bumped yet at the moment we look.
+//
+// Canvas 0 (the primary). OpenCPN can run several canvases with DIFFERENT ENC settings,
+// but a chart object is shared across them and tile57's mariner state is per-chart, so
+// there is no per-canvas answer to give; the primary canvas wins.
+void ChartTile57::apply_canvas_enc_options() {
+    const int ci = 0;
+    const bool text = GetEnableENCTextDisplay(ci);
+    const bool soundings = GetEnableENCDepthSoundingsDisplay(ci);
+    const bool lights = GetEnableLightsDisplay(ci);
+    // Light descriptions: live where the host exports the getter, else the config seed
+    // (see the weak declaration above — OpenCPN 5.12 does not export it).
+    bool light_desc = light_desc_cfg_;
+#ifdef TILE57_WEAK_LIGHTDESC
+    if (GetEnableLightDescriptionsDisplay)
+        light_desc = GetEnableLightDescriptionsDisplay(ci);
+#endif
+
+    mariner_.text_names = text;
+    mariner_.text_other = text && !important_text_only_;
+    mariner_.show_light_descriptions = light_desc;
+
+    // PI_DisCat: 'D' base, 'S' standard, 'O' other/all, 'M' mariner's standard.
+    const PI_DisCat cat = GetENCDisplayCategory(ci);
+    mariner_.display_base = true;
+    mariner_.display_standard = (cat != PI_DISPLAYBASE);
+    // tile57 has no dedicated soundings switch — soundings are OTHER category — so
+    // honour OpenCPN's explicit soundings toggle alongside the category.
+    mariner_.display_other = (cat == PI_OTHER) || soundings;
+
+    // Lights aren't a mariner flag in S-52, they're viewing group 27070: switching them
+    // off means denying that group. Keep the vector stable so the pointer we hand the
+    // engine stays valid (it must outlive the call).
+    vg_off_.clear();
+    if (!lights)
+        vg_off_.push_back(kVGLights);
+    mariner_.viewing_groups_off = vg_off_.empty() ? nullptr : vg_off_.data();
+    mariner_.viewing_groups_off_len = (uint32_t)vg_off_.size();
+}
+
 void ChartTile57::refresh_mariner() {
-    // PI_GetPLIBStateHash changes whenever an S52/vector-chart option changes;
-    // between changes this is a single int compare per render.
-    int hash = PI_GetPLIBStateHash();
-    if (hash == plib_hash_)
+    // The per-canvas ENC toggles are live and cheap — always re-read them.
+    apply_canvas_enc_options();
+
+    // Everything else re-reads only when OpenCPN says the S52 state changed:
+    // PI_GetPLIBStateHash bumps on any S52/vector-chart option, and the "OpenCPN Config"
+    // message bumps its own generation. Between changes this is two int compares.
+    const int hash = PI_GetPLIBStateHash();
+    uint64_t gen;
+    {
+        S52Config& c = s52cfg();
+        std::lock_guard<std::mutex> lk(c.mtx);
+        gen = c.gen;
+    }
+    if (hash == plib_hash_ && gen == s52_msg_gen_)
         return;
     plib_hash_ = hash;
+    s52_msg_gen_ = gen;
 
     mariner_.safety_contour = PI_GetPLIBMarinerSafetyContour();
     // PI_GetPLIBSymbolStyle/BoundaryStyle return S52 LUP table names:
@@ -275,49 +402,35 @@ void ChartTile57::refresh_mariner() {
     mariner_.boundary_style =
         (PI_GetPLIBBoundaryStyle() == 'O') ? TILE57_BOUNDARY_SYMBOLIZED : TILE57_BOUNDARY_PLAIN;
     mariner_.depth_unit = (PI_GetPLIBDepthUnitInt() == 0) ? TILE57_DEPTH_FEET : TILE57_DEPTH_METERS;
-    // Information callouts (INFORM/TXTDSC balloons) clutter the chart — keep them
-    // off unconditionally (set here, not in the config block below which may be
-    // skipped when GetOCPNConfigObject() is null).
+    // Information callouts (INFORM/TXTDSC balloons) clutter the chart — keep them off
+    // unconditionally (OpenCPN has no equivalent toggle).
     mariner_.show_inform_callouts = false;
 
-    // The remaining vector-chart options aren't exposed through PI getters;
-    // OpenCPN's live config object carries them (the options dialog writes
-    // them there, and the PLIB state hash bumps at the same time).
+    // OpenCPN's "Chart object scale factor" slider, folded into the physical symbol scale
+    // the display calibration already computed (see display_size_scale).
+    const float obj_scale = GetOCPNChartScaleFactor_Plugin();
+    const double csf = size_scale_csf_ > 0 ? size_scale_csf_ : OCPN_GetDisplayContentScaleFactor();
+    mariner_.size_scale = display_size_scale(csf) * (obj_scale > 0.1f ? obj_scale : 1.0f);
+
+    // The config file: OpenCPN refreshes it whenever the Options dialog is applied
+    // (MyFrame::ProcessOptionsDialog ends in pConfig->UpdateSettings()), so these are
+    // current for every setting that lives ONLY in that dialog. Read first, so the
+    // pushed message below can override where the two overlap.
     if (wxFileConfig* cfg = GetOCPNConfigObject()) {
-        wxString path = cfg->GetPath();
+        const wxString path = cfg->GetPath();
         cfg->SetPath("/Settings/GlobalState");
 
-        bool soundings = true, text = true, ldis = false, imp_only = false;
-        cfg->Read("bShowSoundg", &soundings, true);
-        cfg->Read("bShowS57Text", &text, true);
-        // KEY is "bShowLightDescription" (OpenCPN's config key) — NOT "bShowLdisText"
-        // (that's the g_bShowLdisText VARIABLE name). The wrong key always missed, so
-        // Read kept the default (false) and light descriptions never emitted, however
-        // the mariner toggled them in OpenCPN.
-        cfg->Read("bShowLightDescription", &ldis, false);
+        bool imp_only = false;
         cfg->Read("bShowS57ImportantTextOnly", &imp_only, false);
-        mariner_.text_names = text;
-        mariner_.text_other = text && !imp_only;
-        mariner_.show_light_descriptions = ldis;
+        important_text_only_ = imp_only;
 
-        // nDisplayCategory holds an S52 _DisCat: 'D' base, 'S' standard,
-        // 'O' other/all, 'M' mariner's standard.
-        long cat = 'O';
-        cfg->Read("nDisplayCategory", &cat, (long)'O');
-        mariner_.display_base = true;
-        mariner_.display_standard = (cat != 'D');
-        // tile57 has no dedicated soundings switch; soundings are OTHER
-        // category, so honour OpenCPN's explicit soundings toggle here.
-        mariner_.display_other = (cat == 'O') || soundings;
-
-        // bShowMeta drives OpenCPN's meta-object (M_* boundary) display.
         bool meta = false;
         cfg->Read("bShowMeta", &meta, false);
         mariner_.show_meta_bounds = meta;
 
         double v;
-        // Prefer the stored contour values (the mariner's set depths) over the
-        // PI getter, which can hand back the snapped/displayed safety contour.
+        // Prefer the stored contour values (the mariner's set depths) over the PI getter,
+        // which can hand back the snapped/displayed safety contour.
         if (cfg->Read("S52_MAR_SAFETY_CONTOUR", &v))
             mariner_.safety_contour = v;
         if (cfg->Read("S52_MAR_SHALLOW_CONTOUR", &v))
@@ -339,14 +452,38 @@ void ChartTile57::refresh_mariner() {
         cfg->Read("bUseSCAMIN", &use_scamin, true);
         mariner_.ignore_scamin = !use_scamin;
 
-        // Data-quality (M_QUAL/QUAPOS) display is a per-canvas setting.
+        // These two are per-canvas: OpenCPN only rewrites their config copy at shutdown,
+        // so what we read here is a STARTUP SEED, not a live value. Data quality is kept
+        // live by the pushed message below; light descriptions are kept live by the weak
+        // getter above where the host exports it.
         cfg->SetPath("/Canvas/CanvasConfig1");
         bool dq = false;
         cfg->Read("canvasENCShowDataQuality", &dq, false);
         mariner_.data_quality = dq;
+        bool ldis = false;
+        cfg->Read("canvasENCShowLightDescriptions", &ldis, false);
+        light_desc_cfg_ = ldis;
 
         cfg->SetPath(path);
     }
+
+    // OpenCPN's live push (see ApplyS52ConfigMessage). Authoritative once it has arrived:
+    // it reflects the S52PLIB as actually configured, including the per-canvas
+    // data-quality toggle that never reaches the config file.
+    S52Config& c = s52cfg();
+    std::lock_guard<std::mutex> lk(c.mtx);
+    if (c.have) {
+        mariner_.show_meta_bounds = c.meta;
+        important_text_only_ = c.important_text_only;
+        mariner_.ignore_scamin = !c.use_scamin;
+        mariner_.data_quality = c.quality_of_data;
+        mariner_.four_shade_water = !c.two_shades;
+        mariner_.safety_depth = c.safety_depth;
+        mariner_.shallow_contour = c.shallow_contour;
+        mariner_.deep_contour = c.deep_contour;
+    }
+    // important_text_only_ may have just moved; recompose the text gate it feeds.
+    mariner_.text_other = mariner_.text_names && !important_text_only_;
 }
 
 void ChartTile57::draw_calibration() const {

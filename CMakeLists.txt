@@ -67,13 +67,19 @@ endif()
 set(TILE57_LIB "${TILE57_DIR}/zig-out/lib/${_tile57_libname}"
     CACHE FILEPATH "path to the tile57 static library")
 
-# OpenCPN plugin API via the vendored opencpn-libs submodule. api-18 ==
-# opencpn_plugin_118, the base class Tile57Plugin derives from. This exposes the
+# OpenCPN plugin API via the vendored opencpn-libs submodule. api-19 ==
+# opencpn_plugin_119, the base class Tile57Plugin derives from. This exposes the
 # header-only `ocpn::api` target (adds ocpn_plugin.h; links the import lib on
 # win32). The base-class + API-helper symbols are provided by the OpenCPN
 # executable and resolved when the host dlopen's the plugin (see the APPLE
 # dynamic_lookup below; Linux allows undefined module symbols by default).
-add_subdirectory(opencpn-libs/api-18)
+#
+# 1.19 (not 1.18) because ONLY 1.19+ exposes the per-canvas ENC display state —
+# GetEnableENCTextDisplay / ...DepthSoundings / ...Lights / ...LightDescriptions /
+# ...BuoyLightLabels / GetENCDisplayCategory. Those are the "Chart Panel Options"
+# toggles, and they are unreadable at 1.18: the canvas writes them straight into
+# OpenCPN's s52plib without ever touching the config object a plugin can read.
+add_subdirectory(opencpn-libs/api-19)
 
 # Windows has no system package manager for wx/GLEW, but OpenCPN's own Windows
 # build caches prebuilt 32-bit copies under <opencpn>/cache (populated by
@@ -125,6 +131,12 @@ if(NOT GLEW_INCLUDE_DIR)
 endif()
 include(${wxWidgets_USE_FILE})
 
+# wxJSON decodes the "OpenCPN Config" plugin message (see Tile57Plugin::SetPluginMessage) —
+# the only live source for the S52 settings that are neither PI getters nor written to the
+# config object. It must come AFTER include(${wxWidgets_USE_FILE}): the vendored target
+# picks the wx headers up from the directory-level include path that sets, not its own.
+add_subdirectory(opencpn-libs/wxJSON)
+
 if(NOT EXISTS ${TILE57_LIB})
   # Windows needs the target spelled out: zig defaults to the 64-bit host, and a
   # 64-bit (or gnu-ABI) tile57.lib fails the link with LNK1143 in compiler_rt.obj.
@@ -175,6 +187,7 @@ endif()
 
 target_link_libraries(tile57_pi PRIVATE
   ocpn::api
+  ocpn::wxjson
   ${wxWidgets_LIBRARIES} ${OPENGL_LIBRARIES} ${GLEW_LIB} ${TILE57_LIB} ${PLATFORM_LIBS})
 
 # OpenCPN loads plugins as .dylib on macOS; silence its OpenGL deprecation noise.

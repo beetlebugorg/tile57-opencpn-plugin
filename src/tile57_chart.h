@@ -95,6 +95,14 @@ class ChartTile57 : public PlugInChartBaseExtended {
     // instances() is the live registry of open charts.
     wxString QueryDescription(double lon, double lat) const;
     bool covers(double lon, double lat) const;
+
+    // The body of OpenCPN's "OpenCPN Config" plugin message (see
+    // Tile57Plugin::SetPluginMessage). It carries the S52 settings that are reachable
+    // NO other way: OpenCPN pushes it whenever the S52 state is reconfigured, and it is
+    // the only live source for the per-canvas data-quality/anchor toggles — the canvas
+    // writes those into OpenCPN's s52plib without ever updating the config object a
+    // plugin can read. Parsed once here; every chart picks it up on its next render.
+    static void ApplyS52ConfigMessage(const wxString& body);
     // A snapshot, by value: OpenCPN constructs plugin charts on a thread pool during the
     // chart-DB scan, so the registry can be growing while the caller iterates.
     static std::vector<ChartTile57*> instances();
@@ -117,8 +125,25 @@ class ChartTile57 : public PlugInChartBaseExtended {
     // PI_GetPLIBStateHash() changes.
     void refresh_mariner();
 
+    // Pull the per-canvas ENC state (OpenCPN's "Chart Panel Options": text, soundings,
+    // lights, light descriptions, display category) into the mariner. Separate from
+    // refresh_mariner's gated block because these are cheap live accessors that must be
+    // read EVERY render — see the comment there.
+    void apply_canvas_enc_options();
+
     t57::ChartRenderer renderer_;
     tile57_mariner mariner_{};
+    // S-52 §14.5 viewing groups the mariner switched OFF. mariner_.viewing_groups_off
+    // points INTO this vector, so it has to outlive every call the mariner is passed to
+    // — hence a member, not a local.
+    std::vector<int32_t> vg_off_;
+    // Fed by the config/message block, consumed by apply_canvas_enc_options (which
+    // composes it with the live "show text" toggle into mariner_.text_other).
+    bool important_text_only_ = false;
+    // Startup seed for light descriptions, used only when the host does not export
+    // GetEnableLightDescriptionsDisplay (OpenCPN 5.12 declares but does not export it).
+    bool light_desc_cfg_ = false;
+    uint64_t s52_msg_gen_ = 0;     // last "OpenCPN Config" message generation folded in
     double last_zoom_ = 0;         // last rendered view zoom, for the object-query pick
     double size_scale_csf_ = -1.0; // content-scale mariner_.size_scale was computed at
 
