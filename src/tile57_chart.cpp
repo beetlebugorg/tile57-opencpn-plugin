@@ -628,8 +628,31 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     // ViewPort::GetPixFromLL). Ignoring it left tile57 stubbornly north-up under a rotated
     // ownship/route overlay. Skew is the canvas's chart-skew compensation and is 0 for a
     // mercator plugin chart (we report m_Chart_Skew = 0), so rotation alone is the angle.
+    //
+    // TILE57_ROT overrides the angle (degrees) for bring-up: TILE57_ROT=30 pins a 30° turn
+    // regardless of what the host says, so "does our transform rotate at all" can be
+    // answered without a heading source or a working host handshake.
+    static const double rot_override = [] {
+        const char* e = std::getenv("TILE57_ROT");
+        return e ? std::atof(e) * kPi / 180.0 : 1e9; // 1e9 sentinel: use the host's angle
+    }();
+    const double rot = rot_override < 1e8 ? rot_override : vp.rotation;
+    // What the host actually handed us. Logged on CHANGE (not per frame) so turning the
+    // chart prints one line: if rotation stays 0.0 while the ownship turns, the angle never
+    // reached the plugin and the transform below is not the problem.
+    if (dbg && pass != t57::ChartRenderer::Pass::kText) {
+        static double dbg_rot = 1e9;
+        if (std::fabs(vp.rotation - dbg_rot) > 0.002) {
+            dbg_rot = vp.rotation;
+            wxLogMessage("tile57 ROT: vp.rotation=%.4f rad (%.1f°) vp.skew=%.4f rad (%.1f°) "
+                         "applied=%.1f° rv_rect=[%d,%d %dx%d] pix=%dx%d fb=%ux%u",
+                         vp.rotation, vp.rotation * 180.0 / kPi, vp.skew, vp.skew * 180.0 / kPi,
+                         rot * 180.0 / kPi, vp.rv_rect.x, vp.rv_rect.y, vp.rv_rect.width,
+                         vp.rv_rect.height, vp.pix_width, vp.pix_height, fbw, fbh);
+        }
+    }
     renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip, device_scale,
-                     cull_bias, vp.rotation);
+                     cull_bias, rot);
     // The tiled renderer portrays only a budget of new tiles per frame (so a big
     // first-visit burst doesn't freeze one frame). If it deferred some, schedule
     // another redraw so they fill in progressively.
