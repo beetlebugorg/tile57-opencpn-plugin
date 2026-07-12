@@ -609,6 +609,17 @@ void ChartTile57::draw_calibration() const {
 // three times over, at every zoom. That is not a SCAMIN problem; no cull can fix drawing the
 // same water twice.
 namespace {
+// Does the CURRENT draw buffer actually have a stencil buffer? The host's b_use_stencil
+// only says whether OPENCPN clips with stencil — on macOS it renders into an FBO and
+// passes false, yet that FBO still HAS a stencil attachment we may use ourselves. Asking
+// GL directly is what matters, and it is what let the (wrong) bounding-box fallback below
+// run on a machine that could have masked exactly.
+bool draw_buffer_has_stencil() {
+    GLint bits = 0;
+    glGetIntegerv(GL_STENCIL_BITS, &bits);
+    return bits > 0;
+}
+
 class QuiltClip {
   public:
     // `scale` is logical canvas px -> framebuffer px: the same device_scale the projection
@@ -647,29 +658,21 @@ class QuiltClip {
             glScissor(rects[0][0], rects[0][1], rects[0][2], rects[0][3]);
             return;
         }
-        if (!have_stencil) {
-            // No stencil to build a real mask in. A bounding box over-draws (a coarse cell's
-            // patch is typically a RING around the fine cells, whose bbox is the whole
-            // screen), so this is a poor fallback — say so once rather than silently.
-            static bool warned = false;
-            if (!warned) {
-                warned = true;
-                wxLogMessage("tile57: quilt patch has %zu rects but the host reports no "
-                             "stencil — falling back to a bounding-box clip; overlapping "
-                             "cells may double-draw.",
-                             rects.size());
-            }
-            GLint x0 = rects[0][0], y0 = rects[0][1];
-            GLint x1 = x0 + rects[0][2], y1 = y0 + rects[0][3];
-            for (const auto& r : rects) {
-                x0 = std::min(x0, r[0]);
-                y0 = std::min(y0, r[1]);
-                x1 = std::max(x1, r[0] + r[2]);
-                y1 = std::max(y1, r[1] + r[3]);
-            }
+        // Several rects and NO stencil to mask with: draw the scene once per rect, each under
+        // an exact scissor (multipass). The old fallback here took the rects' BOUNDING BOX —
+        // and a coarse cell's patch is typically a RING around the finer cells, whose bbox is
+        // the WHOLE SCREEN. Every such cell then painted its full symbology over the fine
+        // cells that had carved it out: soundings stacked several cells deep, drawn as one
+        // unreadable blob. A bbox is not a clip; it is the absence of one.
+        //
+        // Multipass costs one extra draw per rect (geometry is cached in VBOs; nothing is
+        // re-portrayed), and patches are a handful of rects, so this is cheap and — unlike
+        // the stencil path — correct on every backend.
+        if (!have_stencil && !draw_buffer_has_stencil()) {
+            multipass_ = true;
+            rects_ = std::move(rects);
             scissor_ = true;
             glEnable(GL_SCISSOR_TEST);
-            glScissor(x0, y0, x1 - x0, y1 - y0);
             return;
         }
         // Several rects: build a real mask. Use stencil BIT 1 — the core writes bit 0
@@ -724,9 +727,15 @@ class QuiltClip {
     QuiltClip(const QuiltClip&) = delete;
     QuiltClip& operator=(const QuiltClip&) = delete;
     bool empty() const { return empty_; }
+    // True when the caller must draw the scene once per rect() under a scissor (no stencil
+    // available to mask a multi-rect patch in one pass). Every other case is already clipped
+    // by the constructor and draws exactly once.
+    bool multipass() const { return multipass_; }
+    const std::vector<std::array<GLint, 4>>& rects() const { return rects_; }
 
   private:
-    bool empty_ = false, scissor_ = false, stencil_ = false;
+    bool empty_ = false, scissor_ = false, stencil_ = false, multipass_ = false;
+    std::vector<std::array<GLint, 4>> rects_; // multipass only: the patch, rect by rect
     GLboolean prev_scissor_ = GL_FALSE;
     GLint prev_box_[4] = {0, 0, 0, 0};
 };
@@ -880,8 +889,19 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
                        device_scale, fbw, fbh, stencil_clip);
         if (clip.empty())
             return true; // this cell owns none of the screen this frame
-        renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip,
-                         device_scale, cull_bias, rot, scamin_display_denom);
+        if (clip.multipass()) {
+            // No stencil: the patch is drawn rect by rect, each under an exact scissor. The
+            // scene is identical every pass — only the scissor moves — so the tile cache and
+            // the label cache are hit, not rebuilt.
+            for (const auto& r : clip.rects()) {
+                glScissor(r[0], r[1], r[2], r[3]);
+                renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip,
+                                 device_scale, cull_bias, rot, scamin_display_denom);
+            }
+        } else {
+            renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip,
+                             device_scale, cull_bias, rot, scamin_display_denom);
+        }
     }
     // The tiled renderer portrays only a budget of new tiles per frame (so a big
     // first-visit burst doesn't freeze one frame). If it deferred some, schedule
