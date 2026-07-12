@@ -734,6 +734,17 @@ class QuiltClip {
 
 int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass pass,
                              bool stencil_clip, const wxRegion* clip_region) {
+    // TILE57_DEBUG: a black canvas with NO other tile57 log line means the host never got
+    // past one of the three gates below. Report which, once per chart, so "nothing draws"
+    // is never a silent failure (a failed ensure_gl — shader compile / GL loader — looked
+    // identical to "never called").
+    static const bool dbg_entry = std::getenv("TILE57_DEBUG") != nullptr;
+    if (dbg_entry && !logged_entry_) {
+        logged_entry_ = true;
+        wxLogMessage("tile57 ENTRY: %s pass=%d bValid=%d has_chart=%d ensure_gl=%d",
+                     m_Name.c_str(), (int)pass, (int)vp.bValid, (int)renderer_.has_chart(),
+                     (int)renderer_.ensure_gl());
+    }
     if (!vp.bValid)
         return false;
     if (!renderer_.has_chart())

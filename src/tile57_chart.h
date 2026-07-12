@@ -169,6 +169,7 @@ class ChartTile57 : public PlugInChartBaseExtended {
     int plib_hash_ = -1; // last PI_GetPLIBStateHash() folded into mariner_
 
     wxWindow* canvas_ = nullptr; // canvas for CallAfter(Refresh) (progressive-tile redraw)
+    bool logged_entry_ = false;  // TILE57_DEBUG: render_pass gate report, once per chart
 
     wxDECLARE_DYNAMIC_CLASS(ChartTile57);
 };
