@@ -855,20 +855,24 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     // TILE57_DEBUG: one line per zoom step exposing the HiDPI coupling — scamin_denom is what
     // the SCAMIN shader test uses (a feature hides when scamin_denom > its SCAMIN; 0 = cull
     // off). gate = fbw vs pix_width*csf shows why device_scale resolves to 1.
+    //
+    // dbg_zoom_ is PER CHART, deliberately: a quilt draws a dozen cells into one view, and a
+    // function-level static let only the first of them ever log — precisely hiding the thing
+    // worth seeing, which is WHICH CELLS paint a given view. `cell` is this chart's own
+    // compilation scale; when chart_scale > super_scamin, everything but the display-base
+    // skeleton of THIS cell should be gone from the screen.
     static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg && pass != t57::ChartRenderer::Pass::kText) {
-        static double dbg_last = 1e9;
-        if (std::fabs(zoom - dbg_last) > 0.02) {
-            dbg_last = zoom;
-            wxLogMessage("tile57 DBG: zoom=%.3f scamin_denom=1:%.0f (chart_scale=1:%.0f "
-                         "bias=%.2f) super_scamin=1:%.0f cell=1:%d dev_scale=%.2f csf=%.2f "
-                         "pixW=%d fbW=%u gate(pixW*csf)=%ld size_scale=%.3f ppm=%.5f",
-                         zoom, scamin_display_denom * std::pow(2.0, cull_bias),
-                         (double)vp.chart_scale, cull_bias,
-                         mariner_.ignore_scamin ? 0.0 : m_Chart_Scale * 2.0, m_Chart_Scale,
-                         device_scale, csf, vp.pix_width, fbw, std::lround(vp.pix_width * csf),
-                         mariner_.size_scale, ppm);
-        }
+    if (dbg && pass != t57::ChartRenderer::Pass::kText &&
+        std::fabs(zoom - dbg_zoom_) > 0.02) {
+        dbg_zoom_ = zoom;
+        wxLogMessage("tile57 DBG: %s zoom=%.3f scamin_denom=1:%.0f (chart_scale=1:%.0f "
+                     "bias=%.2f) super_scamin=1:%.0f cell=1:%d dev_scale=%.2f csf=%.2f "
+                     "pixW=%d fbW=%u gate(pixW*csf)=%ld size_scale=%.3f ppm=%.5f",
+                     m_Name.c_str(), zoom, scamin_display_denom * std::pow(2.0, cull_bias),
+                     (double)vp.chart_scale, cull_bias,
+                     mariner_.ignore_scamin ? 0.0 : m_Chart_Scale * 2.0, m_Chart_Scale,
+                     device_scale, csf, vp.pix_width, fbw, std::lround(vp.pix_width * csf),
+                     mariner_.size_scale, ppm);
     }
     // Chart rotation (course-up / head-up, and the manual rotate control). OpenCPN does NOT
     // rotate the framebuffer for us — a GL chart is handed the rotation and is expected to
