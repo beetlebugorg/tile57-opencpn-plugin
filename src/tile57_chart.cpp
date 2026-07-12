@@ -622,8 +622,14 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
                          std::lround(vp.pix_width * csf), mariner_.size_scale, ppm);
         }
     }
+    // Chart rotation (course-up / head-up, and the manual rotate control). OpenCPN does NOT
+    // rotate the framebuffer for us — a GL chart is handed the rotation and is expected to
+    // draw its own geometry turned, exactly as the core's native vector charts do (see
+    // ViewPort::GetPixFromLL). Ignoring it left tile57 stubbornly north-up under a rotated
+    // ownship/route overlay. Skew is the canvas's chart-skew compensation and is 0 for a
+    // mercator plugin chart (we report m_Chart_Skew = 0), so rotation alone is the angle.
     renderer_.render(vp.clon, vp.clat, zoom, fbw, fbh, mariner_, pass, stencil_clip, device_scale,
-                     cull_bias);
+                     cull_bias, vp.rotation);
     // The tiled renderer portrays only a budget of new tiles per frame (so a big
     // first-visit burst doesn't freeze one frame). If it deferred some, schedule
     // another redraw so they fill in progressively.

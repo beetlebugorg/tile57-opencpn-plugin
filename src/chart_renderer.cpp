@@ -664,6 +664,23 @@ bool ChartRenderer::get_info(tile57_info& out) const {
     return true;
 }
 
+// View rotation (course-up et al). uRot = (cos, sin) of the OpenCPN ViewPort rotation;
+// (1,0) is north-up. The world term is always rotated — that IS the chart turning.
+//
+// aPost is NOT: it is a screen-px offset, and whether it turns with the chart depends on
+// what it means (uPostRot selects, per draw):
+//   uPostRot=1  CHART-relative — a line's half-width normal, derived from the segment's
+//               WORLD direction at tessellation time. Leave it unrotated and the stroke
+//               offset stops being perpendicular to the rotated segment: lines shear and
+//               (at 90°) collapse to nothing.
+//   uPostRot=0  SCREEN-relative — a symbol's or glyph's local px outline. These stay
+//               UPRIGHT on screen under rotation (S-52 / MapLibre "viewport" alignment),
+//               so text stays readable and buoys stay the right way up.
+// Symbols whose rotation is referenced to NORTH (S-52 ORIENT — "map" alignment) ought to
+// turn with the chart, but tile57's surface API does not yet tell a host which those are:
+// the engine computes the flag and then drops it (`_ = rot_north` in its vector surface),
+// and neither draw_sprite nor draw_symbol carries it. They render viewport-aligned here
+// until the API exposes it.
 static const char* VS = R"(
 attribute vec2 aWorld;
 attribute vec2 aPost;
@@ -673,10 +690,13 @@ uniform float uScale;
 uniform vec2 uOrigin;
 uniform vec2 uVp;
 uniform float uZoom;
+uniform vec2 uRot;
+uniform float uPostRot;
 varying vec4 vCol;
+vec2 t57rot(vec2 p){ return vec2(p.x*uRot.x + p.y*uRot.y, -p.x*uRot.y + p.y*uRot.x); }
 void main(){
   if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); vCol = vec4(0.0); return; }
-  vec2 screen = aWorld*uScale + uOrigin + aPost;
+  vec2 screen = t57rot(aWorld*uScale) + uOrigin + mix(aPost, t57rot(aPost), uPostRot);
   vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
   gl_Position = vec4(ndc, 0.0, 1.0);
   vCol = aColor;
@@ -688,6 +708,7 @@ void main(){ gl_FragColor = vec4(vCol.rgb*vCol.a, vCol.a); }
 )";
 // Sprite program: same world transform, but sample the atlas at aUV. Output
 // premultiplied so it composites with GL_ONE, GL_ONE_MINUS_SRC_ALPHA.
+// The anchor rotates with the chart; the quad (aPost) stays upright — see VS.
 static const char* VS_SPRITE = R"(
 attribute vec2 aWorld;
 attribute vec2 aPost;
@@ -697,10 +718,12 @@ uniform float uScale;
 uniform vec2 uOrigin;
 uniform vec2 uVp;
 uniform float uZoom;
+uniform vec2 uRot;
 varying vec2 vUV;
 void main(){
   if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); vUV = vec2(0.0); return; }
-  vec2 screen = aWorld*uScale + uOrigin + aPost;
+  vec2 wp = aWorld*uScale;
+  vec2 screen = vec2(wp.x*uRot.x + wp.y*uRot.y, -wp.x*uRot.y + wp.y*uRot.x) + uOrigin + aPost;
   vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
   gl_Position = vec4(ndc, 0.0, 1.0);
   vUV = aUV;
@@ -724,15 +747,19 @@ uniform float uScale;
 uniform vec2 uOrigin;
 uniform vec2 uVp;
 uniform float uZoom;
+uniform vec2 uRot;
 varying vec4 vRect;
 varying vec2 vTile;
 varying vec2 vWorldPx;
 void main(){
   if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); return; }
   vec2 wpx = aWorld*uScale;
-  vec2 screen = wpx + uOrigin;
+  vec2 screen = vec2(wpx.x*uRot.x + wpx.y*uRot.y, -wpx.x*uRot.y + wpx.y*uRot.x) + uOrigin;
   vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
   gl_Position = vec4(ndc, 0.0, 1.0);
+  // vWorldPx stays UNROTATED: the fill lattice is anchored in the CHART frame, so the
+  // pattern turns rigidly with the chart (as printed on it) instead of the cells sliding
+  // through the polygon as the view spins.
   vRect = aRect; vTile = aTile; vWorldPx = wpx;
 }
 )";
@@ -761,11 +788,14 @@ uniform float uScale;
 uniform vec2 uOrigin;
 uniform vec2 uVp;
 uniform float uZoom;
+uniform vec2 uRot;
 varying vec2 vUV;
 varying vec4 vCol;
 void main(){
   if (uZoom < aThresh) { gl_Position = vec4(2.0,2.0,2.0,1.0); vUV = vec2(0.0); vCol = vec4(0.0); return; }
-  vec2 screen = aWorld*uScale + uOrigin + aPost;
+  // Anchor turns with the chart; the glyph quad (aPost) does not — labels stay upright.
+  vec2 wp = aWorld*uScale;
+  vec2 screen = vec2(wp.x*uRot.x + wp.y*uRot.y, -wp.x*uRot.y + wp.y*uRot.x) + uOrigin + aPost;
   vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
   gl_Position = vec4(ndc, 0.0, 1.0);
   vUV = aUV; vCol = aColor;
@@ -820,10 +850,10 @@ namespace {
 // instance, so all the render code that reads prog_/u_scale_/… is unchanged.
 struct GlPrograms {
     uint32_t prog = 0, prog_sprite = 0, prog_pat = 0, prog_glyph = 0, prog_blit = 0, vbo_quad = 0;
-    int u_scale = -1, u_origin = -1, u_vp = -1, u_zoom = -1;
-    int su_scale = -1, su_origin = -1, su_vp = -1, su_zoom = -1, su_atlas = -1;
-    int pu_scale = -1, pu_origin = -1, pu_vp = -1, pu_zoom = -1, pu_atlas = -1;
-    int gu_scale = -1, gu_origin = -1, gu_vp = -1, gu_zoom = -1, gu_atlas = -1;
+    int u_scale = -1, u_origin = -1, u_vp = -1, u_zoom = -1, u_rot = -1, u_postrot = -1;
+    int su_scale = -1, su_origin = -1, su_vp = -1, su_zoom = -1, su_atlas = -1, su_rot = -1;
+    int pu_scale = -1, pu_origin = -1, pu_vp = -1, pu_zoom = -1, pu_atlas = -1, pu_rot = -1;
+    int gu_scale = -1, gu_origin = -1, gu_vp = -1, gu_zoom = -1, gu_atlas = -1, gu_rot = -1;
     int bu_tex = -1;
     bool ready = false;
 };
@@ -843,6 +873,8 @@ void build_programs() {
     g.u_origin = glGetUniformLocation(g.prog, "uOrigin");
     g.u_vp = glGetUniformLocation(g.prog, "uVp");
     g.u_zoom = glGetUniformLocation(g.prog, "uZoom");
+    g.u_rot = glGetUniformLocation(g.prog, "uRot");
+    g.u_postrot = glGetUniformLocation(g.prog, "uPostRot");
 
     // Sprite program (textured point symbols).
     g.prog_sprite = glCreateProgram();
@@ -858,6 +890,7 @@ void build_programs() {
     g.su_vp = glGetUniformLocation(g.prog_sprite, "uVp");
     g.su_zoom = glGetUniformLocation(g.prog_sprite, "uZoom");
     g.su_atlas = glGetUniformLocation(g.prog_sprite, "uAtlas");
+    g.su_rot = glGetUniformLocation(g.prog_sprite, "uRot");
 
     // Pattern program (tiled area fills).
     g.prog_pat = glCreateProgram();
@@ -873,6 +906,7 @@ void build_programs() {
     g.pu_vp = glGetUniformLocation(g.prog_pat, "uVp");
     g.pu_zoom = glGetUniformLocation(g.prog_pat, "uZoom");
     g.pu_atlas = glGetUniformLocation(g.prog_pat, "uAtlas");
+    g.pu_rot = glGetUniformLocation(g.prog_pat, "uRot");
 
     // Glyph program (SDF text).
     g.prog_glyph = glCreateProgram();
@@ -889,6 +923,7 @@ void build_programs() {
     g.gu_vp = glGetUniformLocation(g.prog_glyph, "uVp");
     g.gu_zoom = glGetUniformLocation(g.prog_glyph, "uZoom");
     g.gu_atlas = glGetUniformLocation(g.prog_glyph, "uAtlas");
+    g.gu_rot = glGetUniformLocation(g.prog_glyph, "uRot");
 
     // Composite program + a unit fullscreen quad (pos.xy, tex.uv).
     g.prog_blit = glCreateProgram();
@@ -920,24 +955,29 @@ bool ChartRenderer::ensure_gl() {
     u_origin_ = g.u_origin;
     u_vp_ = g.u_vp;
     u_zoom_ = g.u_zoom;
+    u_rot_ = g.u_rot;
+    u_postrot_ = g.u_postrot;
     prog_sprite_ = g.prog_sprite;
     su_scale_ = g.su_scale;
     su_origin_ = g.su_origin;
     su_vp_ = g.su_vp;
     su_zoom_ = g.su_zoom;
     su_atlas_ = g.su_atlas;
+    su_rot_ = g.su_rot;
     prog_pat_ = g.prog_pat;
     pu_scale_ = g.pu_scale;
     pu_origin_ = g.pu_origin;
     pu_vp_ = g.pu_vp;
     pu_zoom_ = g.pu_zoom;
     pu_atlas_ = g.pu_atlas;
+    pu_rot_ = g.pu_rot;
     prog_glyph_ = g.prog_glyph;
     gu_scale_ = g.gu_scale;
     gu_origin_ = g.gu_origin;
     gu_vp_ = g.gu_vp;
     gu_zoom_ = g.gu_zoom;
     gu_atlas_ = g.gu_atlas;
+    gu_rot_ = g.gu_rot;
     prog_blit_ = g.prog_blit;
     bu_tex_ = g.bu_tex;
     vbo_quad_ = g.vbo_quad;
@@ -1197,7 +1237,7 @@ void ChartRenderer::evict_lru(size_t cap) {
 void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, float cull_zoom,
                                  double vwx, double vwy, double scale_px, int z, uint32_t x0,
                                  uint32_t x1, uint32_t y0, uint32_t y1, int budget,
-                                 int max_portray_ms) {
+                                 int max_portray_ms, Rot rot) {
     // Budget the per-frame portray: a big first-visit burst (many tiles entering on a
     // zoom-out) is spread over frames instead of freezing one. Uncached tiles beyond
     // the budget are skipped this frame and flagged pending; the plugin re-requests a
@@ -1256,7 +1296,8 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
     // Cached tiles only — the backdrop NEVER portrays (no added per-frame cost).
     std::vector<const TileGeom*> back_vis;
     if (tiles_pending_ && backdrop_z_ >= 0 && backdrop_z_ != z && std::abs(backdrop_z_ - z) <= 4) {
-        double half_wx = (w * 0.5) / scale_px, half_wy = (h * 0.5) / scale_px;
+        double half_wx, half_wy;
+        rotated_half_extent(w, h, scale_px, rot, half_wx, half_wy);
         double nb = std::pow(2.0, backdrop_z_), maxb = nb - 1.0;
         long bx0 = (long)std::floor(std::clamp((vwx - half_wx) * nb, 0.0, maxb));
         long bx1 = (long)std::floor(std::clamp((vwx + half_wx) * nb, 0.0, maxb));
@@ -1287,18 +1328,29 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
         return;
 
     const float vp[2] = {(float)w, (float)h};
+    const float rv[2] = {(float)rot.c, (float)rot.s};
+    // The tile's world reference point, placed on screen THROUGH the rotation. The shader
+    // rotates only the aWorld term, so pre-rotating the origin here completes the rotation
+    // about the viewport centre: screen = R*(world) + [C + R*(ref - view)].
     auto set_origin = [&](int uloc, const TileGeom* t) {
-        float o[2] = {(float)((t->ref_wx - vwx) * scale_px + w * 0.5),
-                      (float)((t->ref_wy - vwy) * scale_px + h * 0.5)};
+        const double ox = (t->ref_wx - vwx) * scale_px, oy = (t->ref_wy - vwy) * scale_px;
+        float o[2] = {(float)(ox * rot.c + oy * rot.s + w * 0.5),
+                      (float)(-ox * rot.s + oy * rot.c + h * 0.5)};
         glUniform2fv(uloc, 1, o);
     };
+    // u_postrot: only the solid program declares uPostRot — pass -1 for the others (a
+    // uniform location of -1 is a defined no-op; passing prog_'s location while another
+    // program is bound would instead write whatever uniform sits at that index).
     auto layer = [&](const std::vector<const TileGeom*>& list, int prog, int u_scale, int u_vp,
-                     int u_zoom, int u_origin, int idx,
-                     void (ChartRenderer::*drawfn)(uint32_t, uint32_t), uint32_t tex, int u_atlas) {
+                     int u_zoom, int u_origin, int u_rot, int u_postrot, int idx,
+                     void (ChartRenderer::*drawfn)(uint32_t, uint32_t), uint32_t tex, int u_atlas,
+                     float post_rot) {
         glUseProgram(prog);
         glUniform1f(u_scale, (float)scale_px);
         glUniform2fv(u_vp, 1, vp);
         glUniform1f(u_zoom, cull_zoom);
+        glUniform2fv(u_rot, 1, rv);
+        glUniform1f(u_postrot, post_rot);
         if (tex) {
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, tex);
@@ -1317,18 +1369,18 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
     auto draw_layers = [&](const std::vector<const TileGeom*>& list) {
         if (list.empty())
             return;
-        layer(list, prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 0, &ChartRenderer::draw_range, 0,
-              -1); // area
+        layer(list, prog_, u_scale_, u_vp_, u_zoom_, u_origin_, u_rot_, u_postrot_, 0,
+              &ChartRenderer::draw_range, 0, -1, 0.0f); // area (aPost is 0)
         if (g_atlas.ok)
-            layer(list, prog_pat_, pu_scale_, pu_vp_, pu_zoom_, pu_origin_, 5,
-                  &ChartRenderer::draw_pat_range, g_atlas.tex, pu_atlas_); // pattern
-        layer(list, prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 1, &ChartRenderer::draw_range, 0,
-              -1); // line
-        layer(list, prog_, u_scale_, u_vp_, u_zoom_, u_origin_, 2, &ChartRenderer::draw_range, 0,
-              -1); // symbol (tessellated)
+            layer(list, prog_pat_, pu_scale_, pu_vp_, pu_zoom_, pu_origin_, pu_rot_, -1, 5,
+                  &ChartRenderer::draw_pat_range, g_atlas.tex, pu_atlas_, 0.0f); // pattern
+        layer(list, prog_, u_scale_, u_vp_, u_zoom_, u_origin_, u_rot_, u_postrot_, 1,
+              &ChartRenderer::draw_range, 0, -1, 1.0f); // line: rotate the half-width normal
+        layer(list, prog_, u_scale_, u_vp_, u_zoom_, u_origin_, u_rot_, u_postrot_, 2,
+              &ChartRenderer::draw_range, 0, -1, 0.0f); // symbol (tessellated): stays upright
         if (g_atlas.ok)
-            layer(list, prog_sprite_, su_scale_, su_vp_, su_zoom_, su_origin_, 4,
-                  &ChartRenderer::draw_sprite_range, g_atlas.tex, su_atlas_); // sprite
+            layer(list, prog_sprite_, su_scale_, su_vp_, su_zoom_, su_origin_, su_rot_, -1, 4,
+                  &ChartRenderer::draw_sprite_range, g_atlas.tex, su_atlas_, 0.0f); // sprite
     };
     draw_layers(back_vis); // coarser fallback zoom underneath (only when target incomplete)
     draw_layers(vis);      // target zoom on top
@@ -1369,18 +1421,25 @@ void ChartRenderer::portray_view_labels(double lon, double lat, double zoom, uin
 // == the view centre, so the origin is just (w/2, h/2); when reused across a pan/zoom the
 // labels ride the view correctly.
 void ChartRenderer::draw_view_labels(double scale_px, float cull_zoom, uint32_t w, uint32_t h,
-                                     double vwx, double vwy) {
+                                     double vwx, double vwy, Rot rot) {
     if (!n_vtext_ && !n_vglyph_)
         return;
-    const float origin[2] = {(float)((lbl_ref_wx_ - vwx) * scale_px + w * 0.5),
-                             (float)((lbl_ref_wy_ - vwy) * scale_px + h * 0.5)};
+    // Same pre-rotated origin as the tiles: place the cache's world reference point on
+    // screen THROUGH the rotation, so the labels ride the turning chart. Their glyph quads
+    // (aPost) are left unrotated by the shaders, so the text itself stays upright.
+    const double ox = (lbl_ref_wx_ - vwx) * scale_px, oy = (lbl_ref_wy_ - vwy) * scale_px;
+    const float origin[2] = {(float)(ox * rot.c + oy * rot.s + w * 0.5),
+                             (float)(-ox * rot.s + oy * rot.c + h * 0.5)};
     const float vp[2] = {(float)w, (float)h};
+    const float rv[2] = {(float)rot.c, (float)rot.s};
     if (n_vtext_) { // tessellated fallback (usually empty)
         glUseProgram(prog_);
         glUniform1f(u_scale_, (float)scale_px);
         glUniform2fv(u_origin_, 1, origin);
         glUniform2fv(u_vp_, 1, vp);
         glUniform1f(u_zoom_, cull_zoom);
+        glUniform2fv(u_rot_, 1, rv);
+        glUniform1f(u_postrot_, 0.0f); // glyph outlines are screen-px: keep them upright
         draw_range(vbo_vtext_, n_vtext_);
     }
     if (n_vglyph_ && g_glyph.ok) {
@@ -1389,6 +1448,7 @@ void ChartRenderer::draw_view_labels(double scale_px, float cull_zoom, uint32_t 
         glUniform2fv(gu_origin_, 1, origin);
         glUniform2fv(gu_vp_, 1, vp);
         glUniform1f(gu_zoom_, cull_zoom);
+        glUniform2fv(gu_rot_, 1, rv);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_glyph.tex);
         glUniform1i(gu_atlas_, 0);
@@ -1489,9 +1549,17 @@ void ChartRenderer::draw_glyph_range(uint32_t vbo, uint32_t count) {
     glDisableVertexAttribArray(4);
 }
 
+void ChartRenderer::rotated_half_extent(uint32_t w, uint32_t h, double scale_px, Rot rot,
+                                        double& half_wx, double& half_wy, double slack) {
+    const double ac = std::min(1.0, std::fabs(rot.c) + slack);
+    const double as = std::min(1.0, std::fabs(rot.s) + slack);
+    half_wx = (w * ac + h * as) * 0.5 / scale_px;
+    half_wy = (w * as + h * ac) * 0.5 / scale_px;
+}
+
 void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                            const tile57_mariner& m, Pass pass, bool stencil_clip,
-                           double device_scale, double cull_bias) {
+                           double device_scale, double cull_bias, double rotation) {
     if (!chart_ || !ensure_gl())
         return;
     if (!have_range_) {
@@ -1514,16 +1582,25 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         tiles_mhash_ = mh;
     }
 
-    // Motion (pan or zoom) this frame — used only to gate the offscreen supersample
-    // (AA when settled, direct during a gesture). Tiles are cached, so pan/zoom just
-    // re-transform them on the GPU; no re-portray is tied to motion.
+    // Motion (pan, zoom or TURN) this frame — used only to gate the offscreen supersample
+    // (AA when settled, direct during a gesture). Tiles are cached, so pan/zoom/rotate just
+    // re-transform them on the GPU; no re-portray is tied to motion. The rotation epsilon
+    // is coarse (~0.06°) so a dithering course-up heading doesn't read as perpetual motion
+    // and suppress AA forever.
     bool moving = (std::fabs(lon - last_lon_) > 1e-9 || std::fabs(lat - last_lat_) > 1e-9 ||
-                   std::fabs(zoom - last_zoom_r_) > 1e-4);
+                   std::fabs(zoom - last_zoom_r_) > 1e-4 || std::fabs(rotation - last_rot_) > 1e-3);
     last_lon_ = lon;
     last_lat_ = lat;
     last_zoom_r_ = zoom;
+    last_rot_ = rotation;
 
-    // Per-frame transform: screen = aWorld*uScale + uOrigin + aPost (uOrigin per tile).
+    // Per-frame transform: screen = R*(aWorld*uScale) + uOrigin + aPost (uOrigin per tile,
+    // pre-rotated on the CPU in set_origin). R is the view rotation about the viewport
+    // centre, in the y-DOWN screen frame — the same 2x2 OpenCPN's ViewPort::GetPixFromLL
+    // applies, so our geometry lands where the core's overlays (ownship, routes, AIS) do:
+    //   sx =  ux*cos + uy*sin
+    //   sy = -ux*sin + uy*cos
+    const Rot rot{std::cos(rotation), std::sin(rotation)};
     double vwx, vwy;
     lonlat_to_world(lon, lat, vwx, vwy);
     // Projection at the PHYSICAL framebuffer: geographic zoom scaled by device_scale
@@ -1597,7 +1674,8 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         if (z > (int)max_zoom_)
             z = (int)max_zoom_;
         double n = std::pow(2.0, z);
-        double half_wx = (w * 0.5) / scale_px, half_wy = (h * 0.5) / scale_px;
+        double half_wx, half_wy;
+        rotated_half_extent(w, h, scale_px, rot, half_wx, half_wy);
         double wminx = vwx - half_wx, wmaxx = vwx + half_wx;
         double wminy = vwy - half_wy, wmaxy = vwy + half_wy;
         if (have_bounds_) {
@@ -1633,7 +1711,7 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         int portray_ms = moving ? 8 : 30;
         if (wmaxx >= wminx && wmaxy >= wminy && (x1 - x0 + 1) * (y1 - y0 + 1) <= 4096)
             render_tiled(w, h, m, cull_zoom, vwx, vwy, scale_px, z, (uint32_t)x0, (uint32_t)x1,
-                         (uint32_t)y0, (uint32_t)y1, budget, portray_ms);
+                         (uint32_t)y0, (uint32_t)y1, budget, portray_ms, rot);
     }
     // LABELS (text pass / unquilted): portray the whole view's text with a single
     // declutter grid (per-tile grids dropped labels at seams — the missing lights). This
@@ -1644,20 +1722,34 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     // here (the base pass already stamped last_*_ this frame), so detect settle from the
     // previous TEXT frame (lbl_prev_*_).
     if (pass != Pass::kBase) {
-        bool lbl_moving = std::fabs(lon - lbl_prev_lon_) > 1e-9 ||
-                          std::fabs(lat - lbl_prev_lat_) > 1e-9 ||
-                          std::fabs(zoom - lbl_prev_zoom_) > 1e-4;
+        // A turn only invalidates the label cache's EXTENT and declutter, not its contents
+        // (see lbl_rot_): tolerate kLblRotSlack of drift before re-portraying, and portray
+        // the extent with that much slack built in so the tolerated angles stay covered.
+        constexpr double kLblRotSlack = 0.09; // ~5°
+        bool lbl_moving =
+            std::fabs(lon - lbl_prev_lon_) > 1e-9 || std::fabs(lat - lbl_prev_lat_) > 1e-9 ||
+            std::fabs(zoom - lbl_prev_zoom_) > 1e-4 || std::fabs(rotation - lbl_prev_rot_) > 1e-3;
         lbl_prev_lon_ = lon;
         lbl_prev_lat_ = lat;
         lbl_prev_zoom_ = zoom;
+        lbl_prev_rot_ = rotation;
         bool stale = std::fabs(lon - lbl_lon_) > 1e-9 || std::fabs(lat - lbl_lat_) > 1e-9 ||
-                     std::fabs(zoom - lbl_zoom_) > 1e-4;
+                     std::fabs(zoom - lbl_zoom_) > 1e-4 ||
+                     std::fabs(rotation - lbl_rot_) > kLblRotSlack;
         labels_pending_ = false;
         if (!labels_valid_ || (stale && !lbl_moving)) {
-            portray_view_labels(lon, lat, zoom, w, h, m);
+            // Portray the ROTATED view's world AABB, widened by the rotation slack above so
+            // labels exist out to the corners a turn exposes. North-up (rotation exactly 0,
+            // the common case) takes no slack and portrays exactly the view, as before.
+            double lhx, lhy;
+            rotated_half_extent(w, h, scale_px, rot, lhx, lhy,
+                                rotation == 0.0 ? 0.0 : kLblRotSlack);
+            portray_view_labels(lon, lat, zoom, (uint32_t)std::lround(2.0 * lhx * scale_px),
+                                (uint32_t)std::lround(2.0 * lhy * scale_px), m);
             lbl_lon_ = lon;
             lbl_lat_ = lat;
             lbl_zoom_ = zoom;
+            lbl_rot_ = rotation;
             lbl_ref_wx_ = ref_wx_;
             lbl_ref_wy_ = ref_wy_; // portray set these to the view centre
             labels_valid_ = true;
@@ -1672,7 +1764,7 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         // — on a Retina display (size_scale ~3) that erased most labels, lights first
         // (they carry a SCAMIN). At true zoom, S-52 SCAMIN governs label visibility and
         // the declutter grid handles crowding.
-        draw_view_labels(scale_px, (float)zoom, w, h, vwx, vwy);
+        draw_view_labels(scale_px, (float)zoom, w, h, vwx, vwy, rot);
     }
 
     if (ss) {
