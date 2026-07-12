@@ -54,17 +54,28 @@ class ChartRenderer {
     bool get_info(tile57_info& out) const;
     tile57_chart* chart_handle() const { return chart_; } // for object-query
 
+    // postrot (on Vtx/SpriteVtx/GlyphVtx): does this vertex's screen-px offset (px,py) turn
+    // with the chart under a rotated view? 1 = yes (MAP-aligned), 0 = no (VIEWPORT-aligned,
+    // stays upright on screen). It is PER-VERTEX and not a per-draw uniform because tile57
+    // reports rotation-alignment per FEATURE: one tile's symbol/sprite/text buffer mixes
+    // MAP-aligned marks (an ORIENT'd light, a traffic-lane arrow, a depth-contour value that
+    // must follow its contour) with VIEWPORT-aligned ones (a buoy, an ordinary label), so a
+    // single uniform for the whole buffer cannot express it. Lines are always 1 (their aPost
+    // is a half-width normal taken from the segment's WORLD direction); areas are always 0
+    // (their aPost is zero anyway).
+
     // Unified GPU vertex (see header note).
     struct Vtx {
         float wx, wy, px, py;
         uint8_t r, g, b, a;
-        float thresh;
+        float thresh, postrot;
     };
     // Sprite vertex: world anchor + screen-px quad corner + atlas UV + SCAMIN.
     struct SpriteVtx {
-        float wx, wy, px, py, u, v, thresh;
+        float wx, wy, px, py, u, v, thresh, postrot;
     };
     // Pattern vertex: world position + atlas cell rect + tile screen px + SCAMIN.
+    // (No postrot: a pattern has no local px offset — the fill lattice rides the chart.)
     struct PatVtx {
         float wx, wy, u0, v0, u1, v1, tw, th, thresh;
     };
@@ -73,7 +84,7 @@ class ChartRenderer {
     struct GlyphVtx {
         float wx, wy, px, py, u, v;
         uint8_t r, g, b, a;
-        float thresh;
+        float thresh, postrot;
     };
 
     // Geometry sinks the C surface callbacks append to (public for the
@@ -88,22 +99,24 @@ class ChartRenderer {
     double decimate_eps_ = 0;
     // Display scale (mariner size_scale) — pattern tile screen size.
     double size_scale_ = 1.0;
-    // Callback handlers (world/local geometry -> Vtx).
+    // Callback handlers (world/local geometry -> Vtx). `align` is tile57's per-feature
+    // rotation-alignment; it becomes the vertex's postrot (see the note above).
     void on_fill_area(const tile57_world_rings* r, tile57_rgba c, float thresh);
     void on_stroke_line(const tile57_world_rings* l, float width_px, tile57_rgba c, float thresh);
     void on_draw_symbol(tile57_world_point anchor, const tile57_local_rings* r, tile57_rgba c,
-                        int even_odd, float stroke_w, float thresh);
+                        int even_odd, float stroke_w, tile57_rot_align align, float thresh);
     void on_draw_text(tile57_world_point anchor, const tile57_local_rings* g, tile57_rgba c,
-                      tile57_rgba halo, float thresh);
+                      tile57_rgba halo, tile57_rot_align align, float thresh);
     void on_draw_sprite(const char* name, size_t len, tile57_world_point anchor, float rot_deg,
-                        float half_w, float half_h, float thresh);
+                        tile57_rot_align align, float half_w, float half_h, float thresh);
     void on_draw_pattern(const char* name, size_t len, const tile57_world_rings* rings,
                          float thresh);
-    // Lay out `text` from the SDF glyph atlas at (anchor + origin px), size in px,
-    // appending one quad per glyph to glyph_.
+    // Lay out `text` from the SDF glyph atlas at (anchor + origin px), size in px, the whole
+    // run turned by rot_deg about the anchor (a depth-contour value arrives with its
+    // contour's tangent), appending one quad per glyph to glyph_.
     void on_draw_text_str(tile57_world_point anchor, float ox, float oy, const char* text,
-                          size_t len, float size_px, tile57_rgba color, tile57_rgba halo,
-                          float thresh);
+                          size_t len, float size_px, float rot_deg, tile57_rot_align align,
+                          tile57_rgba color, tile57_rgba halo, float thresh);
 
     // ---- tiled path (MapLibre model): portray+tessellate each baked tile ONCE,
     // cache its GPU geometry, compose the view from cached tiles. This is the only
@@ -144,8 +157,11 @@ class ChartRenderer {
     void clear_tiles();
     void evict_lru(size_t cap); // drop least-recently-drawn tiles above `cap`
     // Whole-view label pass (shared declutter grid; fixes per-tile seam label drops).
-    void portray_view_labels(double lon, double lat, double zoom, uint32_t w, uint32_t h,
-                             const tile57_mariner& m);
+    // rotation: handed to tile57 for the VIEW pass only — it decides the declutter frame and
+    // keeps a tangent-rotated contour value from reading upside down. (The TILE pass gets no
+    // rotation: its geometry is cached and must stay north-up, per tile57_chart_tile_surface.)
+    void portray_view_labels(double lon, double lat, double zoom, double rotation, uint32_t w,
+                             uint32_t h, const tile57_mariner& m);
     void draw_view_labels(double scale_px, float cull_zoom, uint32_t w, uint32_t h, double vwx,
                           double vwy, Rot rot);
     static uint64_t tile_key(int z, uint32_t x, uint32_t y) {
@@ -154,7 +170,7 @@ class ChartRenderer {
 
     tile57_chart* chart_ = nullptr;
     uint32_t prog_ = 0; // solid Vtx program (area/line/symbol/text tile layers)
-    int u_scale_ = -1, u_origin_ = -1, u_vp_ = -1, u_zoom_ = -1, u_rot_ = -1, u_postrot_ = -1;
+    int u_scale_ = -1, u_origin_ = -1, u_vp_ = -1, u_zoom_ = -1, u_rot_ = -1;
     // Sprite (textured point symbols) program.
     uint32_t prog_sprite_ = 0;
     int su_scale_ = -1, su_origin_ = -1, su_vp_ = -1, su_zoom_ = -1, su_atlas_ = -1, su_rot_ = -1;

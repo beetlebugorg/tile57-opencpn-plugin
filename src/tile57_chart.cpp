@@ -8,7 +8,6 @@
 #include <cstring>
 #include <mutex>
 #include <string>
-#include <type_traits>
 #include <unordered_set>
 #include <vector>
 #include <wx/fileconf.h>
@@ -140,31 +139,6 @@ double enc_sounding_scale(int n) {
     n = std::clamp(n, -5, 5);
     return (n * 0.1) + 1.0;
 }
-
-// tile57's mariner carries ONE size knob (size_scale — icons, line widths AND text move
-// together), so there is nowhere yet to put a text-only or sounding-only factor. Set the
-// fields if the tile57 we compile against HAS them, and compile to nothing if it does not,
-// so this lights up the moment tile57 grows text_scale / sounding_scale with no edit here.
-// (Same spirit as the weak GetEnableLightDescriptionsDisplay above: use what the other side
-// actually offers.) Scaling text host-side instead is NOT an option: tile57 sizes each
-// label's declutter box from the very px it emits, so text we quietly enlarged afterwards
-// would collide against boxes for a size we never drew.
-template <class M> auto set_text_scale(M& m, double v, int) -> decltype(m.text_scale = v, void()) {
-    m.text_scale = v;
-}
-template <class M> void set_text_scale(M&, double, long) {}
-template <class M>
-auto set_sounding_scale(M& m, double v, int) -> decltype(m.sounding_scale = v, void()) {
-    m.sounding_scale = v;
-}
-template <class M> void set_sounding_scale(M&, double, long) {}
-
-// Whether the above actually landed anywhere — for the one-time log below, so a mariner
-// whose slider does nothing can see WHY rather than filing it as a rendering bug.
-template <class M, class = void> struct has_enc_scale : std::false_type {};
-template <class M>
-struct has_enc_scale<M, std::void_t<decltype(M::text_scale, M::sounding_scale)>> : std::true_type {
-};
 
 // OpenCPN's Mercator scale constant: toSM easting = dLon_rad * a * k0 and
 // screen px = easting * view_scale_ppm, so ppm counts PROJECTED metres.
@@ -552,22 +526,11 @@ void ChartTile57::refresh_mariner() {
     // The ENC Text / ENC Sounding sliders, scaled the way OpenCPN scales them. These sit ON
     // TOP of size_scale (the physical/DPI calibration + the Chart Object slider, both folded
     // in above), because that is how OpenCPN stacks them: the object factor moves symbols,
-    // lines and text together, and these two then move text / soundings alone.
-    set_text_scale(mariner_, enc_text_scale(text_factor_), 0);
-    set_sounding_scale(mariner_, enc_sounding_scale(sounding_factor_), 0);
-    if (!has_enc_scale<tile57_mariner>::value) {
-        // Say so ONCE, and only if a slider is actually off centre — otherwise a mariner who
-        // drags "ENC Text Scale" and sees nothing move has no way to tell this from a bug.
-        static bool warned = false;
-        if (!warned && (text_factor_ || sounding_factor_)) {
-            warned = true;
-            wxLogMessage("tile57: ENC Text/Sounding scale sliders (text=%d sounding=%d) are "
-                         "INERT — this tile57 has one size_scale for icons, lines and text, "
-                         "so text cannot be scaled on its own. Needs mariner.text_scale / "
-                         ".sounding_scale.",
-                         text_factor_, sounding_factor_);
-        }
-    }
+    // lines and text together, and these two then move text / soundings alone. tile57 scales
+    // the glyph AND its declutter box together, so enlarged labels still declutter correctly
+    // — which is exactly why this cannot be done on our side of the API.
+    mariner_.text_size_scale = enc_text_scale(text_factor_);
+    mariner_.sounding_size_scale = enc_sounding_scale(sounding_factor_);
 }
 
 void ChartTile57::draw_calibration() const {
