@@ -156,11 +156,62 @@ void ChartRenderer::on_fill_area(const tile57_world_rings* p, tile57_rgba c, flo
 // World line: expand each segment to a screen-px-wide quad — aWorld is the
 // endpoint (world), aPost carries the perpendicular * half-width in px, applied
 // AFTER the world transform so the line is a constant screen width at any zoom.
-void ChartRenderer::on_stroke_line(const tile57_world_rings* p, float width_px, tile57_rgba c,
-                                   float scamin) {
+//
+// The S-52 LS() dash (dash_on/dash_off px, (0,0) = solid) is cut in the fragment shader from
+// `dist`: each vertex's arc length from the start of its polyline. Two things make that come
+// out at the right SPACING, and both are easy to get wrong:
+//
+//  * `acc` runs CONTINUOUSLY along the whole polyline. Restart the arc length at every
+//    segment and each segment begins at phase 0 — i.e. "on" — and since an ENC's contours and
+//    coastlines are chains of segments mostly SHORTER than one dash period, essentially every
+//    segment would paint its opening dash and nothing else. The line comes out solid, which is
+//    exactly what a per-segment phase looks like: not a wrong dash, but no dash at all.
+//  * `dist` is banked in WORLD units, not px. The shader scales it by uScale, so a dash is a
+//    fixed length ON SCREEN however far in you zoom — and a cached tile drawn at a zoom it was
+//    not portrayed at (the coarse backdrop layer under a still-loading zoom does precisely
+//    this) still dashes correctly, instead of at the phase of some other zoom.
+
+// TILE57_DASH=<k>: multiply the dash run lengths tile57 sends by k, without a rebuild — the
+// same live-calibration trick as TILE57_SIZE. The engine derives the pattern from the line
+// WIDTH (MapLibre line-dasharray semantics: [4,3] in line-width units, so 4*w on / 3*w off),
+// which is a guess at the S-52 intent rather than a measured quantity. If the dash reads too
+// tight or too loose against native OpenCPN, dial k until it matches and we bake that in.
+static float dash_cal_factor() {
+    static float f = [] {
+        const char* e = std::getenv("TILE57_DASH");
+        double v = e ? std::atof(e) : 1.0;
+        return (float)((v > 0.05 && v < 20.0) ? v : 1.0);
+    }();
+    return f;
+}
+
+void ChartRenderer::on_stroke_line(const tile57_world_rings* p, float width_px, float dash_on,
+                                   float dash_off, tile57_rgba c, float scamin) {
     if (!p || p->n < 2)
         return;
     float hw = std::max(0.5f, width_px * 0.5f);
+    dash_on *= dash_cal_factor();
+    dash_off *= dash_cal_factor();
+    // TILE57_DEBUG: the ACTUAL numbers behind a dashed line, once per distinct pattern. The
+    // dash is cut in px (dash_on/off) against an arc length scaled by uScale, and those two
+    // must be the same px — so if the spacing is off, this line and the uScale/device_scale
+    // line in render() are what to compare. period_px is one full on+off cycle on screen.
+    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
+    if (dbg && dash_on > 0.0f) {
+        static std::vector<std::array<float, 3>> seen;
+        std::array<float, 3> key{width_px, dash_on, dash_off};
+        if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
+            seen.push_back(key);
+            wxLogMessage("tile57 DASH: width=%.2fpx on=%.2fpx off=%.2fpx period=%.2fpx "
+                         "(size_scale=%.3f, TILE57_DASH=%.2f)",
+                         width_px, dash_on, dash_off, dash_on + dash_off, size_scale_,
+                         dash_cal_factor());
+        }
+    }
+    // A sub-pixel dash cannot be resolved — it aliases into a grey smear that reads as a
+    // washed-out solid line. Draw it as the solid line it is trying to be.
+    if (dash_on < 1.0f || dash_off < 1.0f)
+        dash_on = dash_off = 0.0f;
     const double eps2 = decimate_eps_ * decimate_eps_;
     for (uint32_t r = 0; r < p->ring_count; ++r) {
         uint32_t s = p->ring_starts[r];
@@ -172,6 +223,7 @@ void ChartRenderer::on_stroke_line(const tile57_world_rings* p, float width_px, 
             if (i == e - 1 || dx * dx + dy * dy >= eps2)
                 kept.push_back({p->pts[i].x, p->pts[i].y});
         }
+        double acc = 0.0; // arc length so far along THIS ring — the dash's phase
         for (size_t i = 0; i + 1 < kept.size(); ++i) {
             double ax = kept[i][0] - ref_wx_, ay = kept[i][1] - ref_wy_;
             double bx = kept[i + 1][0] - ref_wx_, by = kept[i + 1][1] - ref_wy_;
@@ -179,15 +231,18 @@ void ChartRenderer::on_stroke_line(const tile57_world_rings* p, float width_px, 
             if (len < 1e-12)
                 continue;
             float nx = (float)(-dy / len) * hw, ny = (float)(dx / len) * hw; // px offset
-            auto v = [&](double wx, double wy, float ox, float oy) {
-                line_.push_back({(float)wx, (float)wy, ox, oy, c.r, c.g, c.b, c.a, scamin, 1.0f});
+            const float d0 = (float)acc, d1 = (float)(acc + len);
+            auto v = [&](double wx, double wy, float ox, float oy, float d) {
+                line_.push_back({(float)wx, (float)wy, ox, oy, c.r, c.g, c.b, c.a, scamin, d,
+                                 dash_on, dash_off});
             };
-            v(ax, ay, nx, ny);
-            v(bx, by, nx, ny);
-            v(bx, by, -nx, -ny);
-            v(ax, ay, nx, ny);
-            v(bx, by, -nx, -ny);
-            v(ax, ay, -nx, -ny);
+            v(ax, ay, nx, ny, d0);
+            v(bx, by, nx, ny, d1);
+            v(bx, by, -nx, -ny, d1);
+            v(ax, ay, nx, ny, d0);
+            v(bx, by, -nx, -ny, d1);
+            v(ax, ay, -nx, -ny, d0);
+            acc += len;
         }
     }
 }
@@ -731,12 +786,12 @@ static void tr_fill(void* c, const tile57_feature* f, const tile57_world_rings* 
     s->on_fill_area(r, col, feat_scamin(c, f));
     s->tag_plane(s->area_pl_, n0, s->area_.size());
 }
-static void tr_stroke(void* c, const tile57_feature* f, const tile57_world_rings* l, float w, float,
-                      float, tile57_rgba col) {
+static void tr_stroke(void* c, const tile57_feature* f, const tile57_world_rings* l, float w,
+                      float dash_on, float dash_off, tile57_rgba col) {
     auto* s = static_cast<ChartRenderer*>(c);
     s->set_plane(f);
     const size_t n0 = s->line_.size();
-    s->on_stroke_line(l, w, col, feat_scamin(c, f));
+    s->on_stroke_line(l, w, dash_on, dash_off, col, feat_scamin(c, f));
     s->tag_plane(s->line_pl_, n0, s->line_.size());
 }
 static void tr_symbol(void* c, const tile57_feature* f, tile57_world_point a,
@@ -878,6 +933,62 @@ void main(){
 static const char* FS = R"(
 varying vec4 vCol;
 void main(){ gl_FragColor = vec4(vCol.rgb*vCol.a, vCol.a); }
+)";
+// Line program: the world transform above, plus the S-52 LS() dash.
+//
+// aPost is a line's half-width normal, taken from the segment's WORLD direction at
+// tessellation time, so unlike the shared VS there is nothing to select on — it ALWAYS turns
+// with the chart (leave it unrotated and the offset stops being perpendicular to the rotated
+// segment: the stroke shears, and at 90 degrees collapses to nothing).
+//
+// The dash is cut in the fragment from the arc length. aDist arrives in WORLD units and is
+// scaled to screen px HERE, by the same uScale that places the geometry — so the dash is a
+// constant length on screen at every zoom, and it stays right for a cached tile drawn at a
+// zoom it was not portrayed at. Rotation is rigid, so it does not touch a length: the view
+// can turn without disturbing the phase.
+static const char* VS_LINE = R"(
+attribute vec2 aWorld;
+attribute vec2 aPost;
+attribute vec4 aColor;
+attribute float aScamin;
+attribute float aDist;
+attribute vec2 aDash;
+uniform float uScale;
+uniform vec2 uOrigin;
+uniform vec2 uVp;
+uniform float uScaminDenom;
+uniform vec2 uRot;
+varying vec4 vCol;
+varying float vDistPx;
+varying vec2 vDash;
+vec2 t57rot(vec2 p){ return vec2(p.x*uRot.x - p.y*uRot.y, p.x*uRot.y + p.y*uRot.x); }
+void main(){
+  if (uScaminDenom > aScamin) {
+    gl_Position = vec4(2.0,2.0,2.0,1.0);
+    vCol = vec4(0.0); vDistPx = 0.0; vDash = vec2(0.0);
+    return;
+  }
+  vec2 screen = t57rot(aWorld*uScale) + uOrigin + t57rot(aPost);
+  vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
+  gl_Position = vec4(ndc, 0.0, 1.0);
+  vCol = aColor;
+  vDistPx = aDist * uScale;
+  vDash = aDash;
+}
+)";
+// Drop the fragments that fall in a gap. vDistPx interpolates linearly ALONG the segment
+// (both corners of an end share that end's arc length, so it does not vary across the
+// stroke's width), which is what makes the gaps land square across the line.
+static const char* FS_LINE = R"(
+varying vec4 vCol;
+varying float vDistPx;
+varying vec2 vDash;
+void main(){
+  float period = vDash.x + vDash.y;   // (0,0) => solid, and the branch is skipped
+  if (period > 0.0 && mod(vDistPx, period) > vDash.x)
+    discard;
+  gl_FragColor = vec4(vCol.rgb*vCol.a, vCol.a);
+}
 )";
 // Sprite program: same world transform, but sample the atlas at aUV. Output
 // premultiplied so it composites with GL_ONE, GL_ONE_MINUS_SRC_ALPHA.
@@ -1028,8 +1139,10 @@ namespace {
 // pipeline build per cell on macOS. ensure_gl() copies these handles into the
 // instance, so all the render code that reads prog_/u_scale_/… is unchanged.
 struct GlPrograms {
-    uint32_t prog = 0, prog_sprite = 0, prog_pat = 0, prog_glyph = 0, prog_blit = 0, vbo_quad = 0;
+    uint32_t prog = 0, prog_line = 0, prog_sprite = 0, prog_pat = 0, prog_glyph = 0, prog_blit = 0,
+             vbo_quad = 0;
     int u_scale = -1, u_origin = -1, u_vp = -1, u_denom = -1, u_rot = -1;
+    int lu_scale = -1, lu_origin = -1, lu_vp = -1, lu_denom = -1, lu_rot = -1;
     int su_scale = -1, su_origin = -1, su_vp = -1, su_denom = -1, su_atlas = -1, su_rot = -1;
     int pu_scale = -1, pu_origin = -1, pu_vp = -1, pu_denom = -1, pu_atlas = -1, pu_rot = -1;
     int gu_scale = -1, gu_origin = -1, gu_vp = -1, gu_denom = -1, gu_atlas = -1, gu_rot = -1;
@@ -1054,6 +1167,23 @@ void build_programs() {
     g.u_vp = glGetUniformLocation(g.prog, "uVp");
     g.u_denom = glGetUniformLocation(g.prog, "uScaminDenom");
     g.u_rot = glGetUniformLocation(g.prog, "uRot");
+
+    // Line program (stroked lines + the LS() dash, cut client-side).
+    g.prog_line = glCreateProgram();
+    glAttachShader(g.prog_line, compile(GL_VERTEX_SHADER, VS_LINE));
+    glAttachShader(g.prog_line, compile(GL_FRAGMENT_SHADER, FS_LINE));
+    glBindAttribLocation(g.prog_line, 0, "aWorld");
+    glBindAttribLocation(g.prog_line, 1, "aPost");
+    glBindAttribLocation(g.prog_line, 2, "aColor");
+    glBindAttribLocation(g.prog_line, 3, "aScamin");
+    glBindAttribLocation(g.prog_line, 4, "aDist");
+    glBindAttribLocation(g.prog_line, 5, "aDash");
+    glLinkProgram(g.prog_line);
+    g.lu_scale = glGetUniformLocation(g.prog_line, "uScale");
+    g.lu_origin = glGetUniformLocation(g.prog_line, "uOrigin");
+    g.lu_vp = glGetUniformLocation(g.prog_line, "uVp");
+    g.lu_denom = glGetUniformLocation(g.prog_line, "uScaminDenom");
+    g.lu_rot = glGetUniformLocation(g.prog_line, "uRot");
 
     // Sprite program (textured point symbols).
     g.prog_sprite = glCreateProgram();
@@ -1137,6 +1267,12 @@ bool ChartRenderer::ensure_gl() {
     u_vp_ = g.u_vp;
     u_denom_ = g.u_denom;
     u_rot_ = g.u_rot;
+    prog_line_ = g.prog_line;
+    lu_scale_ = g.lu_scale;
+    lu_origin_ = g.lu_origin;
+    lu_vp_ = g.lu_vp;
+    lu_denom_ = g.lu_denom;
+    lu_rot_ = g.lu_rot;
     prog_sprite_ = g.prog_sprite;
     su_scale_ = g.su_scale;
     su_origin_ = g.su_origin;
@@ -1437,7 +1573,7 @@ ChartRenderer::TileGeom& ChartRenderer::ensure_tile(int z, uint32_t x, uint32_t 
     };
     const LayerSrc src[7] = {
         {area_.data(), area_.size() * sizeof(Vtx), (uint32_t)area_.size()},
-        {line_.data(), line_.size() * sizeof(Vtx), (uint32_t)line_.size()},
+        {line_.data(), line_.size() * sizeof(LineVtx), (uint32_t)line_.size()},
         {symbol_.data(), symbol_.size() * sizeof(Vtx), (uint32_t)symbol_.size()},
         {text_.data(), text_.size() * sizeof(Vtx), (uint32_t)text_.size()},
         {sprite_.data(), sprite_.size() * sizeof(SpriteVtx), (uint32_t)sprite_.size()},
@@ -1675,8 +1811,8 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
             if (g_atlas.ok)
                 layer(list, prog_pat_, pu_scale_, pu_vp_, pu_denom_, pu_origin_, pu_rot_, 5,
                       &ChartRenderer::draw_pat_range, g_atlas.tex, pu_atlas_, p); // pattern
-            layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 1,
-                  &ChartRenderer::draw_range, 0, -1, p); // line
+            layer(list, prog_line_, lu_scale_, lu_vp_, lu_denom_, lu_origin_, lu_rot_, 1,
+                  &ChartRenderer::draw_line_range, 0, -1, p); // line (dashed in the fragment)
             layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 2,
                   &ChartRenderer::draw_range, 0, -1, p); // symbol (tessellated)
             if (g_atlas.ok)
@@ -1792,6 +1928,36 @@ void ChartRenderer::draw_range(uint32_t vbo, uint32_t first, uint32_t count) {
     glDisableVertexAttribArray(2);
     glDisableVertexAttribArray(3);
     glDisableVertexAttribArray(4);
+}
+
+// Draw one LineVtx buffer (prog_line_ must be bound + uniforms set by caller).
+void ChartRenderer::draw_line_range(uint32_t vbo, uint32_t first, uint32_t count) {
+    if (!count)
+        return;
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(LineVtx), (void*)offsetof(LineVtx, wx));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(LineVtx), (void*)offsetof(LineVtx, px));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(LineVtx),
+                          (void*)offsetof(LineVtx, r));
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(LineVtx),
+                          (void*)offsetof(LineVtx, scamin));
+    glEnableVertexAttribArray(4);
+    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(LineVtx),
+                          (void*)offsetof(LineVtx, dist));
+    glEnableVertexAttribArray(5);
+    glVertexAttribPointer(5, 2, GL_FLOAT, GL_FALSE, sizeof(LineVtx),
+                          (void*)offsetof(LineVtx, dash_on));
+    glDrawArrays(GL_TRIANGLES, (GLint)first, (GLsizei)count);
+    glDisableVertexAttribArray(0);
+    glDisableVertexAttribArray(1);
+    glDisableVertexAttribArray(2);
+    glDisableVertexAttribArray(3);
+    glDisableVertexAttribArray(4);
+    glDisableVertexAttribArray(5);
 }
 
 // Draw one PatVtx buffer (prog_pat_ must be bound + uniforms/atlas set by caller).
@@ -1946,6 +2112,21 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     // (a 2x HiDPI framebuffer gets 2x px per world unit; zoom — and the SCAMIN cull
     // below — stays geographic).
     double scale_px = 256.0 * std::pow(2.0, zoom) * device_scale; // px per world[0,1]
+    // TILE57_DEBUG: scale_px IS the shader's uScale, and the line shader turns a vertex's
+    // world arc length into screen px with it (vDistPx = aDist * uScale). The dash is cut
+    // against that in px, so scale_px and the DASH: line above must be the SAME px — if
+    // device_scale is 2 here but the dash arrived in logical px, every dash is half length.
+    {
+        static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
+        static double last = -1;
+        if (dbg && scale_px != last) {
+            last = scale_px;
+            wxLogMessage("tile57 SCALE: zoom=%.2f device_scale=%.2f -> uScale=%.1f px/world "
+                         "(=%.2f px per tile-px at z%d)",
+                         zoom, device_scale, scale_px, scale_px / (256.0 * std::pow(2.0, zoom)),
+                         (int)std::floor(zoom));
+        }
+    }
     // The SCAMIN cull denominator: the host's real display scale (1:N), compared per vertex
     // against the feature's own SCAMIN — hide when the display is SMALLER scale (zoomed out)
     // than the feature allows, i.e. denom > SCAMIN. 0 disables the cull entirely (OpenCPN's

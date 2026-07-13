@@ -87,6 +87,25 @@ class ChartRenderer {
         uint8_t r, g, b, a;
         float scamin, postrot;
     };
+    // Line vertex. Lines carry the S-52 LS() dash pattern, so they get their own type and
+    // program rather than widening Vtx — area/symbol/text share Vtx, and an area's triangles
+    // are the biggest buffer on the chart; they must not pay 12 bytes a vertex for a dash
+    // they can never have.
+    //   dist  = arc length from the START OF THE POLYLINE, in WORLD units. The shader turns
+    //           it into screen px (* uScale), so one dash is a constant SCREEN length at any
+    //           zoom, and a cached tile stays correct when it is drawn at a zoom it was not
+    //           portrayed at (the coarse backdrop layer does exactly that).
+    //   dash  = on/off run lengths in px, straight from tile57's stroke_line. (0,0) = solid.
+    // No postrot: a line's aPost is a half-width normal taken from the segment's WORLD
+    // direction, so it ALWAYS turns with the chart — the line shader rotates it flat, with
+    // nothing to select on (see the VS note).
+    struct LineVtx {
+        float wx, wy, px, py;
+        uint8_t r, g, b, a;
+        float scamin;
+        float dist;
+        float dash_on, dash_off;
+    };
     // Sprite vertex: world anchor + screen-px quad corner + atlas UV + SCAMIN.
     struct SpriteVtx {
         float wx, wy, px, py, u, v, scamin, postrot;
@@ -106,7 +125,8 @@ class ChartRenderer {
 
     // Geometry sinks the C surface callbacks append to (public for the
     // trampolines). Grouped by paint layer so we draw area->line->symbol->text.
-    std::vector<Vtx> area_, line_, symbol_, text_;
+    std::vector<Vtx> area_, symbol_, text_;
+    std::vector<LineVtx> line_;     // stroked lines (own type: they carry the LS() dash)
     std::vector<SpriteVtx> sprite_; // point symbols drawn from the atlas
     std::vector<PatVtx> pattern_;   // area fills tiled from the pattern atlas
     std::vector<GlyphVtx> glyph_;   // text drawn as SDF quads from the glyph atlas
@@ -137,7 +157,9 @@ class ChartRenderer {
     // Callback handlers (world/local geometry -> Vtx). `align` is tile57's per-feature
     // rotation-alignment; it becomes the vertex's postrot (see the note above).
     void on_fill_area(const tile57_world_rings* r, tile57_rgba c, float scamin);
-    void on_stroke_line(const tile57_world_rings* l, float width_px, tile57_rgba c, float scamin);
+    // dash_on/dash_off: the LS() pattern in px, as tile57 hands it over ((0,0) = solid).
+    void on_stroke_line(const tile57_world_rings* l, float width_px, float dash_on, float dash_off,
+                        tile57_rgba c, float scamin);
     void on_draw_symbol(tile57_world_point anchor, const tile57_local_rings* r, tile57_rgba c,
                         int even_odd, float stroke_w, tile57_rot_align align, float scamin);
     void on_draw_text(tile57_world_point anchor, const tile57_local_rings* g, tile57_rgba c,
@@ -176,6 +198,7 @@ class ChartRenderer {
     // Draw [first, first+count) vertices of a VBO. The range is how one S-52 draw priority is
     // painted out of a tile whose triangles are sorted by priority (see sort_by_plane).
     void draw_range(uint32_t vbo, uint32_t first, uint32_t count);        // Vtx (prog_)
+    void draw_line_range(uint32_t vbo, uint32_t first, uint32_t count);   // LineVtx (prog_line_)
     void draw_pat_range(uint32_t vbo, uint32_t first, uint32_t count);    // PatVtx (prog_pat_)
     void draw_sprite_range(uint32_t vbo, uint32_t first, uint32_t count); // SpriteVtx
     void draw_glyph_range(uint32_t vbo, uint32_t first, uint32_t count);  // GlyphVtx
@@ -214,8 +237,11 @@ class ChartRenderer {
     }
 
     tile57_chart* chart_ = nullptr;
-    uint32_t prog_ = 0; // solid Vtx program (area/line/symbol/text tile layers)
+    uint32_t prog_ = 0; // solid Vtx program (area/symbol/text tile layers)
     int u_scale_ = -1, u_origin_ = -1, u_vp_ = -1, u_denom_ = -1, u_rot_ = -1;
+    // Line program (LineVtx): same world transform, plus the LS() dash cut in the fragment.
+    uint32_t prog_line_ = 0;
+    int lu_scale_ = -1, lu_origin_ = -1, lu_vp_ = -1, lu_denom_ = -1, lu_rot_ = -1;
     // Sprite (textured point symbols) program.
     uint32_t prog_sprite_ = 0;
     int su_scale_ = -1, su_origin_ = -1, su_vp_ = -1, su_denom_ = -1, su_atlas_ = -1, su_rot_ = -1;
