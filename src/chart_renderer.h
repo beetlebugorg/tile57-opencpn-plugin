@@ -225,6 +225,8 @@ class ChartRenderer {
     // Glyph (SDF text) program.
     uint32_t prog_glyph_ = 0;
     int gu_scale_ = -1, gu_origin_ = -1, gu_vp_ = -1, gu_denom_ = -1, gu_atlas_ = -1, gu_rot_ = -1;
+    int gu_halo_ = -1, gu_halow_ = -1; // S-52 text halo (see FS_GLYPH)
+    float halo_rgb_[3] = {1.0f, 1.0f, 1.0f}; // halo colour for the active palette
     // Composite program + fullscreen quad: draw the resolved MSAA texture (a
     // shared multisampled FBO, see chart_renderer.cpp) over OpenCPN's FBO. MSAA
     // antialiases tessellated text/lines/area edges at ~1x fill cost.

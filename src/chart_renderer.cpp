@@ -1021,15 +1021,26 @@ void main(){
   vUV = aUV; vCol = aColor;
 }
 )";
+// The glyph, plus an S-52 HALO. Chart text sits on top of soundings, depth areas and
+// symbology, and unhaloed it is simply unreadable there — every other chart engine (tile57's
+// own raster path included) masks the background behind the glyph. The SDF gives it to us
+// for free: the same distance field, thresholded further out, IS the outline. One pass —
+// halo underneath, glyph over it, both premultiplied for GL_ONE/ONE_MINUS_SRC_ALPHA.
 static const char* FS_GLYPH = R"(
 uniform sampler2D uAtlas;
+uniform vec4 uHalo;     // rgb = halo colour, a = its strength (0 => no halo)
+uniform float uHaloW;   // halo half-width, in SDF units (0.5 == the glyph edge)
 varying vec2 vUV;
 varying vec4 vCol;
 void main(){
   float d = texture2D(uAtlas, vUV).a;
   float w = fwidth(d);
-  float a = smoothstep(0.5 - w, 0.5 + w, d);
-  gl_FragColor = vec4(vCol.rgb*vCol.a, vCol.a) * a;
+  float fill = smoothstep(0.5 - w, 0.5 + w, d);
+  float halo = smoothstep(0.5 - uHaloW - w, 0.5 - uHaloW + w, d) * uHalo.a;
+  float a = max(fill, halo);
+  if (a <= 0.0) discard;
+  vec3 rgb = mix(uHalo.rgb, vCol.rgb, fill);   // glyph paints OVER its own halo
+  gl_FragColor = vec4(rgb * a, a);
 }
 )";
 // Composite program: draw the supersampled texture as a fullscreen quad,
@@ -1074,6 +1085,7 @@ struct GlPrograms {
     int su_scale = -1, su_origin = -1, su_vp = -1, su_denom = -1, su_atlas = -1, su_rot = -1;
     int pu_scale = -1, pu_origin = -1, pu_vp = -1, pu_denom = -1, pu_atlas = -1, pu_rot = -1;
     int gu_scale = -1, gu_origin = -1, gu_vp = -1, gu_denom = -1, gu_atlas = -1, gu_rot = -1;
+    int gu_halo = -1, gu_halow = -1;
     int bu_tex = -1;
     bool ready = false;
 };
@@ -1146,6 +1158,8 @@ void build_programs() {
     g.gu_denom = glGetUniformLocation(g.prog_glyph, "uScaminDenom");
     g.gu_atlas = glGetUniformLocation(g.prog_glyph, "uAtlas");
     g.gu_rot = glGetUniformLocation(g.prog_glyph, "uRot");
+    g.gu_halo = glGetUniformLocation(g.prog_glyph, "uHalo");
+    g.gu_halow = glGetUniformLocation(g.prog_glyph, "uHaloW");
 
     // Composite program + a unit fullscreen quad (pos.xy, tex.uv).
     g.prog_blit = glCreateProgram();
@@ -1199,6 +1213,8 @@ bool ChartRenderer::ensure_gl() {
     gu_denom_ = g.gu_denom;
     gu_atlas_ = g.gu_atlas;
     gu_rot_ = g.gu_rot;
+    gu_halo_ = g.gu_halo;
+    gu_halow_ = g.gu_halow;
     prog_blit_ = g.prog_blit;
     bu_tex_ = g.bu_tex;
     vbo_quad_ = g.vbo_quad;
@@ -1791,6 +1807,18 @@ void ChartRenderer::draw_view_labels(double scale_px, float cull_denom, uint32_t
         glUniform2fv(gu_vp_, 1, vp);
         glUniform1f(gu_denom_, cull_denom);
         glUniform2fv(gu_rot_, 1, rv);
+        // S-52 text halo. Chart text lands on soundings, depth shades and symbology; without
+        // a mask behind it, it is unreadable exactly where it matters. The halo takes the
+        // PALETTE's background, not a hard white, so it stays right at dusk and night (a white
+        // outline on a night chart is a flare in the dark). TILE57_HALO=0 turns it off.
+        static const float halo_w = [] {
+            const char* e = std::getenv("TILE57_HALO");
+            const float v = e ? (float)std::atof(e) : 0.14f;
+            return v >= 0.0f && v < 0.45f ? v : 0.14f;
+        }();
+        glUniform4f(gu_halo_, halo_rgb_[0], halo_rgb_[1], halo_rgb_[2], halo_w > 0 ? 1.0f : 0.0f);
+        (void)0;
+        glUniform1f(gu_halow_, halo_w);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_glyph.tex);
         glUniform1i(gu_atlas_, 0);
@@ -1928,6 +1956,21 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         b_e_ = info.east;
         b_n_ = info.north;
     }
+    // The text halo takes the PALETTE's paper colour, not a hard white: a white outline on a
+    // night chart is a flare in the dark, and S-52 masks text with the background it sits on.
+    // (S-52 NODTA/CHBLK-ish neutrals per scheme; close enough that the halo reads as "paper".)
+    switch (m.scheme) {
+    case TILE57_SCHEME_NIGHT:
+        halo_rgb_[0] = 0.05f; halo_rgb_[1] = 0.05f; halo_rgb_[2] = 0.07f;
+        break;
+    case TILE57_SCHEME_DUSK:
+        halo_rgb_[0] = 0.18f; halo_rgb_[1] = 0.20f; halo_rgb_[2] = 0.24f;
+        break;
+    default:
+        halo_rgb_[0] = 1.0f; halo_rgb_[1] = 1.0f; halo_rgb_[2] = 1.0f;
+        break;
+    }
+
     // The tile cache is the ONLY geometry source. Invalidate it when the mariner
     // settings change (they change the portrayal).
     // TILE57_DEBUG: a cache clear is supposed to be RARE (an options change). If the
