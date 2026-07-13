@@ -156,8 +156,8 @@ struct FillTess {
 FillTess tessellate_rings(const tile57_world_rings* p, double eps2) {
     // thread_local, not static: tile portray runs on the worker thread while the
     // GL thread can portray labels (and its pattern fallback fills) concurrently.
-    thread_local std::vector<FillPt> flat;                           // decimated points
-    thread_local std::vector<std::pair<uint32_t, uint32_t>> ranges;  // (start,count)/ring
+    thread_local std::vector<FillPt> flat;                          // decimated points
+    thread_local std::vector<std::pair<uint32_t, uint32_t>> ranges; // (start,count)/ring
     thread_local std::vector<FillRingView> views;
     thread_local mapbox::detail::Earcut<uint32_t> earcut;
     flat.clear();
@@ -795,7 +795,6 @@ void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float 
             v(x0, y0, g.u0, g.v0);
             v(x1, y1, g.u1, g.v1);
             v(x0, y1, g.u0, g.v1);
-
         }
         pen += g.adv * size_px;
     }
@@ -901,8 +900,7 @@ static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, 
         // non-NUL-terminated char* to wxLogMessage's %.*s, and a Unicode wx build treats %s
         // as wchar_t* — so "(null)" in that log may have been wx mangling a perfectly good
         // pointer rather than tile57 handing us a null one. ptr=0x0 settles it.
-        const wxString t =
-            text ? wxString::FromUTF8(text, len) : wxString::FromAscii("<NULL PTR>");
+        const wxString t = text ? wxString::FromUTF8(text, len) : wxString::FromAscii("<NULL PTR>");
         wxLogMessage(wxString::Format(
             "tile57 TXT: cls=%s align=%s rot=%7.2f size=%.1f ox=%.1f oy=%.1f ptr=%p len=%zu [%s]",
             wxString::FromAscii((f && f->cls) ? f->cls : "?"),
@@ -1926,11 +1924,11 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
                 // paint), not this call's entry. No portrayed>0 floor: with 12 cells a
                 // one-tile-each floor is itself a 12-tile frame, and the backdrop +
                 // pending-refresh already guarantee the deferred tiles arrive.
-                bool over_time = max_portray_ms > 0 &&
-                                 (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                      std::chrono::steady_clock::now().time_since_epoch())
-                                      .count() -
-                                  s_pool_start_ms) >= max_portray_ms;
+                bool over_time =
+                    max_portray_ms > 0 && (std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               std::chrono::steady_clock::now().time_since_epoch())
+                                               .count() -
+                                           s_pool_start_ms) >= max_portray_ms;
                 if (over_count || over_time) {
                     tiles_pending_ = true;
                     continue;

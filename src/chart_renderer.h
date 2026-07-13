@@ -211,8 +211,8 @@ class ChartRenderer {
     // vertices are SORTED by priority at portray time, so a priority is one contiguous range
     // and the paint loop can walk priorities without touching the data again.
     struct Range {
-        uint8_t plane;          // S-52 draw priority (the paint order key)
-        uint32_t first, count;  // vertices, within this kind's VBO
+        uint8_t plane;         // S-52 draw priority (the paint order key)
+        uint32_t first, count; // vertices, within this kind's VBO
     };
     struct TileGeom {
         uint32_t vbo[7] = {0, 0, 0, 0, 0, 0, 0}; // area,line,symbol,text,sprite,pat,glyph
@@ -276,7 +276,7 @@ class ChartRenderer {
     struct TileJob {
         int z;
         uint32_t x, y;
-        uint64_t gen;  // portray generation the job was queued under (stale -> skipped)
+        uint64_t gen; // portray generation the job was queued under (stale -> skipped)
         tile57_mariner m;
         // Deep copy of m.viewing_groups_off: tile57 only requires the pointee to outlive
         // the CALL, so the caller's array cannot be assumed alive when the worker runs.
@@ -296,15 +296,15 @@ class ChartRenderer {
     };
     void enqueue_tile(int z, uint32_t x, uint32_t y, const tile57_mariner& m); // GL thread
     void portray_tile_cpu(const TileJob& job, TileCpu& out); // worker (takes portray_mu_)
-    TileGeom& upload_tile(TileCpu&& c);   // GL thread: create VBOs + insert into tiles_
-    int drain_portrayed_tiles();          // GL thread: upload all finished results
+    TileGeom& upload_tile(TileCpu&& c); // GL thread: create VBOs + insert into tiles_
+    int drain_portrayed_tiles();        // GL thread: upload all finished results
     void worker_loop();
     void stop_worker(); // quit + join (dtor / shutdown)
 
-    mutable std::mutex portray_mu_; // chart_ + portray scratch: one user at a time
+    mutable std::mutex portray_mu_;     // chart_ + portray scratch: one user at a time
     std::function<void()> on_progress_; // worker -> host "a tile is ready" (see setter)
-    std::thread worker_;            // lazily started by the first enqueue
-    std::mutex q_mu_;               // guards jobs_/done_/quit_/portray_gen_ vs the worker
+    std::thread worker_;                // lazily started by the first enqueue
+    std::mutex q_mu_;                   // guards jobs_/done_/quit_/portray_gen_ vs the worker
     std::condition_variable q_cv_;
     std::deque<TileJob> jobs_;
     std::vector<TileCpu> done_;
