@@ -67,9 +67,9 @@ jobs:
           if-no-files-found: error
 
   # Best-effort Windows build. The plugin links the vendored MSVC OpenCPN import lib
-  # (opencpn-libs/api-18/msvc-wx32/opencpn.lib), so tile57 must be built for the MSVC
-  # ABI too, and wxWidgets/GLEW come from vcpkg. Building wxWidgets from source via
-  # vcpkg is slow; a failure here does not block the Linux build.
+  # (opencpn-libs/api-18/msvc-wx32/opencpn.lib), so tile57 must be built for the 32-bit
+  # MSVC ABI too, and wxWidgets/GLEW come from OpenCPN's prebuilt cache (win_deps.bat).
+  # A failure here does not block the Linux build.
   windows:
     runs-on: windows-latest
     steps:
@@ -114,15 +114,27 @@ jobs:
           if [ -z "$lib" ]; then echo "::error::no tile57 static lib produced by zig build lib"; exit 1; fi
           echo "path=$lib" >> "$GITHUB_OUTPUT"
 
-      - name: Install wxWidgets + GLEW (vcpkg)
-        run: vcpkg install wxwidgets glew --triplet x86-windows
+      # wx + GLEW come from OpenCPN's own prebuilt 32-bit (vc14x) cache, not vcpkg:
+      # building wxWidgets from source in vcpkg took 15-25 min. win_deps.bat downloads
+      # the prebuilt binaries (self-installs wget/7z via choco) into OpenCPN/cache/,
+      # which is exactly what the plugin's OCPN_SRC_DIR discovery reads.
+      - name: Checkout OpenCPN (prebuilt 32-bit wx + GLEW)
+        uses: actions/checkout@v7
+        with:
+          repository: OpenCPN/OpenCPN
+          path: OpenCPN
+          fetch-depth: 1
+
+      - name: Fetch Windows deps (OpenCPN prebuilt wx/GLEW)
+        working-directory: OpenCPN/buildwin
+        shell: cmd
+        run: win_deps.bat
 
       - name: Configure
         # -A Win32 keeps the plugin 32-bit to match OpenCPN's Windows process.
         run: >
           cmake -S . -B build -A Win32
-          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-          -DVCPKG_TARGET_TRIPLET=x86-windows
+          -DOCPN_SRC_DIR="${{ github.workspace }}/OpenCPN"
           -DTILE57_DIR="${{ github.workspace }}/tile57"
           -DTILE57_LIB="${{ steps.t57lib.outputs.path }}"
 
