@@ -59,11 +59,14 @@ jobs:
       - name: Build
         run: cmake --build build -j
 
+      - name: Package (OpenCPN import tarball)
+        run: cmake --build build --target package
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: tile57_pi-linux
-          path: build/libtile57_pi.so
+          path: build/tile57_pi_*.tar.gz
           if-no-files-found: error
 
   # Best-effort Windows build. The plugin links the vendored MSVC OpenCPN import lib
@@ -141,9 +144,12 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
+      - name: Package (OpenCPN import tarball)
+        run: cmake --build build --target package --config Release
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: tile57_pi-windows
-          path: build/**/tile57_pi.dll
+          path: build/tile57_pi_*.tar.gz
           if-no-files-found: error

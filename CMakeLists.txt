@@ -211,3 +211,6 @@ if(APPLE)
     COMMENT "Retargeting wxWidgets to ${OCPN_APP}/Contents/Frameworks"
     VERBATIM)
 endif()
+
+# OpenCPN managed-plugin tarball: `cmake --build build --target package`.
+include(${CMAKE_SOURCE_DIR}/cmake/Package.cmake)
