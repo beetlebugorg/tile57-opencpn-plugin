@@ -385,9 +385,15 @@ void ChartTile57::apply_canvas_enc_options() {
     const PI_DisCat cat = GetENCDisplayCategory(ci);
     mariner_.display_base = true;
     mariner_.display_standard = (cat != PI_DISPLAYBASE);
-    // tile57 has no dedicated soundings switch — soundings are OTHER category — so
-    // honour OpenCPN's explicit soundings toggle alongside the category.
+    // S-52 files soundings under the OTHER category, but OpenCPN — like every ECDIS — has a
+    // SEPARATE soundings switch, and the everyday setting is STANDARD + soundings on. We used
+    // to serve that by turning the whole OTHER category on, which dragged in every
+    // low-priority feature on the chart (the magenta info circles, the extra text) and buried
+    // the display in noise. So portray OTHER when either switch asks for it, and let the
+    // renderer drop the non-soundings when only the soundings were wanted — tile57 tags each
+    // feature with its display category, so that filter is one test per feature.
     mariner_.display_other = (cat == PI_OTHER) || soundings;
+    renderer_.set_display_filter(cat == PI_OTHER, soundings);
 
     // Lights aren't a mariner flag in S-52, they're viewing group 27070: switching them
     // off means denying that group. Keep the vector stable so the pointer we hand the

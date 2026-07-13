@@ -33,6 +33,14 @@ class ChartRenderer {
     // compilation scale (see feature_scamin). `native_scale` is the cell's 1:N denominator.
     // Changing either clears the tile cache — the value is baked into the vertex buffers.
     void set_super_scamin(bool on, double native_scale);
+    // OpenCPN's display category + its separate "show soundings" switch. S-52 files soundings
+    // under the OTHER category, but OpenCPN (like every ECDIS) lets you show them WITHOUT
+    // turning that whole category on. We portray with display_other=true so soundings exist,
+    // then drop the rest of OTHER here — tile57 tags every feature with its category, so this
+    // is one test, not a class list. Changing it clears the tile cache (it is baked in).
+    void set_display_filter(bool other_category, bool soundings);
+    // Should this feature be emitted at all? (The category filter above.)
+    bool feature_visible(const tile57_feature* f) const;
     // The 1:N denominator this feature is culled at (authored SCAMIN, imputed super-SCAMIN,
     // or "never"). Public because the C surface trampolines route every draw call through it.
     float feature_scamin(const tile57_feature* f) const;
@@ -134,6 +142,8 @@ class ChartRenderer {
     // scale, and whether to impute a SCAMIN from it for features the ENC left ungated.
     double native_scale_ = 0.0;
     bool super_scamin_ = true;
+    bool other_category_ = false; // the mariner asked for the whole OTHER category
+    bool soundings_ = true;       // ...or just its soundings (OpenCPN's own switch)
     // Callback handlers (world/local geometry -> Vtx). `align` is tile57's per-feature
     // rotation-alignment; it becomes the vertex's postrot (see the note above).
     void on_fill_area(const tile57_world_rings* r, tile57_rgba c, float scamin);

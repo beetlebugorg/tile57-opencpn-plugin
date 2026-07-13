@@ -767,6 +767,8 @@ static float feat_scamin(void* c, const tile57_feature* f) {
 static void tr_fill(void* c, const tile57_feature* f, const tile57_world_rings* r, tile57_rgba col,
                     int) {
     auto* s = static_cast<ChartRenderer*>(c);
+    if (!s->feature_visible(f))
+        return; // OpenCPN's display-category filter (see feature_visible)
     s->set_plane(f);
     const size_t n0 = s->area_.size();
     s->on_fill_area(r, col, feat_scamin(c, f));
@@ -775,6 +777,8 @@ static void tr_fill(void* c, const tile57_feature* f, const tile57_world_rings* 
 static void tr_stroke(void* c, const tile57_feature* f, const tile57_world_rings* l, float w, float,
                       float, tile57_rgba col) {
     auto* s = static_cast<ChartRenderer*>(c);
+    if (!s->feature_visible(f))
+        return; // OpenCPN's display-category filter (see feature_visible)
     s->set_plane(f);
     const size_t n0 = s->line_.size();
     s->on_stroke_line(l, w, col, feat_scamin(c, f));
@@ -784,6 +788,8 @@ static void tr_symbol(void* c, const tile57_feature* f, tile57_world_point a,
                       const tile57_local_rings* r, tile57_rgba col, int eo, float sw,
                       tile57_rot_align align) {
     auto* s = static_cast<ChartRenderer*>(c);
+    if (!s->feature_visible(f))
+        return; // OpenCPN's display-category filter (see feature_visible)
     s->set_plane(f);
     const size_t n0 = s->symbol_.size();
     s->on_draw_symbol(a, r, col, eo, sw, align, feat_scamin(c, f));
@@ -792,11 +798,15 @@ static void tr_symbol(void* c, const tile57_feature* f, tile57_world_point a,
 static void tr_text(void* c, const tile57_feature* f, tile57_world_point a,
                     const tile57_local_rings* g, tile57_rgba col, tile57_rgba halo, float,
                     tile57_rot_align align) {
+    if (!static_cast<ChartRenderer*>(c)->feature_visible(f))
+        return;
     static_cast<ChartRenderer*>(c)->on_draw_text(a, g, col, halo, align, feat_scamin(c, f));
 }
 static void tr_sprite(void* c, const tile57_feature* f, const char* name, size_t len,
                       tile57_world_point a, float rot, tile57_rot_align align, float hw, float hh) {
     auto* s = static_cast<ChartRenderer*>(c);
+    if (!s->feature_visible(f))
+        return; // OpenCPN's display-category filter (see feature_visible)
     s->set_plane(f);
     const size_t n0 = s->sprite_.size();
     s->on_draw_sprite(name, len, a, rot, align, hw, hh, feat_scamin(c, f));
@@ -805,6 +815,8 @@ static void tr_sprite(void* c, const tile57_feature* f, const char* name, size_t
 static void tr_pattern(void* c, const tile57_feature* f, const char* name, size_t len,
                        const tile57_world_rings* rings) {
     auto* s = static_cast<ChartRenderer*>(c);
+    if (!s->feature_visible(f))
+        return; // OpenCPN's display-category filter (see feature_visible)
     s->set_plane(f);
     const size_t n0 = s->pattern_.size();
     s->on_draw_pattern(name, len, rings, feat_scamin(c, f));
@@ -833,6 +845,8 @@ static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, 
             wxString::FromAscii(align == TILE57_ALIGN_MAP ? "MAP" : "VIEWPORT"), rot, size, ox, oy,
             (const void*)text, len, t));
     }
+    if (!static_cast<ChartRenderer*>(c)->feature_visible(f))
+        return;
     static_cast<ChartRenderer*>(c)->on_draw_text_str(a, ox, oy, text, len, size, rot, align, col,
                                                      halo, feat_scamin(c, f));
 }
@@ -1510,6 +1524,29 @@ ChartRenderer::TileGeom& ChartRenderer::ensure_tile(int z, uint32_t x, uint32_t 
         glBufferData(GL_ARRAY_BUFFER, src[i].bytes, src[i].data, GL_STATIC_DRAW);
     }
     return tiles_.emplace(key, t).first->second;
+}
+
+// OpenCPN's display category + soundings switch (see the header). Baked into the tiles at
+// portray, so a change clears the cache.
+void ChartRenderer::set_display_filter(bool other_category, bool soundings) {
+    if (other_category == other_category_ && soundings == soundings_)
+        return;
+    other_category_ = other_category;
+    soundings_ = soundings;
+    clear_tiles();
+}
+
+// S-52 puts soundings in the OTHER display category, but a mariner running STANDARD with
+// soundings on wants the soundings and NOT the rest of that category — which is what OpenCPN
+// does, and what every chart in the wild looks like. Portraying with display_other=true and
+// dropping the non-soundings here gives exactly that; without it, ticking "soundings" drags
+// in every low-priority feature on the chart and the display turns to noise.
+bool ChartRenderer::feature_visible(const tile57_feature* f) const {
+    if (!f || other_category_ || f->disp_cat != TILE57_DISP_OTHER)
+        return true; // base/standard always; OTHER too when the mariner asked for it
+    const char* c = f->cls;
+    const bool is_sounding = c && std::strncmp(c, "SOUNDG", 6) == 0;
+    return is_sounding && soundings_;
 }
 
 // The cell's compilation scale (1:N) + whether to impute SCAMIN from it. Both feed
