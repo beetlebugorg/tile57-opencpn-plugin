@@ -27,7 +27,37 @@ class Tile57Plugin : public opencpn_plugin_119 {
         tile57_warmup();
         return INSTALLS_PLUGIN_CHART | INSTALLS_PLUGIN_CHART_GL | WANTS_MOUSE_EVENTS |
                WANTS_CURSOR_LATLON | WANTS_PREFERENCES | // the "Build Charts" settings panel
-               WANTS_PLUGIN_MESSAGING;                   // the "OpenCPN Config" S52 state push
+               WANTS_PLUGIN_MESSAGING |                  // the "OpenCPN Config" S52 state push
+               WANTS_LATE_INIT;                          // kick a chart-DB refresh once registered
+    }
+
+    // Why our *.pmtiles charts are otherwise hit-or-miss: every OpenCPN path that
+    // discovers, quilts or opens a plugin chart looks the file extension up in the chart
+    // database's plugin-class descriptor list (chartdbs.cpp SearchDirAndAddCharts /
+    // IsChartAvailable, chartdb.cpp OpenChartUsingCache). That list is only populated for
+    // plugins that are already enabled AND past Init() — and OpenCPN builds it LATE:
+    // LoadChartDatabase() and the first DoChartUpdate() run at startup BEFORE plugins load,
+    // so the descriptor for ChartTile57 isn't there yet. A directory scanned in that window
+    // never adds our cells, and cells already in the persisted DB are reported "unavailable"
+    // and silently skipped by the quilt until the list is rebuilt. Whether that rebuild
+    // wins the race with the first compose is timing-dependent — hence "sometimes it works."
+    //
+    // LateInit runs once the class IS registered (OpenCPN calls it from CallLateInit during
+    // the deferred-startup timer, before its final DoChartUpdate). So schedule ONE chart-DB
+    // refresh: an incremental rescan of the configured directories (picks up cells the early
+    // scan missed) followed by ChartsRefresh() (recomposes the quilt so already-known cells
+    // become available). Deferred via CallAfter so it lands after the startup timer sequence
+    // completes rather than re-entering it. force=false keeps it cheap — unchanged
+    // directories are skipped by magic number. This is belt-and-braces on the plugin side;
+    // the root ordering fix belongs in OpenCPN.
+    void LateInit() override {
+        if (wxWindow* w = GetOCPNCanvasWindow())
+            w->CallAfter([] {
+                wxArrayString dirs = GetChartDBDirArrayString();
+                if (!dirs.IsEmpty())
+                    UpdateChartDBInplace(dirs, /*b_force_update=*/false,
+                                         /*b_ProgressDialog=*/false);
+            });
     }
 
     // OpenCPN broadcasts its live S52PLIB configuration as a JSON message whenever the

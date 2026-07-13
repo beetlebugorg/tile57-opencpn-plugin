@@ -279,21 +279,57 @@ void ChartTile57::apply_info(tile57_chart* h, const tile57_info& info) {
     covr_[7] = (float)info.west; // SW
     covr_valid_ = true;
 
-    // Real M_COVR data-coverage polygons: report these so OpenCPN quilts gaps to
-    // coarser cells instead of over-claiming the bbox above.
+    // Coverage for the quilt. When covr_tables_ is non-empty it OVERRIDES the bbox above
+    // (GetCOVREntries), and OpenCPN turns each ring into an LLRegion via a polygon
+    // tessellator (quilt.cpp GetChartQuiltRegion -> LLRegion(n, pts)). tile57 emits CLOSED
+    // rings (last vertex == first), which gives the tessellator a zero-length edge and
+    // collapses the region to EMPTY — so the cell gets no quilt patch and never paints at
+    // any zoom. Default therefore to the bbox (a clean rectangle can't degenerate); the
+    // real M_COVR polygons (which let OpenCPN quilt gaps to coarser cells) are opt-in via
+    // TILE57_MCOVR while the ring cleanup below is proven out.
     covr_tables_.clear();
-    tile57_coverage_cb ccb{&covr_tables_, [](void* ctx, const double* ll, size_t n) {
-                               auto* tables = static_cast<std::vector<std::vector<float>>*>(ctx);
-                               std::vector<float> ring;
-                               ring.reserve(n * 2);
-                               for (size_t i = 0; i < n;
-                                    ++i) { // tile57 gives lon,lat; OpenCPN wants lat,lon
-                                   ring.push_back((float)ll[2 * i + 1]);
-                                   ring.push_back((float)ll[2 * i]);
-                               }
-                               tables->push_back(std::move(ring));
-                           }};
-    tile57_chart_coverage(h, &ccb, nullptr);
+    if (std::getenv("TILE57_MCOVR")) {
+        tile57_coverage_cb ccb{&covr_tables_, [](void* ctx, const double* ll, size_t n) {
+                                   auto* tables =
+                                       static_cast<std::vector<std::vector<float>>*>(ctx);
+                                   // Drop a duplicated closing vertex: OpenCPN's tessellator
+                                   // wants an OPEN ring, and the zero-length edge from a
+                                   // repeated first/last point empties the region.
+                                   if (n >= 2 && ll[0] == ll[2 * (n - 1)] &&
+                                       ll[1] == ll[2 * (n - 1) + 1])
+                                       --n;
+                                   if (n < 3)
+                                       return; // degenerate ring — skip, fall back to bbox
+                                   std::vector<float> ring;
+                                   ring.reserve(n * 2);
+                                   for (size_t i = 0; i < n;
+                                        ++i) { // tile57 gives lon,lat; OpenCPN wants lat,lon
+                                       ring.push_back((float)ll[2 * i + 1]);
+                                       ring.push_back((float)ll[2 * i]);
+                                   }
+                                   tables->push_back(std::move(ring));
+                               }};
+        tile57_chart_coverage(h, &ccb, nullptr);
+    }
+
+    // DIAG: the COVR tables (when non-empty) OVERRIDE the bbox for quilting, so if tile57
+    // hands back a wrong/degenerate M_COVR ring the chart quilts to the wrong place — no
+    // outline, nothing renders at the real location, and a chart-bar click jumps to the
+    // bogus coverage centroid. Log what we actually got vs. the bbox so "middle of the
+    // ocean" can be pinned to bad coverage coords rather than the (logged-correct) bounds.
+    if (std::getenv("TILE57_DEBUG")) {
+        wxLogMessage("tile57 COVR: %s bbox[N%.4f S%.4f E%.4f W%.4f] tables=%zu",
+                     m_Name.c_str(), info.north, info.south, info.east, info.west,
+                     covr_tables_.size());
+        for (size_t t = 0; t < covr_tables_.size(); ++t) {
+            const auto& r = covr_tables_[t];
+            wxLogMessage("tile57 COVR[%zu]: %zu pts first(lat=%.4f lon=%.4f) "
+                         "last(lat=%.4f lon=%.4f)",
+                         t, r.size() / 2, r.empty() ? 0.f : r[0], r.size() < 2 ? 0.f : r[1],
+                         r.size() < 2 ? 0.f : r[r.size() - 2],
+                         r.empty() ? 0.f : r[r.size() - 1]);
+        }
+    }
 
     bounds_west_ = info.west;
     bounds_south_ = info.south;
