@@ -16,6 +16,64 @@
 #include <wx/jsonreader.h>
 #include <wx/jsonval.h>
 #include <wx/log.h>
+#include <wx/timer.h>
+
+// Coalesced redraw scheduler shared by every ChartTile57 cell on the canvas. It exists to
+// keep progressive tile fill-in from defeating OpenCPN's accelerated pan.
+//
+// The old scheme asked for a full-frame Refresh(true) on EVERY frame while any tile or
+// label was pending. Refresh(true) invalidates the glChartCanvas FBO, so every pan frame
+// became a full re-render (the ~13% every-frame compose seen in profiles) and accelerated
+// pan — which would otherwise just blit the cached frame and re-render the thin exposed
+// margin — never engaged.
+//
+// Instead:
+//   - request_now(): the portray worker calls this (via ChartRenderer's progress callback)
+//     the moment it finishes a tile, so freshly-baked tiles are uploaded and composited
+//     promptly, including mid-pan. Coalesced by an atomic so a burst of completions queues
+//     at most one redraw. Thread-safe (CallAfter marshals onto the GUI thread).
+//   - arm_settle(): the render pass calls this while anything is still pending; it (re)arms
+//     a one-shot debounce that fires ~after motion/loading quiesces, catching the label
+//     re-portray on settle and any final tile drain. Restarted every pending frame, so
+//     during a continuous gesture it never fires — OpenCPN's own gesture paints + the
+//     worker's request_now carry the frame, and accelerated pan keeps the steady pan cheap.
+// Refresh(true) is still used (eraseBackground=true is load-bearing: it forces the real
+// render pass that portrays/drains, per the gray-tile fix) — just far less often.
+namespace {
+class RedrawScheduler : public wxEvtHandler {
+  public:
+    static RedrawScheduler& instance() {
+        static RedrawScheduler s;
+        return s;
+    }
+    // Worker or GL thread: request one coalesced full redraw as soon as possible.
+    void request_now(wxWindow* canvas) {
+        if (!canvas || inflight_.exchange(true))
+            return; // already one queued
+        canvas->CallAfter([this, canvas] {
+            inflight_.store(false);
+            canvas->Refresh(true);
+        });
+    }
+    // GUI thread only: (re)arm the settle debounce; fires one redraw after activity stops.
+    void arm_settle(wxWindow* canvas) {
+        canvas_ = canvas;
+        timer_.StartOnce(60);
+    }
+
+  private:
+    RedrawScheduler() : timer_(this) {
+        Bind(wxEVT_TIMER, &RedrawScheduler::on_timer, this);
+    }
+    void on_timer(wxTimerEvent&) {
+        if (canvas_)
+            canvas_->Refresh(true);
+    }
+    wxTimer timer_;
+    wxWindow* canvas_ = nullptr;
+    std::atomic<bool> inflight_{false};
+};
+} // namespace
 
 // OpenCPN 5.12 DECLARES GetEnableLightDescriptionsDisplay in the 1.19 API header but does
 // NOT export it from the executable — the setter (EnableLightDescriptionsDisplay) is
@@ -800,8 +858,20 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     // Remember the canvas (on the GL thread, where it's valid) for the deferred-tile
     // CallAfter(Refresh) below — a settled view with cold tiles still pending asks for
     // one more redraw so they fill in.
-    if (!canvas_)
+    if (!canvas_) {
         canvas_ = GetOCPNCanvasWindow();
+        // Construct the shared scheduler HERE, on the GUI thread, before any worker can
+        // start — its wxTimer/Bind must not be first-touched from the worker's request_now.
+        RedrawScheduler::instance();
+        // The worker fires this the instant it finishes a tile (off the GUI thread);
+        // route it to the coalesced scheduler so the tile composites promptly without a
+        // per-frame full re-render. Reads canvas_ live; the worker is joined in
+        // ~ChartRenderer before this object dies, so canvas_ is valid whenever it runs.
+        renderer_.set_progress_callback([this] {
+            if (canvas_)
+                RedrawScheduler::instance().request_now(canvas_);
+        });
+    }
 
     // Render into the CURRENT GL viewport — that is what NDC maps to, and it is
     // OpenCPN's choice of target (canvas FBO, or a sub-rect of it). Do NOT size
@@ -956,21 +1026,15 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
                              device_scale, cull_bias, rot, scamin_display_denom, patch_fb);
         }
     }
-    // The tiled renderer portrays only a budget of new tiles per frame (so a big
-    // first-visit burst doesn't freeze one frame). If it deferred some, schedule
-    // another redraw so they fill in progressively.
-    // Ask for one more redraw only if this render deferred tiles/labels. Coalesce across
-    // the whole canvas: one paint fans out to every pass (base/text) and every quilt cell,
-    // and each used to queue its own CallAfter(Refresh) — N redundant full-canvas repaints
-    // for one frame's worth of pending. A single in-flight guard collapses them to one:
-    // one Refresh already repaints all cells. The flag is cleared inside the marshalled
-    // callback (main thread) BEFORE Refresh, so the paint it triggers can queue the next.
-    static std::atomic<bool> refresh_inflight{false};
-    if (renderer_.tiles_pending() && canvas_ && !refresh_inflight.exchange(true))
-        canvas_->CallAfter([w = canvas_]() {
-            refresh_inflight.store(false);
-            w->Refresh(false);
-        });
+    // Progressive fill WITHOUT defeating accelerated pan. Tiles that finish are composited
+    // by the worker's request_now (set up above), so we don't force a redraw here for them.
+    // We only (re)arm the settle debounce while anything is still pending — tiles OR a
+    // stale label re-portray deferred to settle (tiles_pending() covers both). During a
+    // continuous gesture this keeps getting pushed out and never fires, so accelerated pan
+    // stays engaged; ~60 ms after activity stops it fires one Refresh(true) to re-portray
+    // labels and drain any last tiles. (See RedrawScheduler above for the full rationale.)
+    if (renderer_.tiles_pending() && canvas_)
+        RedrawScheduler::instance().arm_settle(canvas_);
     if (pass != t57::ChartRenderer::Pass::kText)
         draw_calibration();
     return true;
@@ -1085,6 +1149,9 @@ wxString ChartTile57::QueryDescription(double lon, double lat) const {
         return wxEmptyString;
     std::vector<QueryHit> hits;
     tile57_query_cb cb{&hits, collect_hit};
+    // The tile-portray worker uses the same (unsynchronized) tile57 handle; one
+    // caller at a time. Worst case this waits out one in-flight tile portray.
+    std::lock_guard<std::mutex> lock(renderer_.portray_mutex());
     tile57_chart_query(ch, lon, lat, last_zoom_, &cb, nullptr);
     if (hits.empty())
         return wxEmptyString;

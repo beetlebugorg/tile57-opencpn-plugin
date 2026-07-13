@@ -16,9 +16,15 @@
 //   aScamin SCAMIN cull: the vertex is dropped when the view zoom < aScamin.
 #pragma once
 #include "tile57.h"
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace t57 {
@@ -70,6 +76,19 @@ class ChartRenderer {
     bool tiles_pending() const { return tiles_pending_ || labels_pending_; }
     bool get_info(tile57_info& out) const;
     tile57_chart* chart_handle() const { return chart_; } // for object-query
+    // Serializes EVERY call into chart_ (and the shared portray scratch): the tile57
+    // handle is not internally synchronized (tile57.h "Threading"), and tile portray now
+    // runs on a worker thread. Anyone outside this class touching chart_handle() — the
+    // object-query path — must hold this for the duration of the call.
+    std::mutex& portray_mutex() const { return portray_mu_; }
+    // Called (from the portray WORKER thread) whenever the worker finishes a tile and
+    // pushes a result — the host uses it to request a coalesced redraw so finished tiles
+    // appear promptly WITHOUT forcing a full-frame re-render every frame (which would
+    // invalidate OpenCPN's FBO and defeat accelerated pan). The target must be
+    // thread-safe (it marshals a Refresh onto the GUI thread). Set once before the worker
+    // can start (i.e. before the first render), then only read by the worker.
+    void set_progress_callback(std::function<void()> cb) { on_progress_ = std::move(cb); }
+    ~ChartRenderer(); // joins the portray worker
 
     // postrot (on Vtx/SpriteVtx/GlyphVtx): does this vertex's screen-px offset (px,py) turn
     // with the chart under a rotated view? 1 = yes (MAP-aligned), 0 = no (VIEWPORT-aligned,
@@ -244,6 +263,57 @@ class ChartRenderer {
     static uint64_t tile_key(int z, uint32_t x, uint32_t y) {
         return ((uint64_t)(z & 0x1f) << 58) | ((uint64_t)(x & 0x1fffffff) << 29) | (y & 0x1fffffff);
     }
+
+    // ---- async tile portray -------------------------------------------------
+    // The CPU half of a tile portray (pmtiles decode + tessellation + priority sort —
+    // ALL of the cost) runs on a per-renderer worker thread; the GL thread only uploads
+    // finished vertex arrays (upload_tile) and composes cached tiles, so a pan/zoom
+    // frame never stalls on portray. portray_mu_ serializes every portray AND every
+    // other call into chart_ (worker tile portray, GL-thread label portray, object
+    // query): the tile57 handle is not internally synchronized, and the portray sinks
+    // are the shared member scratch above. TILE57_SYNC=1 restores the old synchronous
+    // budgeted portray (A/B lever, and the fallback if a platform dislikes the thread).
+    struct TileJob {
+        int z;
+        uint32_t x, y;
+        uint64_t gen;  // portray generation the job was queued under (stale -> skipped)
+        tile57_mariner m;
+        // Deep copy of m.viewing_groups_off: tile57 only requires the pointee to outlive
+        // the CALL, so the caller's array cannot be assumed alive when the worker runs.
+        // The worker re-points m at this before portraying (data() moves with the job).
+        std::vector<int32_t> vg_off;
+    };
+    struct TileCpu { // one finished portray, awaiting GL upload on the paint thread
+        uint64_t key = 0;
+        uint64_t gen = 0;
+        double ref_wx = 0, ref_wy = 0;
+        std::vector<Vtx> area, symbol, text;
+        std::vector<LineVtx> line;
+        std::vector<SpriteVtx> sprite;
+        std::vector<PatVtx> pattern;
+        std::vector<GlyphVtx> glyph;
+        std::vector<Range> ranges[7];
+    };
+    void enqueue_tile(int z, uint32_t x, uint32_t y, const tile57_mariner& m); // GL thread
+    void portray_tile_cpu(const TileJob& job, TileCpu& out); // worker (takes portray_mu_)
+    TileGeom& upload_tile(TileCpu&& c);   // GL thread: create VBOs + insert into tiles_
+    int drain_portrayed_tiles();          // GL thread: upload all finished results
+    void worker_loop();
+    void stop_worker(); // quit + join (dtor / shutdown)
+
+    mutable std::mutex portray_mu_; // chart_ + portray scratch: one user at a time
+    std::function<void()> on_progress_; // worker -> host "a tile is ready" (see setter)
+    std::thread worker_;            // lazily started by the first enqueue
+    std::mutex q_mu_;               // guards jobs_/done_/quit_/portray_gen_ vs the worker
+    std::condition_variable q_cv_;
+    std::deque<TileJob> jobs_;
+    std::vector<TileCpu> done_;
+    bool quit_ = false;
+    uint64_t portray_gen_ = 0; // bumped by clear_tiles(): queued work is for a dead cache
+    // Keys queued or portraying right now (GL thread only). A key is added at enqueue and
+    // removed ONLY when its result drains — every queued job posts exactly one result
+    // (even a stale one posts an empty TileCpu), so entries cannot leak.
+    std::unordered_set<uint64_t> inflight_;
 
     tile57_chart* chart_ = nullptr;
     uint32_t prog_ = 0; // solid Vtx program (area/symbol/text tile layers)
