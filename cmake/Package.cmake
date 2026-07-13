@@ -56,15 +56,17 @@ configure_file(${CMAKE_SOURCE_DIR}/cmake/metadata.xml.in
                ${CMAKE_BINARY_DIR}/metadata.xml @ONLY)
 
 # Assemble the staging tree and tar it. All commands go through `cmake -E` so this
-# works identically on Linux and the MSVC runner.
+# works identically on Linux and the MSVC runner. The tar runs via `cmake -E chdir`
+# (not the target's WORKING_DIRECTORY, which must exist before the FIRST command runs
+# and pkg/ does not yet) so the tarball's top dir is just ${_pkg_base}, no pkg/ prefix.
 add_custom_target(package
   COMMAND ${CMAKE_COMMAND} -E rm -rf ${CMAKE_BINARY_DIR}/pkg
   COMMAND ${CMAKE_COMMAND} -E make_directory ${_pkg_stage}/${_pkg_bin_subdir}
   COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:tile57_pi>
           ${_pkg_stage}/${_pkg_bin_subdir}/${_pkg_bin_name}
   COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/metadata.xml ${_pkg_stage}/metadata.xml
-  COMMAND ${CMAKE_COMMAND} -E tar czf ${CMAKE_BINARY_DIR}/${_pkg_base}.tar.gz ${_pkg_base}
-  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/pkg
+  COMMAND ${CMAKE_COMMAND} -E chdir ${CMAKE_BINARY_DIR}/pkg
+          ${CMAKE_COMMAND} -E tar czf ${CMAKE_BINARY_DIR}/${_pkg_base}.tar.gz ${_pkg_base}
   DEPENDS tile57_pi
   COMMENT "Packaging ${_pkg_base}.tar.gz (OpenCPN import tarball)"
   VERBATIM)
