@@ -872,28 +872,6 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
         mariner_.ignore_scamin
             ? 0.0
             : (vp.chart_scale > 0 ? (double)vp.chart_scale : scale_denom(zoom, vp.clat));
-    // TILE57_DEBUG: one line per zoom step exposing the HiDPI coupling — scamin_denom is what
-    // the SCAMIN shader test uses (a feature hides when scamin_denom > its SCAMIN; 0 = cull
-    // off). gate = fbw vs pix_width*csf shows why device_scale resolves to 1.
-    //
-    // dbg_zoom_ is PER CHART, deliberately: a quilt draws a dozen cells into one view, and a
-    // function-level static let only the first of them ever log — precisely hiding the thing
-    // worth seeing, which is WHICH CELLS paint a given view. `cell` is this chart's own
-    // compilation scale; when chart_scale > super_scamin, everything but the display-base
-    // skeleton of THIS cell should be gone from the screen.
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg && pass != t57::ChartRenderer::Pass::kText &&
-        std::fabs(zoom - dbg_zoom_) > 0.02) {
-        dbg_zoom_ = zoom;
-        wxLogMessage("tile57 DBG: %s zoom=%.3f scamin_denom=1:%.0f (chart_scale=1:%.0f "
-                     "bias=%.2f) super_scamin=1:%.0f cell=1:%d dev_scale=%.2f csf=%.2f "
-                     "pixW=%d fbW=%u gate(pixW*csf)=%ld size_scale=%.3f ppm=%.5f",
-                     m_Name.c_str(), zoom, scamin_display_denom * std::pow(2.0, cull_bias),
-                     (double)vp.chart_scale, cull_bias,
-                     mariner_.ignore_scamin ? 0.0 : m_Chart_Scale * 2.0, m_Chart_Scale,
-                     device_scale, csf, vp.pix_width, fbw, std::lround(vp.pix_width * csf),
-                     mariner_.size_scale, ppm);
-    }
     // Chart rotation (course-up / head-up, and the manual rotate control). OpenCPN does NOT
     // rotate the framebuffer for us — a GL chart is handed the rotation and is expected to
     // draw its own geometry turned, exactly as the core's native vector charts do (see
@@ -909,20 +887,6 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
         return e ? std::atof(e) * kPi / 180.0 : 1e9; // 1e9 sentinel: use the host's angle
     }();
     const double rot = rot_override < 1e8 ? rot_override : vp.rotation;
-    // What the host actually handed us. Logged on CHANGE (not per frame) so turning the
-    // chart prints one line: if rotation stays 0.0 while the ownship turns, the angle never
-    // reached the plugin and the transform below is not the problem.
-    if (dbg && pass != t57::ChartRenderer::Pass::kText) {
-        static double dbg_rot = 1e9;
-        if (std::fabs(vp.rotation - dbg_rot) > 0.002) {
-            dbg_rot = vp.rotation;
-            wxLogMessage("tile57 ROT: vp.rotation=%.4f rad (%.1f°) vp.skew=%.4f rad (%.1f°) "
-                         "applied=%.1f° rv_rect=[%d,%d %dx%d] pix=%dx%d fb=%ux%u",
-                         vp.rotation, vp.rotation * 180.0 / kPi, vp.skew, vp.skew * 180.0 / kPi,
-                         rot * 180.0 / kPi, vp.rv_rect.x, vp.rv_rect.y, vp.rv_rect.width,
-                         vp.rv_rect.height, vp.pix_width, vp.pix_height, fbw, fbh);
-        }
-    }
     // Clip to the patch this cell owns BEFORE drawing anything (see QuiltClip). Scoped, so
     // the GL clip state is restored however we leave.
     {

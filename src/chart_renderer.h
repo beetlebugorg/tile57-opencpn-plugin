@@ -148,15 +148,6 @@ class ChartRenderer {
     double ref_wx_ = 0, ref_wy_ = 0;
     // Geometry decimation epsilon in world units (~half a portrayal pixel).
     double decimate_eps_ = 0;
-    // Screen px per world unit AT THE TILE'S OWN ZOOM (256 * 2^z). The engine bakes
-    // complex-linestyle brick SPACING into tile-local geometry, so it only lands at the
-    // intended screen spacing when the tile is drawn at its native zoom. TILE57_DEBUG uses
-    // this to report the spacing the engine actually asked for, in px.
-    double portray_px_per_world_ = 0;
-    // TILE57_DEBUG only: the previous sprite anchor, to measure brick spacing along a
-    // complex linestyle (consecutive same-name MAP-aligned sprites are one style's bricks).
-    std::string dbg_sprite_name_;
-    double dbg_sprite_ax_ = 0, dbg_sprite_ay_ = 0;
     // Display scale (mariner size_scale) — pattern tile screen size.
     double size_scale_ = 1.0;
     // Super-SCAMIN state (see feature_scamin / set_super_scamin): the cell's compilation

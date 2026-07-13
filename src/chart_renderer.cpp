@@ -192,22 +192,6 @@ void ChartRenderer::on_stroke_line(const tile57_world_rings* p, float width_px, 
     float hw = std::max(0.5f, width_px * 0.5f);
     dash_on *= dash_cal_factor();
     dash_off *= dash_cal_factor();
-    // TILE57_DEBUG: the ACTUAL numbers behind a dashed line, once per distinct pattern. The
-    // dash is cut in px (dash_on/off) against an arc length scaled by uScale, and those two
-    // must be the same px — so if the spacing is off, this line and the uScale/device_scale
-    // line in render() are what to compare. period_px is one full on+off cycle on screen.
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg && dash_on > 0.0f) {
-        static std::vector<std::array<float, 3>> seen;
-        std::array<float, 3> key{width_px, dash_on, dash_off};
-        if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
-            seen.push_back(key);
-            wxLogMessage("tile57 DASH: width=%.2fpx on=%.2fpx off=%.2fpx period=%.2fpx "
-                         "(size_scale=%.3f, TILE57_DASH=%.2f)",
-                         width_px, dash_on, dash_off, dash_on + dash_off, size_scale_,
-                         dash_cal_factor());
-        }
-    }
     // A sub-pixel dash cannot be resolved — it aliases into a grey smear that reads as a
     // washed-out solid line. Draw it as the solid line it is trying to be.
     if (dash_on < 1.0f || dash_off < 1.0f)
@@ -627,32 +611,6 @@ void ChartRenderer::on_draw_sprite(const char* name, size_t len, tile57_world_po
     if (it == g_atlas.uv.end())
         return;
     const AtlasRect& r = it->second;
-    // TILE57_DEBUG: measure a complex linestyle's BRICK SPACING against its BRICK SIZE.
-    // The engine bakes the spacing into tile-local geometry (linestyle.drawComplexRun walks
-    // arc length in tile units), so it only lands at the intended screen spacing when the
-    // tile is drawn at its NATIVE zoom — but the brick's size (hw/hh) is constant SCREEN px.
-    // gap_px is the spacing the engine asked for, at the tile's own zoom; drawn_gap_px is
-    // what it becomes on screen at the CURRENT view zoom. If drawn_gap_px is at or below
-    // 2*hw the bricks touch or overlap — that is "too close together", measured.
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg && align == TILE57_ALIGN_MAP && portray_px_per_world_ > 0) {
-        std::string nm(name, len);
-        if (nm == dbg_sprite_name_) {
-            const double dx = anchor.x - dbg_sprite_ax_, dy = anchor.y - dbg_sprite_ay_;
-            const double gap = std::sqrt(dx * dx + dy * dy) * portray_px_per_world_;
-            static std::vector<std::string> seen;
-            if (gap > 1e-6 && std::find(seen.begin(), seen.end(), nm) == seen.end()) {
-                seen.push_back(nm);
-                wxLogMessage("tile57 BRICK: %s gap=%.1fpx size=%.1fx%.1fpx (2*hw=%.1f) -> %s "
-                             "[size_scale=%.3f, spacing baked at the tile's zoom]",
-                             nm.c_str(), gap, hw * 2, hh * 2, hw * 2,
-                             gap <= hw * 2 ? "OVERLAPPING" : "clear", size_scale_);
-            }
-        }
-        dbg_sprite_name_ = nm;
-        dbg_sprite_ax_ = anchor.x;
-        dbg_sprite_ay_ = anchor.y;
-    }
     float awx = (float)(anchor.x - ref_wx_), awy = (float)(anchor.y - ref_wy_);
     float rad = rot_deg * (float)kPi / 180.0f, c = std::cos(rad), s = std::sin(rad);
     // rot_deg is baked into the quad here (a portray-time constant); the VIEW rotation is
@@ -853,26 +811,6 @@ static void tr_pattern(void* c, const tile57_feature* f, const char* name, size_
 static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, float ox, float oy,
                         const char* text, size_t len, float size, float rot, tile57_rot_align align,
                         tile57_rgba col, tile57_rgba halo) {
-    // TILE57_DEBUG: what the engine actually hands us per label. A depth-contour value must
-    // arrive MAP-aligned with its contour's tangent; an ordinary label VIEWPORT + 0. If a
-    // contour label draws upright on screen, this line says whether the angle never arrived
-    // (engine/ABI) or arrived and we failed to apply it (this file). Capped — labels are many.
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    static int dbg_left = 40;
-    if (dbg && dbg_left > 0) {
-        --dbg_left;
-        // Print the POINTER, and build the string ourselves. The previous version passed a
-        // non-NUL-terminated char* to wxLogMessage's %.*s, and a Unicode wx build treats %s
-        // as wchar_t* — so "(null)" in that log may have been wx mangling a perfectly good
-        // pointer rather than tile57 handing us a null one. ptr=0x0 settles it.
-        const wxString t =
-            text ? wxString::FromUTF8(text, len) : wxString::FromAscii("<NULL PTR>");
-        wxLogMessage(wxString::Format(
-            "tile57 TXT: cls=%s align=%s rot=%7.2f size=%.1f ox=%.1f oy=%.1f ptr=%p len=%zu [%s]",
-            wxString::FromAscii((f && f->cls) ? f->cls : "?"),
-            wxString::FromAscii(align == TILE57_ALIGN_MAP ? "MAP" : "VIEWPORT"), rot, size, ox, oy,
-            (const void*)text, len, t));
-    }
     static_cast<ChartRenderer*>(c)->on_draw_text_str(a, ox, oy, text, len, size, rot, align, col,
                                                      halo, feat_scamin(c, f));
 }
@@ -1573,9 +1511,7 @@ ChartRenderer::TileGeom& ChartRenderer::ensure_tile(int z, uint32_t x, uint32_t 
     ref_wx_ = t.ref_wx;
     ref_wy_ = t.ref_wy;
     decimate_eps_ = 0.5 / (256.0 * n);
-    portray_px_per_world_ = 256.0 * n; // px/world at the TILE's native zoom
     size_scale_ = m.size_scale > 0 ? m.size_scale : 1.0;
-    dbg_sprite_name_.clear();
     tile57_surface_cb cb{};
     fill_surface_cb(cb, this);
     tile57_chart_tile_surface(chart_, (uint8_t)z, x, y, &m, &cb, nullptr);
@@ -1865,19 +1801,6 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
 // (see the label cache there), not every frame.
 void ChartRenderer::portray_view_labels(double lon, double lat, double zoom, double rotation,
                                         uint32_t w, uint32_t h, const tile57_mariner& m) {
-    // TILE57_DEBUG: the settings the LABEL cache is baked with. Soundings live in the TILE
-    // cache and labels here, so if the two are portrayed under different mariner states the
-    // chart shows a mixture — e.g. soundings converted to feet while the depth-contour values
-    // still read in metres. This line says which unit THIS cache was built with.
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg) {
-        static int last_unit = -1;
-        if ((int)m.depth_unit != last_unit) {
-            last_unit = (int)m.depth_unit;
-            wxLogMessage("tile57 LBL: portraying labels with depth_unit=%s safety=%.1f",
-                         m.depth_unit == TILE57_DEPTH_FEET ? "FEET" : "METRES", m.safety_contour);
-        }
-    }
     text_.clear();
     glyph_.clear();
     lonlat_to_world(lon, lat, ref_wx_, ref_wy_); // labels referenced to view centre
@@ -2140,21 +2063,6 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     // (a 2x HiDPI framebuffer gets 2x px per world unit; zoom — and the SCAMIN cull
     // below — stays geographic).
     double scale_px = 256.0 * std::pow(2.0, zoom) * device_scale; // px per world[0,1]
-    // TILE57_DEBUG: scale_px IS the shader's uScale, and the line shader turns a vertex's
-    // world arc length into screen px with it (vDistPx = aDist * uScale). The dash is cut
-    // against that in px, so scale_px and the DASH: line above must be the SAME px — if
-    // device_scale is 2 here but the dash arrived in logical px, every dash is half length.
-    {
-        static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-        static double last = -1;
-        if (dbg && scale_px != last) {
-            last = scale_px;
-            wxLogMessage("tile57 SCALE: zoom=%.2f device_scale=%.2f -> uScale=%.1f px/world "
-                         "(=%.2f px per tile-px at z%d)",
-                         zoom, device_scale, scale_px, scale_px / (256.0 * std::pow(2.0, zoom)),
-                         (int)std::floor(zoom));
-        }
-    }
     // The SCAMIN cull denominator: the host's real display scale (1:N), compared per vertex
     // against the feature's own SCAMIN — hide when the display is SMALLER scale (zoomed out)
     // than the feature allows, i.e. denom > SCAMIN. 0 disables the cull entirely (OpenCPN's
