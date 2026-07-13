@@ -106,8 +106,12 @@ jobs:
         id: t57lib
         shell: bash
         run: |
-          lib=$(ls tile57/zig-out/lib/*.lib tile57/zig-out/lib/*.a 2>/dev/null | head -1)
+          echo "=== tile57/zig-out tree ==="
+          find tile57/zig-out -type f 2>/dev/null | sort || echo "(no zig-out)"
+          # Search the whole zig-out, not just lib/, in case the archive lands elsewhere.
+          lib=$(find tile57/zig-out \( -name '*.lib' -o -name '*.a' \) 2>/dev/null | head -1)
           echo "Found tile57 lib: $lib"
+          if [ -z "$lib" ]; then echo "::error::no tile57 static lib produced by zig build lib"; exit 1; fi
           echo "path=$lib" >> "$GITHUB_OUTPUT"
 
       - name: Install wxWidgets + GLEW (vcpkg)
