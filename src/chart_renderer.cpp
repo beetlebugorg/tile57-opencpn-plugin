@@ -627,6 +627,32 @@ void ChartRenderer::on_draw_sprite(const char* name, size_t len, tile57_world_po
     if (it == g_atlas.uv.end())
         return;
     const AtlasRect& r = it->second;
+    // TILE57_DEBUG: measure a complex linestyle's BRICK SPACING against its BRICK SIZE.
+    // The engine bakes the spacing into tile-local geometry (linestyle.drawComplexRun walks
+    // arc length in tile units), so it only lands at the intended screen spacing when the
+    // tile is drawn at its NATIVE zoom — but the brick's size (hw/hh) is constant SCREEN px.
+    // gap_px is the spacing the engine asked for, at the tile's own zoom; drawn_gap_px is
+    // what it becomes on screen at the CURRENT view zoom. If drawn_gap_px is at or below
+    // 2*hw the bricks touch or overlap — that is "too close together", measured.
+    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
+    if (dbg && align == TILE57_ALIGN_MAP && portray_px_per_world_ > 0) {
+        std::string nm(name, len);
+        if (nm == dbg_sprite_name_) {
+            const double dx = anchor.x - dbg_sprite_ax_, dy = anchor.y - dbg_sprite_ay_;
+            const double gap = std::sqrt(dx * dx + dy * dy) * portray_px_per_world_;
+            static std::vector<std::string> seen;
+            if (gap > 1e-6 && std::find(seen.begin(), seen.end(), nm) == seen.end()) {
+                seen.push_back(nm);
+                wxLogMessage("tile57 BRICK: %s gap=%.1fpx size=%.1fx%.1fpx (2*hw=%.1f) -> %s "
+                             "[size_scale=%.3f, spacing baked at the tile's zoom]",
+                             nm.c_str(), gap, hw * 2, hh * 2, hw * 2,
+                             gap <= hw * 2 ? "OVERLAPPING" : "clear", size_scale_);
+            }
+        }
+        dbg_sprite_name_ = nm;
+        dbg_sprite_ax_ = anchor.x;
+        dbg_sprite_ay_ = anchor.y;
+    }
     float awx = (float)(anchor.x - ref_wx_), awy = (float)(anchor.y - ref_wy_);
     float rad = rot_deg * (float)kPi / 180.0f, c = std::cos(rad), s = std::sin(rad);
     // rot_deg is baked into the quad here (a portray-time constant); the VIEW rotation is
@@ -1547,7 +1573,9 @@ ChartRenderer::TileGeom& ChartRenderer::ensure_tile(int z, uint32_t x, uint32_t 
     ref_wx_ = t.ref_wx;
     ref_wy_ = t.ref_wy;
     decimate_eps_ = 0.5 / (256.0 * n);
+    portray_px_per_world_ = 256.0 * n; // px/world at the TILE's native zoom
     size_scale_ = m.size_scale > 0 ? m.size_scale : 1.0;
+    dbg_sprite_name_.clear();
     tile57_surface_cb cb{};
     fill_surface_cb(cb, this);
     tile57_chart_tile_surface(chart_, (uint8_t)z, x, y, &m, &cb, nullptr);
