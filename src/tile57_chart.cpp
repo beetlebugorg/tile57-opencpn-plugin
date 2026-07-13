@@ -73,6 +73,13 @@ double display_size_scale(double csf) {
     double s = (sw * csf / mm) / kTile57RefPxPerMm * size_cal_factor();
     return (s > 0.1 && s < 12.0) ? s : 1.0;
 }
+// display_size_scale TIMES OpenCPN's "Chart object scale factor" slider — composed in ONE
+// place because it used to be two, and the render pass's copy left the slider out, so the
+// object scale vanished on the first frame whose csf differed from the cached one.
+double composed_size_scale(double csf) {
+    const float obj = GetOCPNChartScaleFactor_Plugin();
+    return display_size_scale(csf) * (obj > 0.1f ? obj : 1.0f);
+}
 // Pixels per metre of a nominal 96-DPI display; turns a ground resolution into
 // an OpenCPN "1:N" scale denominator.
 constexpr double kPxPerMetre = 96.0 / 0.0254;
@@ -465,10 +472,9 @@ void ChartTile57::load_s52_state() {
     mariner_.show_inform_callouts = false;
 
     // OpenCPN's "Chart object scale factor" slider, folded into the physical symbol scale
-    // the display calibration already computed (see display_size_scale).
-    const float obj_scale = GetOCPNChartScaleFactor_Plugin();
+    // the display calibration already computed (see composed_size_scale).
     const double csf = size_scale_csf_ > 0 ? size_scale_csf_ : OCPN_GetDisplayContentScaleFactor();
-    mariner_.size_scale = display_size_scale(csf) * (obj_scale > 0.1f ? obj_scale : 1.0f);
+    mariner_.size_scale = composed_size_scale(csf);
 
     // The config file: OpenCPN refreshes it whenever the Options dialog is applied
     // (MyFrame::ProcessOptionsDialog ends in pConfig->UpdateSettings()), so these are
@@ -821,7 +827,7 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     // changes (once, on the first real frame); this also refreshes cull_bias below.
     if (csf != size_scale_csf_) {
         size_scale_csf_ = csf;
-        mariner_.size_scale = display_size_scale(csf);
+        mariner_.size_scale = composed_size_scale(csf); // NOT display_size_scale — see there
     }
     // When OpenCPN hands a LOGICAL-unit ViewPort against a HiDPI framebuffer, the raw
     // ppm is logical. Instead of bumping the zoom by contentScale (which also shifts
