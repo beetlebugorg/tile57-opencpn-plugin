@@ -62,9 +62,7 @@ class RedrawScheduler : public wxEvtHandler {
     }
 
   private:
-    RedrawScheduler() : timer_(this) {
-        Bind(wxEVT_TIMER, &RedrawScheduler::on_timer, this);
-    }
+    RedrawScheduler() : timer_(this) { Bind(wxEVT_TIMER, &RedrawScheduler::on_timer, this); }
     void on_timer(wxTimerEvent&) {
         if (canvas_)
             canvas_->Refresh(true);
@@ -292,34 +290,33 @@ void ChartTile57::apply_info(tile57_chart* h, const tile57_info& info) {
     // drop out, covr_tables_ is left empty and GetCOVREntries falls back to the bbox, so the
     // cell still paints.
     covr_tables_.clear();
-    tile57_coverage_cb ccb{&covr_tables_, [](void* ctx, const double* ll, size_t n) {
-                               auto* tables = static_cast<std::vector<std::vector<float>>*>(ctx);
-                               // OpenCPN's tessellator wants an OPEN ring; drop tile57's
-                               // duplicated first==last closing vertex.
-                               if (n >= 2 && ll[0] == ll[2 * (n - 1)] &&
-                                   ll[1] == ll[2 * (n - 1) + 1])
-                                   --n;
-                               if (n < 3)
-                                   return; // too few points -> LLRegion empty; use bbox
-                               // Shoelace area (lon,lat); a zero-area ring empties the
-                               // region, which would drop the cell from the quilt.
-                               double area2 = 0.0;
-                               for (size_t i = 0; i < n; ++i) {
-                                   const double* a = &ll[2 * i];
-                                   const double* b = &ll[2 * ((i + 1) % n)];
-                                   area2 += a[0] * b[1] - b[0] * a[1];
-                               }
-                               if (std::fabs(area2) < 1e-9)
-                                   return; // collinear / zero area -> use bbox
-                               std::vector<float> ring;
-                               ring.reserve(n * 2);
-                               for (size_t i = 0; i < n;
-                                    ++i) { // tile57 gives lon,lat; OpenCPN wants lat,lon
-                                   ring.push_back((float)ll[2 * i + 1]);
-                                   ring.push_back((float)ll[2 * i]);
-                               }
-                               tables->push_back(std::move(ring));
-                           }};
+    tile57_coverage_cb ccb{
+        &covr_tables_, [](void* ctx, const double* ll, size_t n) {
+            auto* tables = static_cast<std::vector<std::vector<float>>*>(ctx);
+            // OpenCPN's tessellator wants an OPEN ring; drop tile57's
+            // duplicated first==last closing vertex.
+            if (n >= 2 && ll[0] == ll[2 * (n - 1)] && ll[1] == ll[2 * (n - 1) + 1])
+                --n;
+            if (n < 3)
+                return; // too few points -> LLRegion empty; use bbox
+            // Shoelace area (lon,lat); a zero-area ring empties the
+            // region, which would drop the cell from the quilt.
+            double area2 = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                const double* a = &ll[2 * i];
+                const double* b = &ll[2 * ((i + 1) % n)];
+                area2 += a[0] * b[1] - b[0] * a[1];
+            }
+            if (std::fabs(area2) < 1e-9)
+                return; // collinear / zero area -> use bbox
+            std::vector<float> ring;
+            ring.reserve(n * 2);
+            for (size_t i = 0; i < n; ++i) { // tile57 gives lon,lat; OpenCPN wants lat,lon
+                ring.push_back((float)ll[2 * i + 1]);
+                ring.push_back((float)ll[2 * i]);
+            }
+            tables->push_back(std::move(ring));
+        }};
     tile57_chart_coverage(h, &ccb, nullptr);
 
     // DIAG: the COVR tables (when non-empty) OVERRIDE the bbox for quilting, so if tile57
@@ -328,16 +325,14 @@ void ChartTile57::apply_info(tile57_chart* h, const tile57_info& info) {
     // bogus coverage centroid. Log what we actually got vs. the bbox so "middle of the
     // ocean" can be pinned to bad coverage coords rather than the (logged-correct) bounds.
     if (std::getenv("TILE57_DEBUG")) {
-        wxLogMessage("tile57 COVR: %s bbox[N%.4f S%.4f E%.4f W%.4f] tables=%zu",
-                     m_Name.c_str(), info.north, info.south, info.east, info.west,
-                     covr_tables_.size());
+        wxLogMessage("tile57 COVR: %s bbox[N%.4f S%.4f E%.4f W%.4f] tables=%zu", m_Name.c_str(),
+                     info.north, info.south, info.east, info.west, covr_tables_.size());
         for (size_t t = 0; t < covr_tables_.size(); ++t) {
             const auto& r = covr_tables_[t];
             wxLogMessage("tile57 COVR[%zu]: %zu pts first(lat=%.4f lon=%.4f) "
                          "last(lat=%.4f lon=%.4f)",
                          t, r.size() / 2, r.empty() ? 0.f : r[0], r.size() < 2 ? 0.f : r[1],
-                         r.size() < 2 ? 0.f : r[r.size() - 2],
-                         r.empty() ? 0.f : r[r.size() - 1]);
+                         r.size() < 2 ? 0.f : r[r.size() - 2], r.empty() ? 0.f : r[r.size() - 1]);
         }
     }
 
@@ -890,8 +885,8 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     static const bool dbg_entry = std::getenv("TILE57_DEBUG") != nullptr;
     if (dbg_entry && !logged_entry_) {
         logged_entry_ = true;
-        wxLogMessage("tile57 ENTRY: %s pass=%d bValid=%d has_chart=%d ensure_gl=%d",
-                     m_Name.c_str(), (int)pass, (int)vp.bValid, (int)renderer_.has_chart(),
+        wxLogMessage("tile57 ENTRY: %s pass=%d bValid=%d has_chart=%d ensure_gl=%d", m_Name.c_str(),
+                     (int)pass, (int)vp.bValid, (int)renderer_.has_chart(),
                      (int)renderer_.ensure_gl());
     }
     if (!vp.bValid)
@@ -998,8 +993,7 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     // compilation scale; when chart_scale > super_scamin, everything but the display-base
     // skeleton of THIS cell should be gone from the screen.
     static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg && pass != t57::ChartRenderer::Pass::kText &&
-        std::fabs(zoom - dbg_zoom_) > 0.02) {
+    if (dbg && pass != t57::ChartRenderer::Pass::kText && std::fabs(zoom - dbg_zoom_) > 0.02) {
         dbg_zoom_ = zoom;
         wxLogMessage("tile57 DBG: %s zoom=%.3f scamin_denom=1:%.0f (chart_scale=1:%.0f "
                      "bias=%.2f) super_scamin=1:%.0f cell=1:%d dev_scale=%.2f csf=%.2f "
