@@ -2152,9 +2152,20 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
             double lhx, lhy;
             rotated_half_extent(w, h, scale_px, rot, lhx, lhy,
                                 rotation == 0.0 ? 0.0 : kLblRotSlack);
-            portray_view_labels(lon, lat, zoom, rotation,
-                                (uint32_t)std::lround(2.0 * lhx * scale_px),
-                                (uint32_t)std::lround(2.0 * lhy * scale_px), m);
+            // CLAMP the zoom to the archive's baked range, exactly as the geometry pass does.
+            // tile57 picks its own tiles from the zoom we hand it, and a chart only HAS tiles
+            // inside [min_zoom, max_zoom] — so one step past a cell's max zoom it asked for a
+            // level that does not exist and emitted NOTHING, and every label on that chart
+            // vanished (contour values included) while the geometry kept drawing from the
+            // clamped level. Overzooming a cell is the normal case, not an edge case.
+            //
+            // Rescale the px extent by the same factor, so the clamped zoom still portrays the
+            // SAME piece of world: at zoom lz the view is 2^(lz - zoom) times fewer px across.
+            const double lz = std::clamp(zoom, (double)min_zoom_, (double)max_zoom_);
+            const double k = std::pow(2.0, lz - zoom);
+            portray_view_labels(lon, lat, lz, rotation,
+                                (uint32_t)std::lround(2.0 * lhx * scale_px * k),
+                                (uint32_t)std::lround(2.0 * lhy * scale_px * k), m);
             lbl_lon_ = lon;
             lbl_lat_ = lat;
             lbl_zoom_ = zoom;
