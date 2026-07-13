@@ -648,32 +648,12 @@ void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float 
     // ordinary label with 0. Turn the laid-out run about the anchor by it (same convention as
     // the sprite quad). The VIEW rotation is NOT folded in here: it is added per frame in the
     // shader for a MAP-aligned label, so the cached label buffer survives a turn.
-    //
-    // TILE57_TEXTROT=-1 negates the angle. Both frames READ as y-down/clockwise — tile57's
-    // glyph metrics are stb-style (yoff negative above the baseline) and its own renderer
-    // turns outlines with this same matrix — so the two should agree; but contour labels come
-    // out leaning the MIRROR of their contour on screen. This switch settles which sense is
-    // real without a rebuild, instead of flipping a sign on a hunch.
-    static const float rot_sign = [] {
-        const char* e = std::getenv("TILE57_TEXTROT");
-        return (e && std::atof(e) < 0) ? -1.0f : 1.0f;
-    }();
-    const float rad = rot_sign * rot_deg * (float)kPi / 180.0f;
+    // The sense is settled: verified against the engine's own geometry (the emitted run lies
+    // along the contour it labels, to 0.0 degrees), so the angle is applied as given — a
+    // contour value ALWAYS follows its contour, however steep.
+    const float rad = rot_deg * (float)kPi / 180.0f;
     const float rc = std::cos(rad), rs = std::sin(rad);
     const float postrot = (align == TILE57_ALIGN_MAP) ? 1.0f : 0.0f;
-    // TILE57_DEBUG: the run's ACTUAL emitted direction. Every part of this path checks out in
-    // isolation (the angle arrives, the atlas metrics parse, oy is y-down, the matrix matches
-    // tile57's own emitText) — yet the run does not lie along its contour on screen. So report
-    // what we really emit: the first glyph's quad centre, the last one's, and the angle of the
-    // line between them. That angle IS the run's direction; if it equals rot_deg we are
-    // building the right geometry and the fault is upstream of this file, and if it does not,
-    // it is here. Capped, and only for MAP-aligned runs (the contour values).
-    static const bool dbg_run = std::getenv("TILE57_DEBUG") != nullptr;
-    static int dbg_run_left = 8;
-    const bool trace = dbg_run && dbg_run_left > 0 && align == TILE57_ALIGN_MAP && len >= 2;
-    float first_cx = 0, first_cy = 0, last_cx = 0, last_cy = 0;
-    bool have_first = false;
-
     float pen = 0;
     size_t i = 0;
     while (i < len) {
@@ -699,29 +679,8 @@ void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float 
             v(x1, y1, g.u1, g.v1);
             v(x0, y1, g.u0, g.v1);
 
-            if (trace) { // the glyph's quad centre, AFTER rotation — see the note above
-                const float mx = (x0 + x1) * 0.5f, my = (y0 + y1) * 0.5f;
-                const float rx = mx * rc - my * rs, ry = mx * rs + my * rc;
-                if (!have_first) {
-                    have_first = true;
-                    first_cx = rx;
-                    first_cy = ry;
-                }
-                last_cx = rx;
-                last_cy = ry;
-            }
         }
         pen += g.adv * size_px;
-    }
-    if (trace && have_first && (last_cx != first_cx || last_cy != first_cy)) {
-        --dbg_run_left;
-        const float run_deg =
-            std::atan2(last_cy - first_cy, last_cx - first_cx) * 180.0f / (float)kPi;
-        wxLogMessage(wxString::Format(
-            "tile57 RUN: rot_deg=%7.2f applied=%7.2f  emitted run=%7.2f  (first=%.1f,%.1f "
-            "last=%.1f,%.1f) size=%.1f [%s]",
-            rot_deg, rot_sign * rot_deg, run_deg, first_cx, first_cy, last_cx, last_cy, size_px,
-            wxString::FromUTF8(text, len)));
     }
 }
 
@@ -1742,6 +1701,19 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
 // (see the label cache there), not every frame.
 void ChartRenderer::portray_view_labels(double lon, double lat, double zoom, double rotation,
                                         uint32_t w, uint32_t h, const tile57_mariner& m) {
+    // TILE57_DEBUG: the settings the LABEL cache is baked with. Soundings live in the TILE
+    // cache and labels here, so if the two are portrayed under different mariner states the
+    // chart shows a mixture — e.g. soundings converted to feet while the depth-contour values
+    // still read in metres. This line says which unit THIS cache was built with.
+    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
+    if (dbg) {
+        static int last_unit = -1;
+        if ((int)m.depth_unit != last_unit) {
+            last_unit = (int)m.depth_unit;
+            wxLogMessage("tile57 LBL: portraying labels with depth_unit=%s safety=%.1f",
+                         m.depth_unit == TILE57_DEPTH_FEET ? "FEET" : "METRES", m.safety_contour);
+        }
+    }
     text_.clear();
     glyph_.clear();
     lonlat_to_world(lon, lat, ref_wx_, ref_wy_); // labels referenced to view centre
