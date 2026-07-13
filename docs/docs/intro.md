@@ -22,7 +22,7 @@ An **OpenCPN plugin** that draws S-57/S-101 electronic navigational charts using
 [tile57](https://github.com/beetlebugorg/tile57)'s live S-52 portrayal, rendered as
 vector geometry on the GPU.
 
-![tile57 rendering Annapolis harbor in OpenCPN](/img/annapolis-harbor.png)
+![tile57 S-57/S-101 charts rendered in OpenCPN](/img/hero.png)
 
 The plugin installs a **first-class GL vector chart**, not an overlay. OpenCPN
 discovers a tile57 chart by file mask, adds it to the chart database, and drives it

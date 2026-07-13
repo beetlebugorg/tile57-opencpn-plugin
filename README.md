@@ -14,7 +14,7 @@ building, getting started, architecture, and rendering internals.
 > product. The plugin marks its output accordingly. Do not rely on it for real-world
 > navigation.
 
-![tile57 rendering Annapolis harbor](docs/static/img/annapolis-harbor.png)
+![tile57 S-57/S-101 charts rendered in OpenCPN](docs/static/img/hero.png)
 
 ## How it works
 
