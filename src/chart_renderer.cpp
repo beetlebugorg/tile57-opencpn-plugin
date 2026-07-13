@@ -761,18 +761,33 @@ float ChartRenderer::feature_scamin(const tile57_feature* f) const {
 static float feat_scamin(void* c, const tile57_feature* f) {
     return static_cast<ChartRenderer*>(c)->feature_scamin(f);
 }
+// Every draw call carries its feature's S-52 draw priority (`plane`). Record it before the
+// emit and tag the vertices it produced, so ensure_tile can sort the tile by paint order.
+// tile57 states the contract plainly: "the host owns final paint order".
 static void tr_fill(void* c, const tile57_feature* f, const tile57_world_rings* r, tile57_rgba col,
                     int) {
-    static_cast<ChartRenderer*>(c)->on_fill_area(r, col, feat_scamin(c, f));
+    auto* s = static_cast<ChartRenderer*>(c);
+    s->set_plane(f);
+    const size_t n0 = s->area_.size();
+    s->on_fill_area(r, col, feat_scamin(c, f));
+    s->tag_plane(s->area_pl_, n0, s->area_.size());
 }
 static void tr_stroke(void* c, const tile57_feature* f, const tile57_world_rings* l, float w, float,
                       float, tile57_rgba col) {
-    static_cast<ChartRenderer*>(c)->on_stroke_line(l, w, col, feat_scamin(c, f));
+    auto* s = static_cast<ChartRenderer*>(c);
+    s->set_plane(f);
+    const size_t n0 = s->line_.size();
+    s->on_stroke_line(l, w, col, feat_scamin(c, f));
+    s->tag_plane(s->line_pl_, n0, s->line_.size());
 }
 static void tr_symbol(void* c, const tile57_feature* f, tile57_world_point a,
                       const tile57_local_rings* r, tile57_rgba col, int eo, float sw,
                       tile57_rot_align align) {
-    static_cast<ChartRenderer*>(c)->on_draw_symbol(a, r, col, eo, sw, align, feat_scamin(c, f));
+    auto* s = static_cast<ChartRenderer*>(c);
+    s->set_plane(f);
+    const size_t n0 = s->symbol_.size();
+    s->on_draw_symbol(a, r, col, eo, sw, align, feat_scamin(c, f));
+    s->tag_plane(s->symbol_pl_, n0, s->symbol_.size());
 }
 static void tr_text(void* c, const tile57_feature* f, tile57_world_point a,
                     const tile57_local_rings* g, tile57_rgba col, tile57_rgba halo, float,
@@ -781,12 +796,19 @@ static void tr_text(void* c, const tile57_feature* f, tile57_world_point a,
 }
 static void tr_sprite(void* c, const tile57_feature* f, const char* name, size_t len,
                       tile57_world_point a, float rot, tile57_rot_align align, float hw, float hh) {
-    static_cast<ChartRenderer*>(c)->on_draw_sprite(name, len, a, rot, align, hw, hh,
-                                                   feat_scamin(c, f));
+    auto* s = static_cast<ChartRenderer*>(c);
+    s->set_plane(f);
+    const size_t n0 = s->sprite_.size();
+    s->on_draw_sprite(name, len, a, rot, align, hw, hh, feat_scamin(c, f));
+    s->tag_plane(s->sprite_pl_, n0, s->sprite_.size());
 }
 static void tr_pattern(void* c, const tile57_feature* f, const char* name, size_t len,
                        const tile57_world_rings* rings) {
-    static_cast<ChartRenderer*>(c)->on_draw_pattern(name, len, rings, feat_scamin(c, f));
+    auto* s = static_cast<ChartRenderer*>(c);
+    s->set_plane(f);
+    const size_t n0 = s->pattern_.size();
+    s->on_draw_pattern(name, len, rings, feat_scamin(c, f));
+    s->tag_plane(s->pattern_pl_, n0, s->pattern_.size());
 }
 static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, float ox, float oy,
                         const char* text, size_t len, float size, float rot, tile57_rot_align align,
@@ -1341,6 +1363,60 @@ static void fill_surface_cb_labels(tile57_surface_cb& cb, ChartRenderer* self) {
         cb.draw_text_str = tr_text_str; // SDF glyphs (decluttered)
 }
 
+// Order one kind's geometry by S-52 draw priority and record the runs.
+//
+// Everything we emit is GL_TRIANGLES, so a triangle (3 consecutive vertices) is the atom: it
+// belongs to exactly one feature and therefore one priority. A stable counting sort keeps
+// same-priority features in emission order (tile57's own order within a plane), so this
+// changes ACROSS-priority order only — which is the bug — and nothing else.
+template <class V>
+static void sort_by_plane(std::vector<V>& verts, std::vector<uint8_t>& planes,
+                          std::vector<ChartRenderer::Range>& out) {
+    out.clear();
+    if (verts.empty())
+        return;
+    // planes is per-vertex and in lockstep with verts; guard anyway rather than read past it.
+    planes.resize(verts.size(), 0);
+    const size_t tris = verts.size() / 3;
+
+    uint32_t count[256] = {0};
+    for (size_t t = 0; t < tris; ++t)
+        ++count[planes[t * 3]]; // a triangle's priority == its first vertex's
+
+    uint32_t start[256] = {0};
+    uint32_t acc = 0;
+    bool single = true, seen = false;
+    uint8_t only = 0;
+    for (int p = 0; p < 256; ++p) {
+        start[p] = acc;
+        if (count[p]) {
+            if (seen)
+                single = false;
+            else {
+                seen = true;
+                only = (uint8_t)p;
+            }
+            out.push_back({(uint8_t)p, acc * 3, count[p] * 3});
+            acc += count[p];
+        }
+    }
+    if (single) { // one priority: the buffer is already in order, skip the copy
+        (void)only;
+        return;
+    }
+    std::vector<V> sorted(verts.size());
+    uint32_t cursor[256];
+    std::memcpy(cursor, start, sizeof cursor);
+    for (size_t t = 0; t < tris; ++t) {
+        const uint8_t p = planes[t * 3];
+        const uint32_t dst = cursor[p]++;
+        sorted[dst * 3 + 0] = verts[t * 3 + 0];
+        sorted[dst * 3 + 1] = verts[t * 3 + 1];
+        sorted[dst * 3 + 2] = verts[t * 3 + 2];
+    }
+    verts.swap(sorted);
+}
+
 // ---- tiled path: portray + cache + compose per tile (see chart_renderer.h) -----
 // Portray a single (z,x,y) tile into its own VBOs, ONCE, and cache it. Verts are
 // stored relative to the tile's NW world corner (ref), so aWorld stays f32-tiny and
@@ -1366,6 +1442,13 @@ ChartRenderer::TileGeom& ChartRenderer::ensure_tile(int z, uint32_t x, uint32_t 
     sprite_.clear();
     pattern_.clear();
     glyph_.clear();
+    area_pl_.clear();
+    line_pl_.clear();
+    symbol_pl_.clear();
+    text_pl_.clear();
+    sprite_pl_.clear();
+    pattern_pl_.clear();
+    glyph_pl_.clear();
     ref_wx_ = t.ref_wx;
     ref_wy_ = t.ref_wy;
     decimate_eps_ = 0.5 / (256.0 * n);
@@ -1373,6 +1456,19 @@ ChartRenderer::TileGeom& ChartRenderer::ensure_tile(int z, uint32_t x, uint32_t 
     tile57_surface_cb cb{};
     fill_surface_cb(cb, this);
     tile57_chart_tile_surface(chart_, (uint8_t)z, x, y, &m, &cb, nullptr);
+
+    // PAINT ORDER. Sort each kind's TRIANGLES by S-52 draw priority before upload, and record
+    // the priority runs. Drawing kind-by-kind (all sprites after all symbols) ignored `plane`
+    // entirely, which is why soundings painted over the symbols they belong under. Sorting
+    // here — once, at portray — keeps the per-frame path a plain sequence of draws over
+    // contiguous ranges, and costs nothing on a cache hit.
+    sort_by_plane(area_, area_pl_, t.ranges[0]);
+    sort_by_plane(line_, line_pl_, t.ranges[1]);
+    sort_by_plane(symbol_, symbol_pl_, t.ranges[2]);
+    sort_by_plane(text_, text_pl_, t.ranges[3]);
+    sort_by_plane(sprite_, sprite_pl_, t.ranges[4]);
+    sort_by_plane(pattern_, pattern_pl_, t.ranges[5]);
+    sort_by_plane(glyph_, glyph_pl_, t.ranges[6]);
 
     // Upload each layer to its own VBO (empty layers keep vbo==0, n==0).
     struct LayerSrc {
@@ -1560,9 +1656,12 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
     };
     // Whether a vertex's local px offset turns with the chart is now PER-VERTEX (aPostRot),
     // because tile57 reports rotation-alignment per feature and one buffer mixes both kinds.
+    // `plane` selects ONE S-52 draw priority from each tile (< 0 = the whole buffer, for the
+    // unquilted/label paths that have no priority interleaving to resolve).
     auto layer = [&](const std::vector<const TileGeom*>& list, int prog, int u_scale, int u_vp,
                      int u_denom, int u_origin, int u_rot, int idx,
-                     void (ChartRenderer::*drawfn)(uint32_t, uint32_t), uint32_t tex, int u_atlas) {
+                     void (ChartRenderer::*drawfn)(uint32_t, uint32_t, uint32_t), uint32_t tex,
+                     int u_atlas, int plane = -1) {
         glUseProgram(prog);
         glUniform1f(u_scale, (float)scale_px);
         glUniform2fv(u_vp, 1, vp);
@@ -1575,29 +1674,56 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
         }
         for (auto* t : list)
             if (t->n[idx]) {
-                set_origin(u_origin, t);
-                (this->*drawfn)(t->vbo[idx], t->n[idx]);
+                // Only the triangles of THIS priority, if the caller asked for one. A tile's
+                // vertices are sorted by priority at portray, so a priority is one range.
+                if (plane < 0) {
+                    set_origin(u_origin, t);
+                    (this->*drawfn)(t->vbo[idx], 0, t->n[idx]);
+                    continue;
+                }
+                for (const auto& r : t->ranges[idx])
+                    if ((int)r.plane == plane) {
+                        set_origin(u_origin, t);
+                        (this->*drawfn)(t->vbo[idx], r.first, r.count);
+                        break; // one run per (kind, priority)
+                    }
             }
         if (tex)
             glBindTexture(GL_TEXTURE_2D, 0);
     };
-    // Geometry only (paint order). Layers 3/6 (text/glyph) are never populated for
-    // tiles now — labels are drawn by the whole-view text pass (draw_view_labels).
+    // PAINT ORDER (S-52). tile57 tags every feature with its draw priority and leaves the
+    // order to us; batching purely by geometry KIND drew all sprites after all symbols, so a
+    // sounding painted over a symbol that outranks it. Walk PRIORITY as the outer key, and
+    // keep the kind order (fills, patterns, lines, symbols, sprites) within a priority — that
+    // is the S-52 rule: priority first, and inside one priority, area before line before
+    // point. Only priorities actually present are visited, so a plain chart is unchanged in
+    // cost. Layers 3/6 (text/glyph) never populate for tiles — labels are a separate pass
+    // drawn last, above all of this.
     auto draw_layers = [&](const std::vector<const TileGeom*>& list) {
         if (list.empty())
             return;
-        layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 0,
-              &ChartRenderer::draw_range, 0, -1); // area
-        if (g_atlas.ok)
-            layer(list, prog_pat_, pu_scale_, pu_vp_, pu_denom_, pu_origin_, pu_rot_, 5,
-                  &ChartRenderer::draw_pat_range, g_atlas.tex, pu_atlas_); // pattern
-        layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 1,
-              &ChartRenderer::draw_range, 0, -1); // line
-        layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 2,
-              &ChartRenderer::draw_range, 0, -1); // symbol (tessellated)
-        if (g_atlas.ok)
-            layer(list, prog_sprite_, su_scale_, su_vp_, su_denom_, su_origin_, su_rot_, 4,
-                  &ChartRenderer::draw_sprite_range, g_atlas.tex, su_atlas_); // sprite
+        bool present[256] = {false};
+        for (const auto* t : list)
+            for (int k = 0; k < 7; ++k)
+                for (const auto& r : t->ranges[k])
+                    present[r.plane] = true;
+
+        for (int p = 0; p < 256; ++p) {
+            if (!present[p])
+                continue;
+            layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 0,
+                  &ChartRenderer::draw_range, 0, -1, p); // area
+            if (g_atlas.ok)
+                layer(list, prog_pat_, pu_scale_, pu_vp_, pu_denom_, pu_origin_, pu_rot_, 5,
+                      &ChartRenderer::draw_pat_range, g_atlas.tex, pu_atlas_, p); // pattern
+            layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 1,
+                  &ChartRenderer::draw_range, 0, -1, p); // line
+            layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 2,
+                  &ChartRenderer::draw_range, 0, -1, p); // symbol (tessellated)
+            if (g_atlas.ok)
+                layer(list, prog_sprite_, su_scale_, su_vp_, su_denom_, su_origin_, su_rot_, 4,
+                      &ChartRenderer::draw_sprite_range, g_atlas.tex, su_atlas_, p); // sprite
+        }
     };
     draw_layers(back_vis); // coarser fallback zoom underneath (only when target incomplete)
     draw_layers(vis);      // target zoom on top
@@ -1656,7 +1782,7 @@ void ChartRenderer::draw_view_labels(double scale_px, float cull_denom, uint32_t
         glUniform2fv(u_vp_, 1, vp);
         glUniform1f(u_denom_, cull_denom);
         glUniform2fv(u_rot_, 1, rv);
-        draw_range(vbo_vtext_, n_vtext_);
+        draw_range(vbo_vtext_, 0, n_vtext_);
     }
     if (n_vglyph_ && g_glyph.ok) {
         glUseProgram(prog_glyph_);
@@ -1668,13 +1794,13 @@ void ChartRenderer::draw_view_labels(double scale_px, float cull_denom, uint32_t
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_glyph.tex);
         glUniform1i(gu_atlas_, 0);
-        draw_glyph_range(vbo_vglyph_, n_vglyph_);
+        draw_glyph_range(vbo_vglyph_, 0, n_vglyph_);
         glBindTexture(GL_TEXTURE_2D, 0);
     }
     glUseProgram(0);
 }
 
-void ChartRenderer::draw_range(uint32_t vbo, uint32_t count) {
+void ChartRenderer::draw_range(uint32_t vbo, uint32_t first, uint32_t count) {
     if (!count)
         return;
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -1688,7 +1814,7 @@ void ChartRenderer::draw_range(uint32_t vbo, uint32_t count) {
     glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)offsetof(Vtx, scamin));
     glEnableVertexAttribArray(4);
     glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)offsetof(Vtx, postrot));
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)count);
+    glDrawArrays(GL_TRIANGLES, (GLint)first, (GLsizei)count);
     glDisableVertexAttribArray(0);
     glDisableVertexAttribArray(1);
     glDisableVertexAttribArray(2);
@@ -1697,7 +1823,7 @@ void ChartRenderer::draw_range(uint32_t vbo, uint32_t count) {
 }
 
 // Draw one PatVtx buffer (prog_pat_ must be bound + uniforms/atlas set by caller).
-void ChartRenderer::draw_pat_range(uint32_t vbo, uint32_t count) {
+void ChartRenderer::draw_pat_range(uint32_t vbo, uint32_t first, uint32_t count) {
     if (!count)
         return;
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -1710,7 +1836,7 @@ void ChartRenderer::draw_pat_range(uint32_t vbo, uint32_t count) {
     glEnableVertexAttribArray(3);
     glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(PatVtx),
                           (void*)offsetof(PatVtx, scamin));
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)count);
+    glDrawArrays(GL_TRIANGLES, (GLint)first, (GLsizei)count);
     glDisableVertexAttribArray(0);
     glDisableVertexAttribArray(1);
     glDisableVertexAttribArray(2);
@@ -1718,7 +1844,7 @@ void ChartRenderer::draw_pat_range(uint32_t vbo, uint32_t count) {
 }
 
 // Draw one SpriteVtx buffer (prog_sprite_ bound + uniforms/atlas set by caller).
-void ChartRenderer::draw_sprite_range(uint32_t vbo, uint32_t count) {
+void ChartRenderer::draw_sprite_range(uint32_t vbo, uint32_t first, uint32_t count) {
     if (!count)
         return;
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -1737,7 +1863,7 @@ void ChartRenderer::draw_sprite_range(uint32_t vbo, uint32_t count) {
     glEnableVertexAttribArray(4);
     glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx),
                           (void*)offsetof(SpriteVtx, postrot));
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)count);
+    glDrawArrays(GL_TRIANGLES, (GLint)first, (GLsizei)count);
     glDisableVertexAttribArray(0);
     glDisableVertexAttribArray(1);
     glDisableVertexAttribArray(2);
@@ -1746,7 +1872,7 @@ void ChartRenderer::draw_sprite_range(uint32_t vbo, uint32_t count) {
 }
 
 // Draw one GlyphVtx buffer (prog_glyph_ bound + uniforms/atlas set by caller).
-void ChartRenderer::draw_glyph_range(uint32_t vbo, uint32_t count) {
+void ChartRenderer::draw_glyph_range(uint32_t vbo, uint32_t first, uint32_t count) {
     if (!count)
         return;
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -1767,7 +1893,7 @@ void ChartRenderer::draw_glyph_range(uint32_t vbo, uint32_t count) {
     glEnableVertexAttribArray(5);
     glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx),
                           (void*)offsetof(GlyphVtx, postrot));
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)count);
+    glDrawArrays(GL_TRIANGLES, (GLint)first, (GLsizei)count);
     glDisableVertexAttribArray(0);
     glDisableVertexAttribArray(1);
     glDisableVertexAttribArray(2);

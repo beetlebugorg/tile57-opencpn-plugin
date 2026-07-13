@@ -110,6 +110,20 @@ class ChartRenderer {
     std::vector<SpriteVtx> sprite_; // point symbols drawn from the atlas
     std::vector<PatVtx> pattern_;   // area fills tiled from the pattern atlas
     std::vector<GlyphVtx> glyph_;   // text drawn as SDF quads from the glyph atlas
+    // The S-52 draw priority of every vertex above, in step with it (one entry per vertex).
+    // tile57 tags each feature with `plane` and leaves the paint order to us — batching by
+    // geometry KIND (all sprites after all symbols) ignores it, which is what put soundings
+    // on top of the symbols they should sit under. Portray records it, ensure_tile sorts by
+    // it. Scratch only: it does not ride to the GPU (the sort makes it implicit).
+    std::vector<uint8_t> area_pl_, line_pl_, symbol_pl_, text_pl_, sprite_pl_, pattern_pl_,
+        glyph_pl_;
+    int cur_plane_ = 0; // the feature being portrayed (set per draw call by the trampolines)
+    void set_plane(const tile57_feature* f) { cur_plane_ = f ? (int)f->plane : 0; }
+    // Tag the vertices [from, to) of `planes`' buffer with the current feature's priority.
+    void tag_plane(std::vector<uint8_t>& planes, size_t from, size_t to) {
+        planes.resize(from); // portray clears verts + planes together; keep them in lockstep
+        planes.resize(to, (uint8_t)std::min(std::max(cur_plane_, 0), 255));
+    }
     // The world reference point offsets are relative to (set per portrayal).
     double ref_wx_ = 0, ref_wy_ = 0;
     // Geometry decimation epsilon in world units (~half a portrayal pixel).
@@ -143,18 +157,28 @@ class ChartRenderer {
     // cache its GPU geometry, compose the view from cached tiles. This is the only
     // render path. One tile's tessellated GPU geometry (its own VBOs) + the world
     // origin its verts are relative to (the tile's NW corner, so aWorld stays f32-tiny).
+    // A run of triangles sharing one S-52 draw priority, inside a kind's VBO. The tile's
+    // vertices are SORTED by priority at portray time, so a priority is one contiguous range
+    // and the paint loop can walk priorities without touching the data again.
+    struct Range {
+        uint8_t plane;          // S-52 draw priority (the paint order key)
+        uint32_t first, count;  // vertices, within this kind's VBO
+    };
     struct TileGeom {
         uint32_t vbo[7] = {0, 0, 0, 0, 0, 0, 0}; // area,line,symbol,text,sprite,pat,glyph
         uint32_t n[7] = {0, 0, 0, 0, 0, 0, 0};
+        std::vector<Range> ranges[7]; // ascending by plane; empty kinds stay empty
         double ref_wx = 0, ref_wy = 0;
         int64_t used_ms = 0; // last frame this tile was drawn (LRU evict)
     };
 
   private:
-    void draw_range(uint32_t vbo, uint32_t count);        // Vtx layout (prog_)
-    void draw_pat_range(uint32_t vbo, uint32_t count);    // PatVtx layout (prog_pat_)
-    void draw_sprite_range(uint32_t vbo, uint32_t count); // SpriteVtx layout (prog_sprite_)
-    void draw_glyph_range(uint32_t vbo, uint32_t count);  // GlyphVtx layout (prog_glyph_)
+    // Draw [first, first+count) vertices of a VBO. The range is how one S-52 draw priority is
+    // painted out of a tile whose triangles are sorted by priority (see sort_by_plane).
+    void draw_range(uint32_t vbo, uint32_t first, uint32_t count);        // Vtx (prog_)
+    void draw_pat_range(uint32_t vbo, uint32_t first, uint32_t count);    // PatVtx (prog_pat_)
+    void draw_sprite_range(uint32_t vbo, uint32_t first, uint32_t count); // SpriteVtx
+    void draw_glyph_range(uint32_t vbo, uint32_t first, uint32_t count);  // GlyphVtx
     void composite_ss(); // draw the resolved MSAA texture over OpenCPN's FBO
 
     // The view rotation as (cos, sin) — the GPU transform's 2x2, y-down (see VS).
