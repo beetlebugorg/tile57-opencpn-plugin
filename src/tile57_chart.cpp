@@ -2,6 +2,7 @@
 #include "tile57_chart.h"
 #include "gl.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
