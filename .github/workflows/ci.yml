@@ -12,7 +12,7 @@ jobs:
   format:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Pin the exact clang-format so the check matches local formatting byte-for-byte
       # (clang-format output drifts between versions). Only our own src/ — vendored
       # third_party/ and the opencpn-libs submodule are left alone.
