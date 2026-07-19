@@ -120,7 +120,7 @@ uint64_t mariner_hash(const tile57_mariner& m) {
 // Rings are decimated to the portrayal's pixel grid first — dropping sub-half-
 // pixel detail cuts the triangle count hugely on dense coastlines/depth areas
 // (the per-frame draw cost, hence the zoom framerate) with no visible change.
-void ChartRenderer::on_fill_area(const tile57_world_rings* p, tile57_rgba c, float scamin) {
+void ChartRenderer::on_fill_area(const tile57_world_rings* p, Rgba8 c, float scamin) {
     if (!p || p->n < 3)
         return;
     using Pt = std::array<double, 2>;
@@ -186,7 +186,7 @@ static float dash_cal_factor() {
 }
 
 void ChartRenderer::on_stroke_line(const tile57_world_rings* p, float width_px, float dash_on,
-                                   float dash_off, tile57_rgba c, float scamin) {
+                                   float dash_off, Rgba8 c, float scamin) {
     if (!p || p->n < 2)
         return;
     float hw = std::max(0.5f, width_px * 0.5f);
@@ -234,7 +234,7 @@ void ChartRenderer::on_stroke_line(const tile57_world_rings* p, float width_px, 
 // Anchored fill (symbol / text): tessellate the local (px) rings with an
 // even-odd rule (group rings by containment parity so counters cut out and no
 // triangles bridge between letters), anchored at one world point via aWorld.
-static void tess_local_even_odd(const tile57_local_rings* p, double awx, double awy, tile57_rgba c,
+static void tess_local_even_odd(const tile57_local_rings* p, double awx, double awy, Rgba8 c,
                                 float scamin, float postrot, std::vector<ChartRenderer::Vtx>& out) {
     if (!p || p->n < 3)
         return;
@@ -302,7 +302,7 @@ static void tess_local_even_odd(const tile57_local_rings* p, double awx, double 
 }
 
 void ChartRenderer::on_draw_symbol(tile57_world_point anchor, const tile57_local_rings* p,
-                                   tile57_rgba c, int even_odd, float stroke_w,
+                                   Rgba8 c, int even_odd, float stroke_w,
                                    tile57_rot_align align, float scamin) {
     (void)even_odd;
     double awx = anchor.x - ref_wx_, awy = anchor.y - ref_wy_;
@@ -340,7 +340,7 @@ void ChartRenderer::on_draw_symbol(tile57_world_point anchor, const tile57_local
 }
 
 void ChartRenderer::on_draw_text(tile57_world_point anchor, const tile57_local_rings* g,
-                                 tile57_rgba c, tile57_rgba /*halo*/, tile57_rot_align align,
+                                 Rgba8 c, Rgba8 /*halo*/, tile57_rot_align align,
                                  float scamin) {
     tess_local_even_odd(g, anchor.x - ref_wx_, anchor.y - ref_wy_, c, scamin,
                         (align == TILE57_ALIGN_MAP) ? 1.0f : 0.0f, text_);
@@ -636,7 +636,7 @@ void ChartRenderer::on_draw_pattern(const char* name, size_t len, const tile57_w
         return;
     auto it = g_atlas.uv.find("pat:" + std::string(name, len));
     if (it == g_atlas.uv.end()) { // unknown pattern -> flat translucent tint
-        on_fill_area(p, tile57_rgba{160, 160, 170, 140}, scamin);
+        on_fill_area(p, Rgba8{160, 160, 170, 140}, scamin);
         return;
     }
     const AtlasRect& r = it->second;
@@ -678,7 +678,7 @@ void ChartRenderer::on_draw_pattern(const char* name, size_t len, const tile57_w
 // atlas is monochrome SDF, tinted by the text colour in the glyph shader.
 void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float oy,
                                      const char* text, size_t len, float size_px, float rot_deg,
-                                     tile57_rot_align align, tile57_rgba c, tile57_rgba /*halo*/,
+                                     tile57_rot_align align, Rgba8 c, Rgba8 /*halo*/,
                                      float scamin) {
     if (!g_glyph.ok || size_px <= 0 || !text)
         return;
@@ -762,35 +762,36 @@ static float feat_scamin(void* c, const tile57_feature* f) {
 // Every draw call carries its feature's S-52 draw priority (`plane`). Record it before the
 // emit and tag the vertices it produced, so ensure_tile can sort the tile by paint order.
 // tile57 states the contract plainly: "the host owns final paint order".
-static void tr_fill(void* c, const tile57_feature* f, const tile57_world_rings* r, tile57_rgba col,
+static void tr_fill(void* c, const tile57_feature* f, const tile57_world_rings* r, tile57_color col,
                     int) {
     auto* s = static_cast<ChartRenderer*>(c);
     s->set_plane(f);
     const size_t n0 = s->area_.size();
-    s->on_fill_area(r, col, feat_scamin(c, f));
+    s->on_fill_area(r, tile57_unpack(col), feat_scamin(c, f));
     s->tag_plane(s->area_pl_, n0, s->area_.size());
 }
 static void tr_stroke(void* c, const tile57_feature* f, const tile57_world_rings* l, float w,
-                      float dash_on, float dash_off, tile57_rgba col) {
+                      float dash_on, float dash_off, tile57_color col) {
     auto* s = static_cast<ChartRenderer*>(c);
     s->set_plane(f);
     const size_t n0 = s->line_.size();
-    s->on_stroke_line(l, w, dash_on, dash_off, col, feat_scamin(c, f));
+    s->on_stroke_line(l, w, dash_on, dash_off, tile57_unpack(col), feat_scamin(c, f));
     s->tag_plane(s->line_pl_, n0, s->line_.size());
 }
 static void tr_symbol(void* c, const tile57_feature* f, tile57_world_point a,
-                      const tile57_local_rings* r, tile57_rgba col, int eo, float sw,
+                      const tile57_local_rings* r, tile57_color col, int eo, float sw,
                       tile57_rot_align align) {
     auto* s = static_cast<ChartRenderer*>(c);
     s->set_plane(f);
     const size_t n0 = s->symbol_.size();
-    s->on_draw_symbol(a, r, col, eo, sw, align, feat_scamin(c, f));
+    s->on_draw_symbol(a, r, tile57_unpack(col), eo, sw, align, feat_scamin(c, f));
     s->tag_plane(s->symbol_pl_, n0, s->symbol_.size());
 }
 static void tr_text(void* c, const tile57_feature* f, tile57_world_point a,
-                    const tile57_local_rings* g, tile57_rgba col, tile57_rgba halo, float,
-                    tile57_rot_align align) {
-    static_cast<ChartRenderer*>(c)->on_draw_text(a, g, col, halo, align, feat_scamin(c, f));
+                    const tile57_local_rings* g, tile57_color col, tile57_color halo, float,
+                    tile57_rot_align align, int32_t /*text_group*/) {
+    static_cast<ChartRenderer*>(c)->on_draw_text(a, g, tile57_unpack(col), tile57_unpack(halo),
+                                                 align, feat_scamin(c, f));
 }
 static void tr_sprite(void* c, const tile57_feature* f, const char* name, size_t len,
                       tile57_world_point a, float rot, tile57_rot_align align, float hw, float hh) {
@@ -810,9 +811,10 @@ static void tr_pattern(void* c, const tile57_feature* f, const char* name, size_
 }
 static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, float ox, float oy,
                         const char* text, size_t len, float size, float rot, tile57_rot_align align,
-                        tile57_rgba col, tile57_rgba halo) {
-    static_cast<ChartRenderer*>(c)->on_draw_text_str(a, ox, oy, text, len, size, rot, align, col,
-                                                     halo, feat_scamin(c, f));
+                        tile57_color col, tile57_color halo, int32_t /*text_group*/) {
+    static_cast<ChartRenderer*>(c)->on_draw_text_str(a, ox, oy, text, len, size, rot, align,
+                                                     tile57_unpack(col), tile57_unpack(halo),
+                                                     feat_scamin(c, f));
 }
 
 // ---- chart / GL lifecycle --------------------------------------------------
@@ -1371,22 +1373,23 @@ void ChartRenderer::composite_ss() {
 // dep's drawText calls draw_text UNCONDITIONALLY (no null-check) — a null there
 // crashes — so a text-suppressing pass MUST supply a non-null no-op draw_text_str
 // (dep takes the SDF path and returns before that call).
-static void tr_noop_fill(void*, const tile57_feature*, const tile57_world_rings*, tile57_rgba,
+static void tr_noop_fill(void*, const tile57_feature*, const tile57_world_rings*, tile57_color,
                          int) {}
 static void tr_noop_stroke(void*, const tile57_feature*, const tile57_world_rings*, float, float,
-                           float, tile57_rgba) {}
+                           float, tile57_color) {}
 static void tr_noop_symbol(void*, const tile57_feature*, tile57_world_point,
-                           const tile57_local_rings*, tile57_rgba, int, float, tile57_rot_align) {}
+                           const tile57_local_rings*, tile57_color, int, float,
+                           tile57_rot_align) {}
 static void tr_noop_sprite(void*, const tile57_feature*, const char*, size_t, tile57_world_point,
                            float, tile57_rot_align, float, float) {}
 static void tr_noop_pattern(void*, const tile57_feature*, const char*, size_t,
                             const tile57_world_rings*) {}
 static void tr_noop_text(void*, const tile57_feature*, tile57_world_point,
-                         const tile57_local_rings*, tile57_rgba, tile57_rgba, float,
-                         tile57_rot_align) {}
+                         const tile57_local_rings*, tile57_color, tile57_color, float,
+                         tile57_rot_align, int32_t) {}
 static void tr_noop_text_str(void*, const tile57_feature*, tile57_world_point, float, float,
-                             const char*, size_t, float, float, tile57_rot_align, tile57_rgba,
-                             tile57_rgba) {}
+                             const char*, size_t, float, float, tile57_rot_align, tile57_color,
+                             tile57_color, int32_t) {}
 
 // GEOMETRY callbacks (per-tile portray): everything EXCEPT text/labels. Text is
 // portrayed separately for the whole view (fill_surface_cb_labels) so its declutter
