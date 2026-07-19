@@ -120,32 +120,86 @@ uint64_t mariner_hash(const tile57_mariner& m) {
 // Rings are decimated to the portrayal's pixel grid first — dropping sub-half-
 // pixel detail cuts the triangle count hugely on dense coastlines/depth areas
 // (the per-frame draw cost, hence the zoom framerate) with no visible change.
-void ChartRenderer::on_fill_area(const tile57_world_rings* p, Rgba8 c, float scamin) {
-    if (!p || p->n < 3)
-        return;
-    using Pt = std::array<double, 2>;
-    const double eps2 = decimate_eps_ * decimate_eps_;
-    std::vector<std::vector<Pt>> poly;
+// ---- shared ring tessellation (fillArea / fillPattern hot path) ------------
+// Decimate a tile57_world_rings into ONE flat point buffer and earcut it with a
+// PERSISTENT tessellator. The old shape -- mapbox::earcut<>(poly) over a fresh
+// nested vector<vector<Pt>> plus a second full `flat` copy -- rebuilt and tore
+// down the whole tessellator (node pool, index vector) and reallocated every
+// ring, per FEATURE; fillArea was the single hottest portray item in
+// Instruments. All portray runs on the GL thread, so file-scope scratch is
+// safe, and Earcut::operator() resets its own state (indices.clear(),
+// earcut.hpp:247) -- instance reuse is the intended pattern; only the free
+// function wrapper is single-shot. The returned indices point into `pts`,
+// which is laid out ring-after-ring exactly as earcut numbers its vertices.
+namespace {
+using FillPt = std::array<double, 2>;
+struct FillRingView {
+    using value_type = FillPt; // earcut.hpp derives its Point type from this
+    const FillPt* p;
+    std::size_t n;
+    std::size_t size() const { return n; }
+    bool empty() const { return n == 0; }
+    const FillPt& operator[](std::size_t i) const { return p[i]; }
+};
+struct FillPolyView {
+    using value_type = FillRingView;
+    const FillRingView* r;
+    std::size_t n;
+    std::size_t size() const { return n; }
+    bool empty() const { return n == 0; }
+    const FillRingView& operator[](std::size_t i) const { return r[i]; }
+};
+struct FillTess {
+    const std::vector<uint32_t>* idx; // triangle indices into *pts (null: nothing to fill)
+    const std::vector<FillPt>* pts;
+};
+FillTess tessellate_rings(const tile57_world_rings* p, double eps2) {
+    // thread_local, not static: tile portray runs on the worker thread while the
+    // GL thread can portray labels (and its pattern fallback fills) concurrently.
+    thread_local std::vector<FillPt> flat;                          // decimated points
+    thread_local std::vector<std::pair<uint32_t, uint32_t>> ranges; // (start,count)/ring
+    thread_local std::vector<FillRingView> views;
+    thread_local mapbox::detail::Earcut<uint32_t> earcut;
+    flat.clear();
+    ranges.clear();
     for (uint32_t r = 0; r < p->ring_count; ++r) {
         uint32_t s = p->ring_starts[r];
         uint32_t e = (r + 1 < p->ring_count) ? p->ring_starts[r + 1] : p->n;
         if (e <= s + 2)
             continue;
-        std::vector<Pt> ring{{p->pts[s].x, p->pts[s].y}};
+        const uint32_t start = (uint32_t)flat.size();
+        flat.push_back({p->pts[s].x, p->pts[s].y});
         for (uint32_t i = s + 1; i < e; ++i) {
-            double dx = p->pts[i].x - ring.back()[0], dy = p->pts[i].y - ring.back()[1];
+            double dx = p->pts[i].x - flat.back()[0], dy = p->pts[i].y - flat.back()[1];
             if (i == e - 1 || dx * dx + dy * dy >= eps2)
-                ring.push_back({p->pts[i].x, p->pts[i].y});
+                flat.push_back({p->pts[i].x, p->pts[i].y});
         }
-        if (ring.size() >= 3)
-            poly.push_back(std::move(ring));
+        const uint32_t count = (uint32_t)flat.size() - start;
+        if (count >= 3)
+            ranges.push_back({start, count});
+        else
+            flat.resize(start); // degenerate after decimation: drop it (same gate as before)
     }
-    if (poly.empty())
+    if (ranges.empty())
+        return {nullptr, nullptr};
+    // Build the views only after `flat` stops growing: push_back reallocation
+    // would invalidate the pointers they hold.
+    views.clear();
+    for (auto [s, n] : ranges)
+        views.push_back({flat.data() + s, (std::size_t)n});
+    earcut(FillPolyView{views.data(), views.size()});
+    return {&earcut.indices, &flat};
+}
+} // namespace
+
+void ChartRenderer::on_fill_area(const tile57_world_rings* p, Rgba8 c, float scamin) {
+    if (!p || p->n < 3)
         return;
-    std::vector<Pt> flat;
-    for (const auto& ring : poly)
-        flat.insert(flat.end(), ring.begin(), ring.end());
-    std::vector<uint32_t> idx = mapbox::earcut<uint32_t>(poly);
+    FillTess t = tessellate_rings(p, decimate_eps_ * decimate_eps_);
+    if (!t.idx)
+        return;
+    const auto& idx = *t.idx;
+    const auto& flat = *t.pts;
     for (size_t i = 0; i + 2 < idx.size(); i += 3)
         for (int k = 0; k < 3; ++k) {
             double wx = flat[idx[i + k]][0] - ref_wx_, wy = flat[idx[i + k]][1] - ref_wy_;
@@ -642,29 +696,11 @@ void ChartRenderer::on_draw_pattern(const char* name, size_t len, const tile57_w
     const AtlasRect& r = it->second;
     float tw = std::max(1.0f, r.px_w * (float)size_scale_); // tile size in screen px
     float th = std::max(1.0f, r.px_h * (float)size_scale_);
-    using Pt = std::array<double, 2>;
-    const double eps2 = decimate_eps_ * decimate_eps_;
-    std::vector<std::vector<Pt>> poly;
-    for (uint32_t rr = 0; rr < p->ring_count; ++rr) {
-        uint32_t s = p->ring_starts[rr];
-        uint32_t e = (rr + 1 < p->ring_count) ? p->ring_starts[rr + 1] : p->n;
-        if (e <= s + 2)
-            continue;
-        std::vector<Pt> ring{{p->pts[s].x, p->pts[s].y}};
-        for (uint32_t i = s + 1; i < e; ++i) {
-            double dx = p->pts[i].x - ring.back()[0], dy = p->pts[i].y - ring.back()[1];
-            if (i == e - 1 || dx * dx + dy * dy >= eps2)
-                ring.push_back({p->pts[i].x, p->pts[i].y});
-        }
-        if (ring.size() >= 3)
-            poly.push_back(std::move(ring));
-    }
-    if (poly.empty())
+    FillTess t = tessellate_rings(p, decimate_eps_ * decimate_eps_);
+    if (!t.idx)
         return;
-    std::vector<Pt> flat;
-    for (const auto& ring : poly)
-        flat.insert(flat.end(), ring.begin(), ring.end());
-    std::vector<uint32_t> idx = mapbox::earcut<uint32_t>(poly);
+    const auto& idx = *t.idx;
+    const auto& flat = *t.pts;
     for (size_t i = 0; i + 2 < idx.size(); i += 3)
         for (int k = 0; k < 3; ++k) {
             float wx = (float)(flat[idx[i + k]][0] - ref_wx_),
@@ -717,7 +753,6 @@ void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float 
             v(x0, y0, g.u0, g.v0);
             v(x1, y1, g.u1, g.v1);
             v(x0, y1, g.u0, g.v1);
-
         }
         pen += g.adv * size_px;
     }
@@ -1224,6 +1259,15 @@ bool ChartRenderer::ensure_gl() {
         return true;
     if (!t57_gl_loader_init())
         return false;
+    // Detect a DEAD context (plugin reload / context recreate): the cached program
+    // handles are context objects, so if the current context doesn't know them the
+    // whole shared block must rebuild. This replaces the old scheme of resetting
+    // g_prog in shutdown() — that reset fired on EVERY chart close (OpenCPN opens
+    // and closes charts constantly while quilting), recompiling all five shader
+    // programs mid-pan for the surviving renderers: a multi-ms hitch each time,
+    // 2.2% of a whole profile.
+    if (g_prog.ready && !glIsProgram(g_prog.prog))
+        g_prog = GlPrograms{};
     if (!g_prog.ready)
         build_programs();         // compile shaders/programs ONCE process-wide
     const GlPrograms& g = g_prog; // adopt the shared handles into this instance
@@ -1466,7 +1510,17 @@ static void sort_by_plane(std::vector<V>& verts, std::vector<uint8_t>& planes,
         (void)only;
         return;
     }
-    std::vector<V> sorted(verts.size());
+    // Reusable scratch (per vertex type, per thread): a fresh vector here
+    // value-initialized (memset) its whole allocation on every call only to be
+    // fully overwritten by the scatter below -- visible in Instruments as
+    // _platform_memset under vector(size_t). Grow-only reuse skips both the
+    // allocation and the zeroing after warmup. thread_local, not static: tile
+    // portray runs on the worker thread while the label pass sorts on the GL
+    // thread. Every element in [0, verts.size()) is written by the scatter
+    // before being copied back, so no stale data can leak through.
+    thread_local std::vector<V> sorted;
+    if (sorted.size() < verts.size())
+        sorted.resize(verts.size());
     uint32_t cursor[256];
     std::memcpy(cursor, start, sizeof cursor);
     for (size_t t = 0; t < tris; ++t) {
@@ -1476,24 +1530,20 @@ static void sort_by_plane(std::vector<V>& verts, std::vector<uint8_t>& planes,
         sorted[dst * 3 + 1] = verts[t * 3 + 1];
         sorted[dst * 3 + 2] = verts[t * 3 + 2];
     }
-    verts.swap(sorted);
+    std::copy_n(sorted.begin(), verts.size(), verts.begin());
 }
 
 // ---- tiled path: portray + cache + compose per tile (see chart_renderer.h) -----
-// Portray a single (z,x,y) tile into its own VBOs, ONCE, and cache it. Verts are
-// stored relative to the tile's NW world corner (ref), so aWorld stays f32-tiny and
-// the cached geometry is view-independent — compose places it via a per-tile uOrigin.
-ChartRenderer::TileGeom& ChartRenderer::ensure_tile(int z, uint32_t x, uint32_t y,
-                                                    const tile57_mariner& m) {
-    uint64_t key = tile_key(z, x, y);
-    auto it = tiles_.find(key);
-    if (it != tiles_.end())
-        return it->second;
-
-    TileGeom t{};
-    double n = std::pow(2.0, z);
-    t.ref_wx = (double)x / n; // tile NW corner in web-mercator [0,1]
-    t.ref_wy = (double)y / n;
+// The CPU half of one tile's portray: pmtiles decode + tessellation through the shared
+// sinks + the priority sort — everything except the VBO upload. Runs on the WORKER
+// thread (or on the GL thread via ensure_tile in TILE57_SYNC mode); either way it takes
+// portray_mu_, because the tile57 handle is not internally synchronized and the sinks
+// are the shared member scratch the GL thread's label portray also writes.
+void ChartRenderer::portray_tile_cpu(const TileJob& job, TileCpu& out) {
+    std::lock_guard<std::mutex> lock(portray_mu_);
+    double n = std::pow(2.0, job.z);
+    out.ref_wx = (double)job.x / n; // tile NW corner in web-mercator [0,1]
+    out.ref_wy = (double)job.y / n;
 
     // Portray this tile through the shared tessellation sinks (reuse the member
     // scratch vectors), referenced to the tile origin, decimated at the tile zoom.
@@ -1511,41 +1561,59 @@ ChartRenderer::TileGeom& ChartRenderer::ensure_tile(int z, uint32_t x, uint32_t 
     sprite_pl_.clear();
     pattern_pl_.clear();
     glyph_pl_.clear();
-    ref_wx_ = t.ref_wx;
-    ref_wy_ = t.ref_wy;
+    ref_wx_ = out.ref_wx;
+    ref_wy_ = out.ref_wy;
     decimate_eps_ = 0.5 / (256.0 * n);
-    size_scale_ = m.size_scale > 0 ? m.size_scale : 1.0;
+    size_scale_ = job.m.size_scale > 0 ? job.m.size_scale : 1.0;
     tile57_surface_cb cb{};
     fill_surface_cb(cb, this);
-    tile57_chart_tile_surface(chart_, (uint8_t)z, x, y, &m, &cb, nullptr);
+    tile57_chart_tile_surface(chart_, (uint8_t)job.z, job.x, job.y, &job.m, &cb, nullptr);
 
     // PAINT ORDER. Sort each kind's TRIANGLES by S-52 draw priority before upload, and record
     // the priority runs. Drawing kind-by-kind (all sprites after all symbols) ignored `plane`
     // entirely, which is why soundings painted over the symbols they belong under. Sorting
     // here — once, at portray — keeps the per-frame path a plain sequence of draws over
     // contiguous ranges, and costs nothing on a cache hit.
-    sort_by_plane(area_, area_pl_, t.ranges[0]);
-    sort_by_plane(line_, line_pl_, t.ranges[1]);
-    sort_by_plane(symbol_, symbol_pl_, t.ranges[2]);
-    sort_by_plane(text_, text_pl_, t.ranges[3]);
-    sort_by_plane(sprite_, sprite_pl_, t.ranges[4]);
-    sort_by_plane(pattern_, pattern_pl_, t.ranges[5]);
-    sort_by_plane(glyph_, glyph_pl_, t.ranges[6]);
+    sort_by_plane(area_, area_pl_, out.ranges[0]);
+    sort_by_plane(line_, line_pl_, out.ranges[1]);
+    sort_by_plane(symbol_, symbol_pl_, out.ranges[2]);
+    sort_by_plane(text_, text_pl_, out.ranges[3]);
+    sort_by_plane(sprite_, sprite_pl_, out.ranges[4]);
+    sort_by_plane(pattern_, pattern_pl_, out.ranges[5]);
+    sort_by_plane(glyph_, glyph_pl_, out.ranges[6]);
 
-    // Upload each layer to its own VBO (empty layers keep vbo==0, n==0).
+    // Hand the finished arrays to the result; the scratch re-fills from empty next
+    // portray (the .clear()s above reset the moved-from vectors).
+    out.area = std::move(area_);
+    out.line = std::move(line_);
+    out.symbol = std::move(symbol_);
+    out.text = std::move(text_);
+    out.sprite = std::move(sprite_);
+    out.pattern = std::move(pattern_);
+    out.glyph = std::move(glyph_);
+}
+
+// GL-THREAD half: upload each layer to its own VBO (empty layers keep vbo==0, n==0)
+// and insert into the tile cache.
+ChartRenderer::TileGeom& ChartRenderer::upload_tile(TileCpu&& c) {
+    TileGeom t{};
+    t.ref_wx = c.ref_wx;
+    t.ref_wy = c.ref_wy;
+    for (int i = 0; i < 7; ++i)
+        t.ranges[i] = std::move(c.ranges[i]);
     struct LayerSrc {
         const void* data;
         size_t bytes;
         uint32_t count;
     };
     const LayerSrc src[7] = {
-        {area_.data(), area_.size() * sizeof(Vtx), (uint32_t)area_.size()},
-        {line_.data(), line_.size() * sizeof(LineVtx), (uint32_t)line_.size()},
-        {symbol_.data(), symbol_.size() * sizeof(Vtx), (uint32_t)symbol_.size()},
-        {text_.data(), text_.size() * sizeof(Vtx), (uint32_t)text_.size()},
-        {sprite_.data(), sprite_.size() * sizeof(SpriteVtx), (uint32_t)sprite_.size()},
-        {pattern_.data(), pattern_.size() * sizeof(PatVtx), (uint32_t)pattern_.size()},
-        {glyph_.data(), glyph_.size() * sizeof(GlyphVtx), (uint32_t)glyph_.size()},
+        {c.area.data(), c.area.size() * sizeof(Vtx), (uint32_t)c.area.size()},
+        {c.line.data(), c.line.size() * sizeof(LineVtx), (uint32_t)c.line.size()},
+        {c.symbol.data(), c.symbol.size() * sizeof(Vtx), (uint32_t)c.symbol.size()},
+        {c.text.data(), c.text.size() * sizeof(Vtx), (uint32_t)c.text.size()},
+        {c.sprite.data(), c.sprite.size() * sizeof(SpriteVtx), (uint32_t)c.sprite.size()},
+        {c.pattern.data(), c.pattern.size() * sizeof(PatVtx), (uint32_t)c.pattern.size()},
+        {c.glyph.data(), c.glyph.size() * sizeof(GlyphVtx), (uint32_t)c.glyph.size()},
     };
     for (int i = 0; i < 7; ++i) {
         t.n[i] = src[i].count;
@@ -1555,8 +1623,119 @@ ChartRenderer::TileGeom& ChartRenderer::ensure_tile(int z, uint32_t x, uint32_t 
         glBindBuffer(GL_ARRAY_BUFFER, t.vbo[i]);
         glBufferData(GL_ARRAY_BUFFER, src[i].bytes, src[i].data, GL_STATIC_DRAW);
     }
-    return tiles_.emplace(key, t).first->second;
+    return tiles_.emplace(c.key, std::move(t)).first->second;
 }
+
+// Synchronous portray + upload, ONCE, on the calling (GL) thread — the TILE57_SYNC
+// fallback path only; the normal path is enqueue_tile -> worker -> drain.
+ChartRenderer::TileGeom& ChartRenderer::ensure_tile(int z, uint32_t x, uint32_t y,
+                                                    const tile57_mariner& m) {
+    uint64_t key = tile_key(z, x, y);
+    auto it = tiles_.find(key);
+    if (it != tiles_.end())
+        return it->second;
+    TileJob job{z, x, y, portray_gen_, m, {}};
+    TileCpu out;
+    out.key = key;
+    portray_tile_cpu(job, out);
+    return upload_tile(std::move(out));
+}
+
+// Queue one tile's CPU portray to the worker (started lazily here). GL thread only.
+void ChartRenderer::enqueue_tile(int z, uint32_t x, uint32_t y, const tile57_mariner& m) {
+    TileJob job;
+    job.z = z;
+    job.x = x;
+    job.y = y;
+    job.m = m;
+    if (m.viewing_groups_off && m.viewing_groups_off_len) // pointee only outlives the CALL
+        job.vg_off.assign(m.viewing_groups_off, m.viewing_groups_off + m.viewing_groups_off_len);
+    inflight_.insert(tile_key(z, x, y));
+    {
+        std::lock_guard<std::mutex> lock(q_mu_);
+        job.gen = portray_gen_;
+        jobs_.push_back(std::move(job));
+        if (!worker_.joinable())
+            worker_ = std::thread([this] { worker_loop(); });
+    }
+    q_cv_.notify_one();
+}
+
+void ChartRenderer::worker_loop() {
+    for (;;) {
+        TileJob job;
+        bool stale;
+        {
+            std::unique_lock<std::mutex> lk(q_mu_);
+            q_cv_.wait(lk, [&] { return quit_ || !jobs_.empty(); });
+            if (quit_)
+                return;
+            job = std::move(jobs_.front());
+            jobs_.pop_front();
+            stale = job.gen != portray_gen_; // queued for a cache clear_tiles just killed
+        }
+        TileCpu out;
+        out.key = tile_key(job.z, job.x, job.y);
+        out.gen = job.gen;
+        if (!stale) {
+            // Re-point the mariner's deny-list at OUR copy (the original pointee may be
+            // long gone — tile57 only guarantees it for the call it was passed to).
+            job.m.viewing_groups_off = job.vg_off.empty() ? nullptr : job.vg_off.data();
+            job.m.viewing_groups_off_len = (uint32_t)job.vg_off.size();
+            portray_tile_cpu(job, out);
+        }
+        // A stale job still posts its (empty) result: the GL-thread drain is the ONLY
+        // place inflight_ entries are removed, so every queued key posts exactly one.
+        {
+            std::lock_guard<std::mutex> lk(q_mu_);
+            done_.push_back(std::move(out));
+        }
+        // Ask the host for a redraw so this freshly-portrayed tile gets uploaded and
+        // composited. Coalesced on the host side, so firing per tile is fine. on_progress_
+        // is set once before the worker starts, so this read races with nothing.
+        if (on_progress_)
+            on_progress_();
+    }
+}
+
+// GL thread, at the top of every render_tiled: upload whatever the worker finished.
+int ChartRenderer::drain_portrayed_tiles() {
+    std::vector<TileCpu> ready;
+    {
+        std::lock_guard<std::mutex> lock(q_mu_);
+        if (done_.empty())
+            return 0;
+        ready.swap(done_);
+    }
+    int uploaded = 0;
+    for (auto& c : ready) {
+        inflight_.erase(c.key);
+        // Drop results portrayed under settings the cache has since been cleared for
+        // (gen mismatch); the tile re-queues under the new generation next render.
+        if (c.gen != portray_gen_ || tiles_.count(c.key))
+            continue;
+        upload_tile(std::move(c));
+        ++uploaded;
+    }
+    return uploaded;
+}
+
+void ChartRenderer::stop_worker() {
+    {
+        std::lock_guard<std::mutex> lock(q_mu_);
+        quit_ = true;
+        jobs_.clear();
+    }
+    q_cv_.notify_all();
+    if (worker_.joinable())
+        worker_.join();
+    worker_ = std::thread(); // joinable() false again -> a later enqueue can restart
+    quit_ = false;
+    done_.clear();
+    inflight_.clear();
+}
+
+ChartRenderer::~ChartRenderer() { stop_worker(); }
 
 // The cell's compilation scale (1:N) + whether to impute SCAMIN from it. Both feed
 // feature_scamin, which runs at PORTRAY time and bakes the result into the vertex buffers —
@@ -1564,12 +1743,31 @@ ChartRenderer::TileGeom& ChartRenderer::ensure_tile(int z, uint32_t x, uint32_t 
 void ChartRenderer::set_super_scamin(bool on, double native_scale) {
     if (on == super_scamin_ && native_scale == native_scale_)
         return;
-    super_scamin_ = on;
-    native_scale_ = native_scale;
+    {
+        // feature_scamin reads these mid-portray — possibly on the worker right now.
+        // (The tile it is baking is doomed anyway: clear_tiles below bumps the
+        // generation and its result will be dropped — this lock just keeps the reads
+        // themselves well-defined.)
+        std::lock_guard<std::mutex> lock(portray_mu_);
+        super_scamin_ = on;
+        native_scale_ = native_scale;
+    }
     clear_tiles();
 }
 
 void ChartRenderer::clear_tiles() {
+    {
+        // Queued/running portrays were requested for the cache being cleared: bump the
+        // generation (the worker skips mismatched jobs, drain drops mismatched results)
+        // and drop the not-yet-started jobs outright. A job portraying RIGHT NOW keeps
+        // its inflight_ entry until its stale result drains — so it cannot be re-queued
+        // early, and re-queues fresh right after.
+        std::lock_guard<std::mutex> lock(q_mu_);
+        ++portray_gen_;
+        for (auto& j : jobs_)
+            inflight_.erase(tile_key(j.z, j.x, j.y));
+        jobs_.clear();
+    }
     for (auto& kv : tiles_)
         for (int i = 0; i < 7; ++i)
             if (kv.second.vbo[i])
@@ -1618,27 +1816,59 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now().time_since_epoch())
                       .count();
+    // The portray time budget must bound the FRAME, not this renderer: a quilt draws a
+    // dozen cells per paint and each has its own ChartRenderer, so a per-renderer 8 ms
+    // cap compounds into a ~100 ms pan frame — the budget never actually protected the
+    // frame. All cells render sequentially on the GL thread, so a shared pool works: a
+    // gap since the last render_tiled call longer than a frame's worth of compose marks
+    // a NEW paint and refills the pool; renders inside the same paint all burn from it.
+    static int64_t s_pool_start_ms = 0; // wall-clock start of this paint's portray pool
+    static int64_t s_last_call_ms = 0;  // last render_tiled entry, for paint detection
+    // Refill on a paint boundary (gap since the previous cell's render), and in any case
+    // once per ~frame period — back-to-back fast paints (120 Hz trackpad pan) can leave
+    // gaps under the threshold forever, which would starve portray completely.
+    if (now - s_last_call_ms > 12 || now - s_pool_start_ms >= 16)
+        s_pool_start_ms = now;
+    s_last_call_ms = now;
     tiles_pending_ = false;
-    int portrayed = 0;
+    // ASYNC PORTRAY (the normal path): the worker thread does the CPU portray; here we
+    // upload whatever it finished since the last paint, and below, a cache miss just
+    // queues a job and draws the backdrop — the paint thread NEVER portrays, so a frame
+    // costs compose only, no matter how many tiles a zoom-out dumped on us. The budget
+    // machinery above only applies to the TILE57_SYNC fallback. The existing
+    // tiles_pending_ -> CallAfter(Refresh) loop keeps repainting (and thus draining)
+    // until the worker catches up.
+    static const bool sync_portray = std::getenv("TILE57_SYNC") != nullptr;
+    int portrayed = drain_portrayed_tiles();
     std::vector<const TileGeom*> vis;
     vis.reserve((size_t)(x1 - x0 + 1) * (y1 - y0 + 1));
     for (uint32_t ty = y0; ty <= y1; ++ty)
         for (uint32_t tx = x0; tx <= x1; ++tx) {
             uint64_t key = tile_key(z, tx, ty);
             auto it = tiles_.find(key);
+            if (it == tiles_.end() && !sync_portray) {
+                if (!inflight_.count(key)) // queue once; drained on a later paint
+                    enqueue_tile(z, tx, ty, m);
+                tiles_pending_ = true;
+                continue;
+            }
             if (it == tiles_.end()) {
-                // Two ways to defer an uncached tile to a later frame: a hard COUNT cap
-                // (used while MOVING, to keep the pan frame cheap) and a wall-clock TIME
-                // cap (used when SETTLED, where we want to finish the whole view in as few
-                // redraws as possible — ideally one — without freezing on a huge burst).
-                // Each deferral schedules exactly one more redraw (tiles_pending_). Fewer
-                // redraws == fewer full-canvas repaints == fewer core basemap re-tessellations.
+                // TILE57_SYNC fallback. Two ways to defer an uncached tile to a later
+                // frame: a hard COUNT cap (used while MOVING, to keep the pan frame
+                // cheap) and a wall-clock TIME cap (used when SETTLED, where we want to
+                // finish the whole view in as few redraws as possible — ideally one —
+                // without freezing on a huge burst). Each deferral schedules exactly one
+                // more redraw (tiles_pending_).
                 bool over_count = portrayed >= kPortrayBudgetPerFrame;
-                bool over_time = max_portray_ms > 0 && portrayed > 0 &&
-                                 (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                      std::chrono::steady_clock::now().time_since_epoch())
-                                      .count() -
-                                  now) >= max_portray_ms;
+                // Time cap measured against the SHARED pool start (all cells in this
+                // paint), not this call's entry. No portrayed>0 floor: with 12 cells a
+                // one-tile-each floor is itself a 12-tile frame, and the backdrop +
+                // pending-refresh already guarantee the deferred tiles arrive.
+                bool over_time =
+                    max_portray_ms > 0 && (std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               std::chrono::steady_clock::now().time_since_epoch())
+                                               .count() -
+                                           s_pool_start_ms) >= max_portray_ms;
                 if (over_count || over_time) {
                     tiles_pending_ = true;
                     continue;
@@ -1720,10 +1950,16 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
     // because tile57 reports rotation-alignment per feature and one buffer mixes both kinds.
     // `plane` selects ONE S-52 draw priority from each tile (< 0 = the whole buffer, for the
     // unquilted/label paths that have no priority interleaving to resolve).
+    // `plane_lo..plane_hi` selects an INCLUSIVE run of S-52 draw priorities from each
+    // tile (lo < 0 = the whole buffer). A tile's vertices are sorted by priority at
+    // portray, so a run's ranges sit back-to-back in the VBO and collapse into ONE
+    // glDrawArrays per tile. Most of the per-draw cost on macOS is Apple's GL-on-Metal
+    // dispatch (gldUpdateDispatch / buildPipelineState in Instruments), so fewer,
+    // fatter draws is the whole game here.
     auto layer = [&](const std::vector<const TileGeom*>& list, int prog, int u_scale, int u_vp,
                      int u_denom, int u_origin, int u_rot, int idx,
                      void (ChartRenderer::*drawfn)(uint32_t, uint32_t, uint32_t), uint32_t tex,
-                     int u_atlas, int plane = -1) {
+                     int u_atlas, int plane_lo = -1, int plane_hi = -1) {
         glUseProgram(prog);
         glUniform1f(u_scale, (float)scale_px);
         glUniform2fv(u_vp, 1, vp);
@@ -1736,19 +1972,25 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
         }
         for (auto* t : list)
             if (t->n[idx]) {
-                // Only the triangles of THIS priority, if the caller asked for one. A tile's
-                // vertices are sorted by priority at portray, so a priority is one range.
-                if (plane < 0) {
+                if (plane_lo < 0) {
                     set_origin(u_origin, t);
                     (this->*drawfn)(t->vbo[idx], 0, t->n[idx]);
                     continue;
                 }
+                // Merge every range inside the window: ranges are sorted by plane and
+                // adjacent in the buffer (offsets accumulate with no gaps), so the
+                // window is a single contiguous span.
+                uint32_t first = 0, count = 0;
                 for (const auto& r : t->ranges[idx])
-                    if ((int)r.plane == plane) {
-                        set_origin(u_origin, t);
-                        (this->*drawfn)(t->vbo[idx], r.first, r.count);
-                        break; // one run per (kind, priority)
+                    if ((int)r.plane >= plane_lo && (int)r.plane <= plane_hi) {
+                        if (!count)
+                            first = r.first;
+                        count += r.count;
                     }
+                if (count) {
+                    set_origin(u_origin, t);
+                    (this->*drawfn)(t->vbo[idx], first, count);
+                }
             }
         if (tex)
             glBindTexture(GL_TEXTURE_2D, 0);
@@ -1758,33 +2000,52 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
     // sounding painted over a symbol that outranks it. Walk PRIORITY as the outer key, and
     // keep the kind order (fills, patterns, lines, symbols, sprites) within a priority — that
     // is the S-52 rule: priority first, and inside one priority, area before line before
-    // point. Only priorities actually present are visited, so a plain chart is unchanged in
-    // cost. Layers 3/6 (text/glyph) never populate for tiles — labels are a separate pass
+    // point. Layers 3/6 (text/glyph) never populate for tiles — labels are a separate pass
     // drawn last, above all of this.
+    //
+    // DRAW-CALL REDUCTION, order unchanged: `kinds_at` records which kinds exist at each
+    // priority across all tiles. Passes for (kind, priority) combinations nothing uses are
+    // skipped outright (the old loop bound the program and set five uniforms for every
+    // present priority x 5 kinds, hit or not), and a RUN of consecutive priorities occupied
+    // by a SINGLE kind is drawn as one merged pass — S-52 order only constrains draws
+    // between DIFFERENT kinds, and within one kind the priority order is preserved by the
+    // VBO's plane sort. Typical charts are long single-kind runs (fills low, lines mid,
+    // points high), so this collapses hundreds of draws into a handful.
     auto draw_layers = [&](const std::vector<const TileGeom*>& list) {
         if (list.empty())
             return;
-        bool present[256] = {false};
+        uint8_t kinds_at[256] = {0}; // bit k set: some tile draws kind k at this priority
         for (const auto* t : list)
             for (int k = 0; k < 7; ++k)
                 for (const auto& r : t->ranges[k])
-                    present[r.plane] = true;
+                    kinds_at[r.plane] |= (uint8_t)(1u << k);
 
-        for (int p = 0; p < 256; ++p) {
-            if (!present[p])
+        for (int p = 0; p < 256;) {
+            const uint8_t kinds = kinds_at[p];
+            if (!kinds) {
+                ++p;
                 continue;
-            layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 0,
-                  &ChartRenderer::draw_range, 0, -1, p); // area
-            if (g_atlas.ok)
+            }
+            int pe = p;
+            if ((kinds & (kinds - 1)) == 0) // single kind here: extend the run
+                while (pe + 1 < 256 && (kinds_at[pe + 1] == 0 || kinds_at[pe + 1] == kinds))
+                    ++pe;
+            if (kinds & (1u << 0))
+                layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 0,
+                      &ChartRenderer::draw_range, 0, -1, p, pe); // area
+            if ((kinds & (1u << 5)) && g_atlas.ok)
                 layer(list, prog_pat_, pu_scale_, pu_vp_, pu_denom_, pu_origin_, pu_rot_, 5,
-                      &ChartRenderer::draw_pat_range, g_atlas.tex, pu_atlas_, p); // pattern
-            layer(list, prog_line_, lu_scale_, lu_vp_, lu_denom_, lu_origin_, lu_rot_, 1,
-                  &ChartRenderer::draw_line_range, 0, -1, p); // line (dashed in the fragment)
-            layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 2,
-                  &ChartRenderer::draw_range, 0, -1, p); // symbol (tessellated)
-            if (g_atlas.ok)
+                      &ChartRenderer::draw_pat_range, g_atlas.tex, pu_atlas_, p, pe); // pattern
+            if (kinds & (1u << 1))
+                layer(list, prog_line_, lu_scale_, lu_vp_, lu_denom_, lu_origin_, lu_rot_, 1,
+                      &ChartRenderer::draw_line_range, 0, -1, p, pe); // line (fragment dash)
+            if (kinds & (1u << 2))
+                layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 2,
+                      &ChartRenderer::draw_range, 0, -1, p, pe); // symbol (tessellated)
+            if ((kinds & (1u << 4)) && g_atlas.ok)
                 layer(list, prog_sprite_, su_scale_, su_vp_, su_denom_, su_origin_, su_rot_, 4,
-                      &ChartRenderer::draw_sprite_range, g_atlas.tex, su_atlas_, p); // sprite
+                      &ChartRenderer::draw_sprite_range, g_atlas.tex, su_atlas_, p, pe); // sprite
+            p = pe + 1;
         }
     };
     draw_layers(back_vis); // coarser fallback zoom underneath (only when target incomplete)
@@ -1804,6 +2065,10 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
 // (see the label cache there), not every frame.
 void ChartRenderer::portray_view_labels(double lon, double lat, double zoom, double rotation,
                                         uint32_t w, uint32_t h, const tile57_mariner& m) {
+    // One portray at a time, whichever thread: the tile worker uses the same tile57
+    // handle and the same member scratch/params this pass writes below. Runs at settle
+    // only, so blocking briefly on an in-flight tile portray is fine.
+    std::lock_guard<std::mutex> portray_lock(portray_mu_);
     text_.clear();
     glyph_.clear();
     lonlat_to_world(lon, lat, ref_wx_, ref_wy_); // labels referenced to view centre
@@ -2312,15 +2577,19 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
 }
 
 void ChartRenderer::shutdown() {
+    stop_worker(); // no portray may be running when chart_ closes below
     gl_ready_ = false;
     prog_ = prog_sprite_ = prog_pat_ = prog_glyph_ = prog_blit_ = 0;
     vbo_quad_ = 0;
     have_range_ = false;
     tiles_.clear();
     tiles_mhash_ = 0; // GL buffers die with the context on shutdown
-    // The shared programs die with the context too — force a rebuild on the next
-    // ensure_gl (e.g. after a plugin reload / context recreate).
-    g_prog = GlPrograms{};
+    // Do NOT reset g_prog here: it is SHARED by every renderer, and shutdown() runs
+    // on every chart close — OpenCPN closes charts constantly while quilting, and
+    // resetting here forced a full 5-program shader recompile on the next paint of
+    // every surviving chart (a repeating multi-ms hitch, 2.2% of a whole profile).
+    // A genuinely dead context (plugin reload / context recreate) is detected in
+    // ensure_gl via glIsProgram and rebuilds there.
     if (chart_) {
         tile57_chart_close(chart_);
         chart_ = nullptr;

@@ -47,7 +47,7 @@ const config = {
   themeConfig:
     /** @type {import('@docusaurus/preset-classic').ThemeConfig} */
     ({
-      image: 'img/annapolis-harbor.png',
+      image: 'img/hero.png',
       navbar: {
         title: 'tile57 OpenCPN plugin',
         items: [

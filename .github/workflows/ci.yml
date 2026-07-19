@@ -12,7 +12,7 @@ jobs:
   format:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Pin the exact clang-format so the check matches local formatting byte-for-byte
       # (clang-format output drifts between versions). Only our own src/ — vendored
       # third_party/ and the opencpn-libs submodule are left alone.
@@ -41,7 +41,9 @@ jobs:
 
       - name: Build tile57 (static lib)
         working-directory: tile57
-        run: zig build -Doptimize=ReleaseFast
+        # `lib` builds ONLY libtile57.a (what the plugin links); the default step also
+        # builds the host-only bake CLI, which can't cross-compile.
+        run: zig build lib -Doptimize=ReleaseFast
 
       - name: Install build dependencies
         run: |
@@ -57,17 +59,20 @@ jobs:
       - name: Build
         run: cmake --build build -j
 
+      - name: Package (OpenCPN import tarball)
+        run: cmake --build build --target package
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: tile57_pi-linux
-          path: build/libtile57_pi.so
+          path: build/tile57_pi_*.tar.gz
           if-no-files-found: error
 
   # Best-effort Windows build. The plugin links the vendored MSVC OpenCPN import lib
-  # (opencpn-libs/api-18/msvc-wx32/opencpn.lib), so tile57 must be built for the MSVC
-  # ABI too, and wxWidgets/GLEW come from vcpkg. Building wxWidgets from source via
-  # vcpkg is slow; a failure here does not block the Linux build.
+  # (opencpn-libs/api-18/msvc-wx32/opencpn.lib), so tile57 must be built for the 32-bit
+  # MSVC ABI too, and wxWidgets/GLEW come from OpenCPN's prebuilt cache (win_deps.bat).
+  # A failure here does not block the Linux build.
   windows:
     runs-on: windows-latest
     steps:
@@ -84,7 +89,10 @@ jobs:
           path: tile57
 
       - name: Set up MSVC environment
+        # OpenCPN for Windows is a 32-bit process, so the plugin (and tile57) must be x86.
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
@@ -93,33 +101,55 @@ jobs:
 
       - name: Build tile57 (MSVC-ABI static lib)
         working-directory: tile57
-        run: zig build -Dtarget=x86_64-windows-msvc -Doptimize=ReleaseFast
+        # `lib` builds ONLY libtile57.a for the MSVC ABI; the default step also builds
+        # the host-only bake CLI, which can't cross-compile. x86 = 32-bit, to match OpenCPN.
+        run: zig build lib -Dtarget=x86-windows-msvc -Doptimize=ReleaseFast
 
       - name: Locate tile57 lib
         id: t57lib
         shell: bash
         run: |
-          lib=$(ls tile57/zig-out/lib/*.lib tile57/zig-out/lib/*.a 2>/dev/null | head -1)
+          echo "=== tile57/zig-out tree ==="
+          find tile57/zig-out -type f 2>/dev/null | sort || echo "(no zig-out)"
+          # Search the whole zig-out, not just lib/, in case the archive lands elsewhere.
+          lib=$(find tile57/zig-out \( -name '*.lib' -o -name '*.a' \) 2>/dev/null | head -1)
           echo "Found tile57 lib: $lib"
+          if [ -z "$lib" ]; then echo "::error::no tile57 static lib produced by zig build lib"; exit 1; fi
           echo "path=$lib" >> "$GITHUB_OUTPUT"
 
-      - name: Install wxWidgets + GLEW (vcpkg)
-        run: vcpkg install wxwidgets glew --triplet x64-windows
+      # wx + GLEW come from OpenCPN's own prebuilt 32-bit (vc14x) cache, not vcpkg:
+      # building wxWidgets from source in vcpkg took 15-25 min. win_deps.bat downloads
+      # the prebuilt binaries (self-installs wget/7z via choco) into OpenCPN/cache/,
+      # which is exactly what the plugin's OCPN_SRC_DIR discovery reads.
+      - name: Checkout OpenCPN (prebuilt 32-bit wx + GLEW)
+        uses: actions/checkout@v7
+        with:
+          repository: OpenCPN/OpenCPN
+          path: OpenCPN
+          fetch-depth: 1
+
+      - name: Fetch Windows deps (OpenCPN prebuilt wx/GLEW)
+        working-directory: OpenCPN/buildwin
+        shell: cmd
+        run: win_deps.bat
 
       - name: Configure
+        # -A Win32 keeps the plugin 32-bit to match OpenCPN's Windows process.
         run: >
-          cmake -S . -B build
-          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-          -DVCPKG_TARGET_TRIPLET=x64-windows
+          cmake -S . -B build -A Win32
+          -DOCPN_SRC_DIR="${{ github.workspace }}/OpenCPN"
           -DTILE57_DIR="${{ github.workspace }}/tile57"
           -DTILE57_LIB="${{ steps.t57lib.outputs.path }}"
 
       - name: Build
         run: cmake --build build --config Release
 
+      - name: Package (OpenCPN import tarball)
+        run: cmake --build build --target package --config Release
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: tile57_pi-windows
-          path: build/**/tile57_pi.dll
+          path: build/tile57_pi_*.tar.gz
           if-no-files-found: error

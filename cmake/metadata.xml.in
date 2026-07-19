@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- OpenCPN managed-plugin manifest. Rendered from this template by the `package`
+     CMake target (cmake/Package.cmake) with the resolved build target tuple, then
+     placed at the top of the plugin tarball. OpenCPN reads it on
+     Options -> Plugins -> "Import plugin..." to check compatibility and install. -->
+<plugin version="1">
+  <name>tile57</name>
+  <version>@PKG_VERSION@</version>
+  <release>1</release>
+  <summary>S-57/S-101 vector charts via tile57 — NOT FOR NAVIGATION</summary>
+  <api-version>1.19</api-version>
+  <open-source>true</open-source>
+  <author>beetlebug.org</author>
+  <source>https://github.com/beetlebugorg/tile57-opencpn-plugin</source>
+  <info-url>https://beetlebugorg.github.io/tile57-opencpn-plugin/</info-url>
+  <description>Installs an ENC chart driven by tile57's live S-52 portrayal, rendered on the GPU. Add the folder holding a baked bundle's chart.pmtiles as a chart directory. EXPERIMENTAL / NOT FOR NAVIGATION.</description>
+  <target>@PKG_TARGET@</target>
+  <target-version>@PKG_TARGET_VERSION@</target-version>
+  <target-arch>@PKG_ARCH@</target-arch>
+</plugin>
