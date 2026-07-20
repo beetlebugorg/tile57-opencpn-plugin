@@ -1,33 +1,39 @@
-// chart_renderer.h — draws a tile57 chart as a GPU vector chart.
+// chart_renderer.h — draws a tile57 chart from a draw-ready GPU scene.
 //
-// tile57 portrays a view ONCE (tile57_chart_surface) into a WORLD-SPACE
-// tagged stream: area/line geometry in web-mercator [0,1]; point symbols and text
-// as a world anchor + a local reference-px outline; each draw call tagged with
-// its feature SCAMIN. We tessellate that once into a single vertex buffer and,
-// every frame, transform it on the GPU and cull by SCAMIN — so pan and zoom
-// re-portray NOTHING (like a native S57 SENC). Portrayal re-runs only when the
-// view leaves the cached camera's margin/zoom band or mariner settings change.
+// tile57 portrays a whole view ONCE (tile57_chart_gpu_scene / _compose_gpu_scene)
+// into DRAW-READY buffers: geometry already tessellated, already in S-52 paint
+// order, split into ranges that each draw with one pipeline. The host owns no
+// scene and knows no S-52: upload the three buffers (triangles: vertices+indices;
+// sprites/SDF glyphs: quads) plus the two baked atlas textures, then walk the
+// ranges in order and draw each. Every vertex is WORLD web-mercator [0,1]; the
+// camera transforms it per frame (uScale/uOrigin/uRot), so pan/zoom/rotate
+// re-portray NOTHING. The scene OVERSCANS the viewport; it rebuilds only when the
+// view leaves that coverage margin/zoom band or the mariner settings change —
+// the lookout-core model (see lookout-core/src/gpu.zig).
 //
-// One vertex, one program: screen_px = aWorld * uScale + uOrigin + aPost.
-//   aWorld  world offset from a per-chart reference point (f32; small -> precise)
-//   aPost   a screen-space px offset applied AFTER the world transform: 0 for
-//           areas, perp*halfwidth for lines, the local glyph/symbol px for
-//           anchored symbols & text (so those stay a constant screen size).
-//   aScamin SCAMIN cull: the vertex is dropped when the view zoom < aScamin.
+// Per-vertex `scamin` and `disp_cat` gates ride to the GPU and are culled in the
+// vertex shader from uniforms (uScaminDenom, uCatMask), so category / SCAMIN
+// changes never force a rebuild either.
 #pragma once
 #include "tile57.h"
-#include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
-#include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace t57 {
+
+// tile57 hands colours across the C ABI as a packed 0xRRGGBBAA scalar
+// (tile57_color) rather than a 4-byte struct — passing a small struct by value
+// across callconv(.c) is miscompiled by zig on aarch64 in optimized builds.
+struct Rgba8 {
+    unsigned char r, g, b, a;
+};
+static inline Rgba8 tile57_unpack(tile57_color c) {
+    return Rgba8{(unsigned char)((c >> 24) & 0xFF), (unsigned char)((c >> 16) & 0xFF),
+                 (unsigned char)((c >> 8) & 0xFF), (unsigned char)(c & 0xFF)};
+}
 
 class ChartRenderer {
   public:
@@ -35,304 +41,113 @@ class ChartRenderer {
 
     bool open_chart(const std::string& pmtiles_path); // baked .pmtiles archive
     bool ensure_gl();
-    // SUPER-SCAMIN: impute a SCAMIN for features the ENC left ungated, from this cell's
-    // compilation scale (see feature_scamin). `native_scale` is the cell's 1:N denominator.
-    // Changing either clears the tile cache — the value is baked into the vertex buffers.
+    // Kept for the host's "Use SCAMIN" wiring in tile57_chart.cpp. The engine now
+    // imputes a SCAMIN for ungated features from the cell's compilation scale, so
+    // this only records intent; the live cull denominator arrives per render().
     void set_super_scamin(bool on, double native_scale);
-    // The 1:N denominator this feature is culled at (authored SCAMIN, imputed super-SCAMIN,
-    // or "never"). Public because the C surface trampolines route every draw call through it.
-    float feature_scamin(const tile57_feature* f) const;
-    // Portray (if needed) for this view, then draw into the current framebuffer.
-    // lon/lat = view centre, zoom = the GEOGRAPHIC (chart-scale) web-mercator zoom —
-    // used for tile detail + the SCAMIN cull, so those track the physical chart scale
-    // regardless of display density. w/h = the GL viewport (physical px). device_scale
-    // = the framebuffer/logical px ratio (contentScale on HiDPI): the projection
-    // scales by it so geometry fills the physical framebuffer while SCAMIN does not.
-    // scamin_display_denom = the host's TRUE display scale denominator (OpenCPN's
-    // vp.chart_scale). Each feature's SCAMIN rides to the GPU as itself and is compared
-    // against this, exactly as native OpenCPN does — no zoom-threshold formula, so no
-    // equator assumption. 0 disables the cull ("Use SCAMIN" off).
-    // cull_bias = zoom levels of extra culling (TILE57_DECLUTTER opt-in, normally 0);
-    // one level = one doubling of the denominator, applied to every layer alike so a
-    // feature's symbol and label always hide at the same zoom.
-    // rotation = OpenCPN's ViewPort rotation in radians (course-up etc; 0 = north-up),
-    // applied about the viewport centre on the GPU. It is a pure VIEW transform: the
-    // portrayed geometry stays north-up in world space, so the tile + label caches
-    // survive a turn untouched and rotating re-portrays nothing.
-    // patch_fb = the quilt patch this chart owns, {x, y, w, h} in framebuffer px (top-left
-    // origin, like the shader's screen frame); null = the whole viewport. Tiles outside it
-    // can never appear on screen, so they are never portrayed — without this every cell in a
-    // quilt tessellates the whole canvas and the scissor discards nearly all of it.
+    // Portray (if the view left the cached scene's coverage) then draw into the
+    // current framebuffer. Args unchanged from the surface-callback renderer so
+    // tile57_chart.cpp needs no change: lon/lat = view centre, zoom = GEOGRAPHIC
+    // web-mercator zoom (tile detail + SCAMIN cull, tracks the physical chart
+    // scale), w/h = the GL viewport (physical px), device_scale = framebuffer/
+    // logical px ratio (HiDPI), cull_bias = extra SCAMIN thinning (levels),
+    // rotation = ViewPort rotation (rad, course-up), scamin_display_denom = the
+    // host's true display scale (1:N; 0 = cull off), patch_fb = the quilt patch
+    // {x,y,w,h} in framebuffer px this chart owns (null = whole viewport).
     void render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                 const tile57_mariner& m, Pass pass, bool stencil_clip, double device_scale = 1.0,
                 double cull_bias = 0.0, double rotation = 0.0, double scamin_display_denom = 0.0,
                 const int* patch_fb = nullptr);
     void shutdown();
     bool has_chart() const { return chart_ != nullptr; }
-    // True when the last render deferred work that a follow-up redraw would finish:
-    // tiles left un-portrayed by the per-frame budget, OR a stale whole-view label
-    // portray postponed until motion stops. The caller requests another redraw so the
-    // view fills in / labels refresh (progressive fill instead of a one-frame freeze).
-    bool tiles_pending() const { return tiles_pending_ || labels_pending_; }
+    // The lookout-core model rebuilds the whole scene synchronously on a coverage
+    // miss, so nothing is ever deferred to a follow-up frame.
+    bool tiles_pending() const { return false; }
     bool get_info(tile57_info& out) const;
     tile57_chart* chart_handle() const { return chart_; } // for object-query
-    // Serializes EVERY call into chart_ (and the shared portray scratch): the tile57
-    // handle is not internally synchronized (tile57.h "Threading"), and tile portray now
-    // runs on a worker thread. Anyone outside this class touching chart_handle() — the
-    // object-query path — must hold this for the duration of the call.
+    // Serializes every call into chart_ (the tile57 handle is not internally
+    // synchronized): the render/build path and the object-query path both take it.
     std::mutex& portray_mutex() const { return portray_mu_; }
-    // Called (from the portray WORKER thread) whenever the worker finishes a tile and
-    // pushes a result — the host uses it to request a coalesced redraw so finished tiles
-    // appear promptly WITHOUT forcing a full-frame re-render every frame (which would
-    // invalidate OpenCPN's FBO and defeat accelerated pan). The target must be
-    // thread-safe (it marshals a Refresh onto the GUI thread). Set once before the worker
-    // can start (i.e. before the first render), then only read by the worker.
+    // Retained for ABI parity with the host; the synchronous rebuild never calls it.
     void set_progress_callback(std::function<void()> cb) { on_progress_ = std::move(cb); }
-    ~ChartRenderer(); // joins the portray worker
-
-    // postrot (on Vtx/SpriteVtx/GlyphVtx): does this vertex's screen-px offset (px,py) turn
-    // with the chart under a rotated view? 1 = yes (MAP-aligned), 0 = no (VIEWPORT-aligned,
-    // stays upright on screen). It is PER-VERTEX and not a per-draw uniform because tile57
-    // reports rotation-alignment per FEATURE: one tile's symbol/sprite/text buffer mixes
-    // MAP-aligned marks (an ORIENT'd light, a traffic-lane arrow, a depth-contour value that
-    // must follow its contour) with VIEWPORT-aligned ones (a buoy, an ordinary label), so a
-    // single uniform for the whole buffer cannot express it. Lines are always 1 (their aPost
-    // is a half-width normal taken from the segment's WORLD direction); areas are always 0
-    // (their aPost is zero anyway).
-
-    // Unified GPU vertex (see header note).
-    struct Vtx {
-        float wx, wy, px, py;
-        uint8_t r, g, b, a;
-        float scamin, postrot;
-    };
-    // Line vertex. Lines carry the S-52 LS() dash pattern, so they get their own type and
-    // program rather than widening Vtx — area/symbol/text share Vtx, and an area's triangles
-    // are the biggest buffer on the chart; they must not pay 12 bytes a vertex for a dash
-    // they can never have.
-    //   dist  = arc length from the START OF THE POLYLINE, in WORLD units. The shader turns
-    //           it into screen px (* uScale), so one dash is a constant SCREEN length at any
-    //           zoom, and a cached tile stays correct when it is drawn at a zoom it was not
-    //           portrayed at (the coarse backdrop layer does exactly that).
-    //   dash  = on/off run lengths in px, straight from tile57's stroke_line. (0,0) = solid.
-    // No postrot: a line's aPost is a half-width normal taken from the segment's WORLD
-    // direction, so it ALWAYS turns with the chart — the line shader rotates it flat, with
-    // nothing to select on (see the VS note).
-    struct LineVtx {
-        float wx, wy, px, py;
-        uint8_t r, g, b, a;
-        float scamin;
-        float dist;
-        float dash_on, dash_off;
-    };
-    // Sprite vertex: world anchor + screen-px quad corner + atlas UV + SCAMIN.
-    struct SpriteVtx {
-        float wx, wy, px, py, u, v, scamin, postrot;
-    };
-    // Pattern vertex: world position + atlas cell rect + tile screen px + SCAMIN.
-    // (No postrot: a pattern has no local px offset — the fill lattice rides the chart.)
-    struct PatVtx {
-        float wx, wy, u0, v0, u1, v1, tw, th, scamin;
-    };
-    // Glyph vertex: world anchor + screen-px quad corner + SDF atlas UV + colour
-    // + SCAMIN (text drawn as SDF quads from the glyph atlas).
-    struct GlyphVtx {
-        float wx, wy, px, py, u, v;
-        uint8_t r, g, b, a;
-        float scamin, postrot;
-    };
-
-    // Geometry sinks the C surface callbacks append to (public for the
-    // trampolines). Grouped by paint layer so we draw area->line->symbol->text.
-    std::vector<Vtx> area_, symbol_, text_;
-    std::vector<LineVtx> line_;     // stroked lines (own type: they carry the LS() dash)
-    std::vector<SpriteVtx> sprite_; // point symbols drawn from the atlas
-    std::vector<PatVtx> pattern_;   // area fills tiled from the pattern atlas
-    std::vector<GlyphVtx> glyph_;   // text drawn as SDF quads from the glyph atlas
-    // The S-52 draw priority of every vertex above, in step with it (one entry per vertex).
-    // tile57 tags each feature with `plane` and leaves the paint order to us — batching by
-    // geometry KIND (all sprites after all symbols) ignores it, which is what put soundings
-    // on top of the symbols they should sit under. Portray records it, ensure_tile sorts by
-    // it. Scratch only: it does not ride to the GPU (the sort makes it implicit).
-    std::vector<uint8_t> area_pl_, line_pl_, symbol_pl_, text_pl_, sprite_pl_, pattern_pl_,
-        glyph_pl_;
-    int cur_plane_ = 0; // the feature being portrayed (set per draw call by the trampolines)
-    void set_plane(const tile57_feature* f) { cur_plane_ = f ? (int)f->plane : 0; }
-    // Tag the vertices [from, to) of `planes`' buffer with the current feature's priority.
-    void tag_plane(std::vector<uint8_t>& planes, size_t from, size_t to) {
-        planes.resize(from); // portray clears verts + planes together; keep them in lockstep
-        planes.resize(to, (uint8_t)std::min(std::max(cur_plane_, 0), 255));
-    }
-    // The world reference point offsets are relative to (set per portrayal).
-    double ref_wx_ = 0, ref_wy_ = 0;
-    // Geometry decimation epsilon in world units (~half a portrayal pixel).
-    double decimate_eps_ = 0;
-    // Screen px per world unit AT THE TILE'S OWN ZOOM (256 * 2^z). The engine bakes
-    // complex-linestyle brick SPACING into tile-local geometry, so it only lands at the
-    // intended screen spacing when the tile is drawn at its native zoom. TILE57_DEBUG uses
-    // this to report the spacing the engine actually asked for, in px.
-    double portray_px_per_world_ = 0;
-    // TILE57_DEBUG only: the previous sprite anchor, to measure brick spacing along a
-    // complex linestyle (consecutive same-name MAP-aligned sprites are one style's bricks).
-    std::string dbg_sprite_name_;
-    double dbg_sprite_ax_ = 0, dbg_sprite_ay_ = 0;
-    // Display scale (mariner size_scale) — pattern tile screen size.
-    double size_scale_ = 1.0;
-    // Super-SCAMIN state (see feature_scamin / set_super_scamin): the cell's compilation
-    // scale, and whether to impute a SCAMIN from it for features the ENC left ungated.
-    double native_scale_ = 0.0;
-    bool super_scamin_ = true;
-    // Callback handlers (world/local geometry -> Vtx). `align` is tile57's per-feature
-    // rotation-alignment; it becomes the vertex's postrot (see the note above).
-    void on_fill_area(const tile57_world_rings* r, tile57_rgba c, float scamin);
-    // dash_on/dash_off: the LS() pattern in px, as tile57 hands it over ((0,0) = solid).
-    void on_stroke_line(const tile57_world_rings* l, float width_px, float dash_on, float dash_off,
-                        tile57_rgba c, float scamin);
-    void on_draw_symbol(tile57_world_point anchor, const tile57_local_rings* r, tile57_rgba c,
-                        int even_odd, float stroke_w, tile57_rot_align align, float scamin);
-    void on_draw_text(tile57_world_point anchor, const tile57_local_rings* g, tile57_rgba c,
-                      tile57_rgba halo, tile57_rot_align align, float scamin);
-    void on_draw_sprite(const char* name, size_t len, tile57_world_point anchor, float rot_deg,
-                        tile57_rot_align align, float half_w, float half_h, float scamin);
-    void on_draw_pattern(const char* name, size_t len, const tile57_world_rings* rings,
-                         float scamin);
-    // Lay out `text` from the SDF glyph atlas at (anchor + origin px), size in px, the whole
-    // run turned by rot_deg about the anchor (a depth-contour value arrives with its
-    // contour's tangent), appending one quad per glyph to glyph_.
-    void on_draw_text_str(tile57_world_point anchor, float ox, float oy, const char* text,
-                          size_t len, float size_px, float rot_deg, tile57_rot_align align,
-                          tile57_rgba color, tile57_rgba halo, float scamin);
-
-    // ---- tiled path (MapLibre model): portray+tessellate each baked tile ONCE,
-    // cache its GPU geometry, compose the view from cached tiles. This is the only
-    // render path. One tile's tessellated GPU geometry (its own VBOs) + the world
-    // origin its verts are relative to (the tile's NW corner, so aWorld stays f32-tiny).
-    // A run of triangles sharing one S-52 draw priority, inside a kind's VBO. The tile's
-    // vertices are SORTED by priority at portray time, so a priority is one contiguous range
-    // and the paint loop can walk priorities without touching the data again.
-    struct Range {
-        uint8_t plane;         // S-52 draw priority (the paint order key)
-        uint32_t first, count; // vertices, within this kind's VBO
-    };
-    struct TileGeom {
-        uint32_t vbo[7] = {0, 0, 0, 0, 0, 0, 0}; // area,line,symbol,text,sprite,pat,glyph
-        uint32_t n[7] = {0, 0, 0, 0, 0, 0, 0};
-        std::vector<Range> ranges[7]; // ascending by plane; empty kinds stay empty
-        double ref_wx = 0, ref_wy = 0;
-        int64_t used_ms = 0; // last frame this tile was drawn (LRU evict)
-    };
+    ~ChartRenderer();
 
   private:
-    // Draw [first, first+count) vertices of a VBO. The range is how one S-52 draw priority is
-    // painted out of a tile whose triangles are sorted by priority (see sort_by_plane).
-    void draw_range(uint32_t vbo, uint32_t first, uint32_t count);        // Vtx (prog_)
-    void draw_line_range(uint32_t vbo, uint32_t first, uint32_t count);   // LineVtx (prog_line_)
-    void draw_pat_range(uint32_t vbo, uint32_t first, uint32_t count);    // PatVtx (prog_pat_)
-    void draw_sprite_range(uint32_t vbo, uint32_t first, uint32_t count); // SpriteVtx
-    void draw_glyph_range(uint32_t vbo, uint32_t first, uint32_t count);  // GlyphVtx
-    void composite_ss(); // draw the resolved MSAA texture over OpenCPN's FBO
-
-    // The view rotation as (cos, sin) — the GPU transform's 2x2, y-down (see VS).
+    // The view rotation as (cos, sin) — the GPU transform's 2x2, y-down.
     struct Rot {
         double c = 1.0, s = 0.0;
     };
-    // Half-extents (world units) of the AABB that CONTAINS the rotated view rect. Turning
-    // the view sweeps the screen rect over a bigger world box, so tile enumeration (and the
-    // label portray) must cover |w·cos|+|h·sin| by |w·sin|+|h·cos| — at 45° that is ~1.41x
-    // each way — or the corners the turn exposes come up empty. `slack` (radians) widens
-    // the box to also contain every rotation within ±slack: sin/cos are 1-Lipschitz, so
-    // padding |cos| and |sin| by slack is a sound bound. slack=0 (north-up, and the tile
-    // path) reproduces the old w/2, h/2 exactly.
-    static void rotated_half_extent(uint32_t w, uint32_t h, double scale_px, Rot rot,
-                                    double& half_wx, double& half_wy, double slack = 0.0);
-    // Tiled path helpers (chart_renderer.cpp).
-    void render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, float cull_denom, double vwx,
-                      double vwy, double scale_px, int z, uint32_t x0, uint32_t x1, uint32_t y0,
-                      uint32_t y1, int budget, int max_portray_ms, Rot rot);
-    TileGeom& ensure_tile(int z, uint32_t x, uint32_t y, const tile57_mariner& m);
-    void clear_tiles();
-    void evict_lru(size_t cap); // drop least-recently-drawn tiles above `cap`
-    // Whole-view label pass (shared declutter grid; fixes per-tile seam label drops).
-    // rotation: handed to tile57 for the VIEW pass only — it decides the declutter frame and
-    // keeps a tangent-rotated contour value from reading upside down. (The TILE pass gets no
-    // rotation: its geometry is cached and must stay north-up, per tile57_chart_tile_surface.)
-    void portray_view_labels(double lon, double lat, double zoom, double rotation, uint32_t w,
-                             uint32_t h, const tile57_mariner& m);
-    void draw_view_labels(double scale_px, float cull_denom, uint32_t w, uint32_t h, double vwx,
-                          double vwy, Rot rot);
-    static uint64_t tile_key(int z, uint32_t x, uint32_t y) {
-        return ((uint64_t)(z & 0x1f) << 58) | ((uint64_t)(x & 0x1fffffff) << 29) | (y & 0x1fffffff);
-    }
 
-    // ---- async tile portray -------------------------------------------------
-    // The CPU half of a tile portray (pmtiles decode + tessellation + priority sort —
-    // ALL of the cost) runs on a per-renderer worker thread; the GL thread only uploads
-    // finished vertex arrays (upload_tile) and composes cached tiles, so a pan/zoom
-    // frame never stalls on portray. portray_mu_ serializes every portray AND every
-    // other call into chart_ (worker tile portray, GL-thread label portray, object
-    // query): the tile57 handle is not internally synchronized, and the portray sinks
-    // are the shared member scratch above. TILE57_SYNC=1 restores the old synchronous
-    // budgeted portray (A/B lever, and the fallback if a platform dislikes the thread).
-    struct TileJob {
-        int z;
-        uint32_t x, y;
-        uint64_t gen; // portray generation the job was queued under (stale -> skipped)
-        tile57_mariner m;
-        // Deep copy of m.viewing_groups_off: tile57 only requires the pointee to outlive
-        // the CALL, so the caller's array cannot be assumed alive when the worker runs.
-        // The worker re-points m at this before portraying (data() moves with the job).
-        std::vector<int32_t> vg_off;
+    // One contiguous draw out of the uploaded buffers, one pipeline. Copied from
+    // tile57_gpu_range at build time (the scene is freed once uploaded).
+    struct Range {
+        uint32_t first = 0, count = 0;
+        uint8_t kind = 0;              // tile57_gpu_kind (paint order is already the array order)
+        uint8_t prim = 0;             // tile57_gpu_prim: TRIANGLES (indices) | QUADS (quad verts)
+        uint8_t atlas = 0;            // tile57_gpu_atlas (QUADS only)
+        uint32_t pattern = 0xFFFFFFFF; // index into pat_tex_, or TILE57_GPU_NO_PATTERN
+        unsigned char color[4] = {0, 0, 0, 255}; // resolved range colour (flat fills / SDF tint)
     };
-    struct TileCpu { // one finished portray, awaiting GL upload on the paint thread
-        uint64_t key = 0;
-        uint64_t gen = 0;
-        double ref_wx = 0, ref_wy = 0;
-        std::vector<Vtx> area, symbol, text;
-        std::vector<LineVtx> line;
-        std::vector<SpriteVtx> sprite;
-        std::vector<PatVtx> pattern;
-        std::vector<GlyphVtx> glyph;
-        std::vector<Range> ranges[7];
-    };
-    void enqueue_tile(int z, uint32_t x, uint32_t y, const tile57_mariner& m); // GL thread
-    void portray_tile_cpu(const TileJob& job, TileCpu& out); // worker (takes portray_mu_)
-    TileGeom& upload_tile(TileCpu&& c); // GL thread: create VBOs + insert into tiles_
-    int drain_portrayed_tiles();        // GL thread: upload all finished results
-    void worker_loop();
-    void stop_worker(); // quit + join (dtor / shutdown)
 
-    mutable std::mutex portray_mu_;     // chart_ + portray scratch: one user at a time
-    std::function<void()> on_progress_; // worker -> host "a tile is ready" (see setter)
-    std::thread worker_;                // lazily started by the first enqueue
-    std::mutex q_mu_;                   // guards jobs_/done_/quit_/portray_gen_ vs the worker
-    std::condition_variable q_cv_;
-    std::deque<TileJob> jobs_;
-    std::vector<TileCpu> done_;
-    bool quit_ = false;
-    uint64_t portray_gen_ = 0; // bumped by clear_tiles(): queued work is for a dead cache
-    // Keys queued or portraying right now (GL thread only). A key is added at enqueue and
-    // removed ONLY when its result drains — every queued job posts exactly one result
-    // (even a stale one posts an empty TileCpu), so entries cannot leak.
-    std::unordered_set<uint64_t> inflight_;
+    // A whole view uploaded to GL: the three buffers, the per-range draw list, and
+    // one texture per area-fill pattern cell. Rebuilt only on a coverage miss.
+    struct Scene {
+        uint32_t vbo = 0;    // tile57_gpu_vertex[]  (triangles)
+        uint32_t ibo = 0;    // uint32 indices
+        uint32_t qbo = 0;    // tile57_gpu_quad[] * 6 per quad (sprites / SDF glyphs)
+        uint32_t quad_verts = 0; // total quad vertices in qbo (6 * quad_count)
+        std::vector<Range> ranges;
+        std::vector<uint32_t> pat_tex;             // GL texture per pattern cell
+        std::vector<std::pair<int, int>> pat_wh;   // each cell's device-px period (w,h)
+        bool ok = false;
+        // Coverage: the view this scene was portrayed for. A rebuild is needed once
+        // the live view pans/zooms out of the overscanned world box, or the zoom
+        // drifts past ZOOM_REBUILD (see render()).
+        double cx = 0, cy = 0;    // build view centre, world [0,1]
+        double build_zoom = 0;    // zoom the scene was portrayed at
+        double half_wx = 0, half_wy = 0; // overscanned world half-extents covered
+    };
+
+    // Build (portray + upload) a fresh scene for this view; frees any prior one.
+    void build_scene(double lon, double lat, double zoom, uint32_t w, uint32_t h,
+                     const tile57_mariner& m);
+    void free_scene();
+    // Does the cached scene still cover this view (within the overscan margin and
+    // zoom band)? False forces a rebuild.
+    bool scene_covers(double vwx, double vwy, double zoom) const;
+    // Walk the scene's ranges in paint order, drawing each with its pipeline. The
+    // per-frame transform (scale_px / origin / rot) and the live SCAMIN / category
+    // gates ride the uniforms; nothing here is rebuilt on a pan.
+    void draw_scene(double scale_px, const double origin[2], uint32_t vw, uint32_t vh, Rot rot,
+                    float cull_denom, uint32_t cat_mask, Pass pass);
+    void draw_range(const Range& r);         // flat triangles (area / line)
+    void draw_pat_range(const Range& r);     // pattern-tiled triangles
+    void draw_quad_range(const Range& r);    // sprite or SDF glyph quads
+    void composite_ss();                     // draw the resolved SS texture over OpenCPN's FBO
 
     tile57_chart* chart_ = nullptr;
-    uint32_t prog_ = 0; // solid Vtx program (area/symbol/text tile layers)
-    int u_scale_ = -1, u_origin_ = -1, u_vp_ = -1, u_denom_ = -1, u_rot_ = -1;
-    // Line program (LineVtx): same world transform, plus the LS() dash cut in the fragment.
-    uint32_t prog_line_ = 0;
-    int lu_scale_ = -1, lu_origin_ = -1, lu_vp_ = -1, lu_denom_ = -1, lu_rot_ = -1;
-    // Sprite (textured point symbols) program.
-    uint32_t prog_sprite_ = 0;
-    int su_scale_ = -1, su_origin_ = -1, su_vp_ = -1, su_denom_ = -1, su_atlas_ = -1, su_rot_ = -1;
-    // Pattern (tiled-texture area fills) program.
+    Scene scene_;
+    uint64_t scene_mhash_ = 0; // mariner hash the scene was portrayed at (rebuild on change)
+
+    // Shared GL programs (adopted from the process-wide g_prog in ensure_gl).
+    // Flat triangles (area + line): world transform, per-RANGE flat colour, SCAMIN
+    // + category gate.
+    uint32_t prog_ = 0;
+    int u_scale_ = -1, u_origin_ = -1, u_vp_ = -1, u_denom_ = -1, u_rot_ = -1, u_cat_ = -1,
+        u_color_ = -1;
+    // Pattern-tiled area fills (per-range cell texture, world-anchored tiling).
     uint32_t prog_pat_ = 0;
-    int pu_scale_ = -1, pu_origin_ = -1, pu_vp_ = -1, pu_denom_ = -1, pu_atlas_ = -1, pu_rot_ = -1;
-    // Glyph (SDF text) program.
+    int pu_scale_ = -1, pu_origin_ = -1, pu_vp_ = -1, pu_denom_ = -1, pu_rot_ = -1, pu_cat_ = -1,
+        pu_cell_ = -1, pu_period_ = -1, pu_worg_ = -1;
+    // Sprite (textured point symbols / soundings) — quads, atlas artwork.
+    uint32_t prog_sprite_ = 0;
+    int su_scale_ = -1, su_origin_ = -1, su_vp_ = -1, su_denom_ = -1, su_atlas_ = -1, su_rot_ = -1,
+        su_cat_ = -1;
+    // SDF text — quads, glyph atlas, per-vertex tint + embolden weight.
     uint32_t prog_glyph_ = 0;
-    int gu_scale_ = -1, gu_origin_ = -1, gu_vp_ = -1, gu_denom_ = -1, gu_atlas_ = -1, gu_rot_ = -1;
-    // Composite program + fullscreen quad: draw the resolved MSAA texture (a
-    // shared multisampled FBO, see chart_renderer.cpp) over OpenCPN's FBO. MSAA
-    // antialiases tessellated text/lines/area edges at ~1x fill cost.
+    int gu_scale_ = -1, gu_origin_ = -1, gu_vp_ = -1, gu_denom_ = -1, gu_atlas_ = -1, gu_rot_ = -1,
+        gu_cat_ = -1;
+    // Composite (draw the resolved supersample texture over OpenCPN's FBO).
     uint32_t prog_blit_ = 0, vbo_quad_ = 0;
     int bu_tex_ = -1;
     bool gl_ready_ = false;
@@ -342,40 +157,16 @@ class ChartRenderer {
     bool have_bounds_ = false;
     double b_w_ = 0, b_s_ = 0, b_e_ = 0, b_n_ = 0; // chart coverage bbox (deg)
 
-    // Previous render's view centre/zoom/rotation — motion detection (gates the AA
-    // supersample; a turn is motion just like a pan).
+    // Motion detection (gates the supersample AA: AA when settled, direct while moving).
     double last_lon_ = 1e9, last_lat_ = 1e9, last_zoom_r_ = 1e9, last_rot_ = 1e9;
+    bool host_stencil_mode_ = false; // host lacks FBOs -> direct render, no SS composite
 
-    // Tiled path state (the only render path).
-    std::unordered_map<uint64_t, TileGeom> tiles_; // (z,x,y) -> cached tile geometry
-    uint64_t tiles_mhash_ = 0;                     // mariner hash the cache was portrayed at
-    tile57_mariner tiles_m_{};                     // ...and the settings themselves (debug diff)
-    bool tiles_pending_ = false; // last render deferred some tiles (portray budget)
-    bool host_stencil_mode_ =
-        false; // host lacks FBOs (stencil-clips quilt) -> force direct render, no SS composite
-    int backdrop_z_ =
-        -1; // newest fully-cached zoom level, drawn under a still-loading zoom to avoid gray gaps
-    // Whole-view label buffers (one declutter grid → no per-tile seam drops).
-    uint32_t vbo_vtext_ = 0, vbo_vglyph_ = 0, n_vtext_ = 0, n_vglyph_ = 0;
-    // Label cache: the whole-view label portray (pmtiles decode + declutter + soundings)
-    // is the costliest per-frame item, so — like the geometry tiles — portray only on
-    // settle / view-change and reuse the buffers (drawn with a transformed origin) during
-    // a pan/zoom gesture. lbl_*_ is the view the cache was portrayed at; lbl_prev_*_ is the
-    // previous text frame (settle detection, kept separate from last_*_ which both passes
-    // stamp — so it would always read "still" in the text pass).
-    bool labels_valid_ = false;
-    bool labels_pending_ = false; // stale portray deferred until motion stops
-    double lbl_lon_ = 1e9, lbl_lat_ = 1e9, lbl_zoom_ = 1e9;
-    double lbl_prev_lon_ = 1e9, lbl_prev_lat_ = 1e9, lbl_prev_zoom_ = 1e9;
-    double lbl_ref_wx_ = 0, lbl_ref_wy_ = 0; // cache's world reference (draw origin)
-    // Rotation the label cache was portrayed at. Label POSITIONS are world anchors and
-    // their glyph quads stay upright, so a cached label draws correctly at ANY rotation —
-    // only the portray EXTENT (the rotated view's world AABB) and tile57's declutter grid
-    // were computed for this angle. So don't re-portray on every degree of a turn (the
-    // heading dithers constantly under course-up and this is the costliest per-frame item):
-    // re-portray only once the heading has moved past kLblRotSlack, the same slack the
-    // portray extent is widened by, so the angles we tolerate are the ones we covered.
-    double lbl_rot_ = 1e9, lbl_prev_rot_ = 1e9;
+    // Kept for set_super_scamin (see above); the live cull rides render()'s args.
+    double native_scale_ = 0.0;
+    bool super_scamin_ = true;
+
+    mutable std::mutex portray_mu_;     // chart_ : one user at a time (render vs object-query)
+    std::function<void()> on_progress_; // unused in the synchronous model; kept for the setter
 };
 
 } // namespace t57

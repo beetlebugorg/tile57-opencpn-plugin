@@ -1,98 +1,38 @@
 // chart_renderer.cpp — see chart_renderer.h.
+//
+// Consumes tile57's draw-ready GPU scene (tile57_chart_gpu_scene): the whole view,
+// pre-tessellated and in paint order. We upload the buffers ONCE per view and, on
+// pan/zoom/rotate, just re-transform them (uScale/uOrigin/uRot) and re-gate SCAMIN
+// + display category in the vertex shader — no re-portray. The scene overscans the
+// viewport and rebuilds only when the view leaves that coverage or the mariner
+// settings change (the lookout-core model).
 #include "chart_renderer.h"
-#include "earcut.hpp"
 #include "gl.h"
 #include <algorithm>
-#include <array>
 #include <cctype>
-#include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <unordered_map>
 #include <vector>
 #include <wx/image.h>
-#include <wx/log.h> // reliable capture in opencpn.log (stderr isn't captured here)
+#include <wx/log.h>
 #include <wx/mstream.h>
 
 namespace t57 {
 
 namespace {
 constexpr double kPi = 3.14159265358979323846;
-// A feature with no SCAMIN is never scale-culled: give it an effectively infinite one, so
-// the "display denominator > SCAMIN" test below can stay branchless.
-constexpr float kNeverCulled = 1e30f;
-// SUPER-SCAMIN (see ChartRenderer::feature_scamin): how far past its own compilation scale a
-// cell's SCAMIN-LESS detail may still draw. OpenCPN uses 2x (s52plib.cpp: SuperScamin =
-// chart_ref_scale * 2), so a 1:12,000 cell's ungated symbology dies at 1:24,000.
-constexpr double kSuperScaminUnderzoom = 2.0;
+// Overscan the built view so panning within the margin re-uses the scene, and the
+// zoom drift that forces a fresh build (2^0.3 < 1.25, so a rebuild lands before the
+// margin is exhausted). Mirrors lookout-core/src/gpu.zig (OVERSCAN / ZOOM_REBUILD).
+constexpr double kOverscan = 1.25;
+constexpr double kZoomRebuild = 0.3;
 
 void lonlat_to_world(double lon, double lat, double& wx, double& wy) {
     wx = (lon + 180.0) / 360.0;
     double s = std::sin(lat * kPi / 180.0);
     wy = 0.5 - std::log((1.0 + s) / (1.0 - s)) / (4.0 * kPi);
-}
-// SCAMIN travels to the GPU AS ITSELF — the raw 1:N denominator — and is compared against
-// the host's actual display denominator (see render's scamin_denom / the uScaminDenom
-// uniform). That is exactly what native OpenCPN does:
-//
-//     if (vp_plib.chart_scale > rzRules->obj->Scamin) b_visible = false;   // s52plib.cpp
-//
-// This used to convert SCAMIN into a web-mercator zoom threshold, log2(DENOM_Z0 / scamin),
-// and compare zooms. That is MapLibre's convention and it bakes in the EQUATOR: the scale
-// denominator at a given zoom shrinks with cos(latitude), so the formula drifted from the
-// real display scale by log2(cos lat) — ~0.36 of a zoom level at latitude 39, i.e. features
-// popping in and out ~28% of a scale step away from where the native charts do it.
-// The host knows its own scale exactly; there is nothing to model.
-float scamin_denom(int64_t scamin) { return scamin > 0 ? (float)scamin : kNeverCulled; }
-// TILE57_DEBUG: name the mariner fields that CHANGED — a cache clear costs a full re-portray
-// of every visible tile, so a hash that flaps every frame is a performance cliff, and the
-// hash alone ("a -> b") cannot say which setting moved. Compares the portrayal-relevant
-// fields by name; anything not listed here cannot invalidate the cache anyway.
-std::string mariner_diff(const tile57_mariner& a, const tile57_mariner& b) {
-    std::string d;
-    auto num = [&d](const char* n, double x, double y) {
-        if (x != y)
-            d += std::string(d.empty() ? "" : " ") + n + "=" + std::to_string(x) + "->" +
-                 std::to_string(y);
-    };
-    auto flag = [&d](const char* n, bool x, bool y) {
-        if (x != y)
-            d += std::string(d.empty() ? "" : " ") + n + "=" + (x ? "1" : "0") + "->" +
-                 (y ? "1" : "0");
-    };
-    num("safety_contour", a.safety_contour, b.safety_contour);
-    num("shallow_contour", a.shallow_contour, b.shallow_contour);
-    num("deep_contour", a.deep_contour, b.deep_contour);
-    num("safety_depth", a.safety_depth, b.safety_depth);
-    num("size_scale", a.size_scale, b.size_scale);
-    num("text_size_scale", a.text_size_scale, b.text_size_scale);
-    num("sounding_size_scale", a.sounding_size_scale, b.sounding_size_scale);
-    flag("four_shade_water", a.four_shade_water, b.four_shade_water);
-    flag("display_base", a.display_base, b.display_base);
-    flag("display_standard", a.display_standard, b.display_standard);
-    flag("display_other", a.display_other, b.display_other);
-    flag("data_quality", a.data_quality, b.data_quality);
-    flag("show_inform_callouts", a.show_inform_callouts, b.show_inform_callouts);
-    flag("show_meta_bounds", a.show_meta_bounds, b.show_meta_bounds);
-    flag("simplified_points", a.simplified_points, b.simplified_points);
-    flag("show_full_sector_lines", a.show_full_sector_lines, b.show_full_sector_lines);
-    flag("text_names", a.text_names, b.text_names);
-    flag("text_other", a.text_other, b.text_other);
-    flag("show_light_descriptions", a.show_light_descriptions, b.show_light_descriptions);
-    flag("ignore_scamin", a.ignore_scamin, b.ignore_scamin);
-    flag("show_overscale", a.show_overscale, b.show_overscale);
-    flag("date_dependent", a.date_dependent, b.date_dependent);
-    if (a.viewing_groups_off_len != b.viewing_groups_off_len)
-        d += " viewing_groups_len=" + std::to_string(a.viewing_groups_off_len) + "->" +
-             std::to_string(b.viewing_groups_off_len);
-    if (a.viewing_groups_off != b.viewing_groups_off)
-        d += " viewing_groups_PTR(moved)"; // the vector reallocated: hashed, but not a change
-    if (d.empty())
-        d = "(no named field changed — PADDING or an unlisted field)";
-    return d;
 }
 
 uint64_t mariner_hash(const tile57_mariner& m) {
@@ -105,1077 +45,186 @@ uint64_t mariner_hash(const tile57_mariner& m) {
         }
     };
     mix(&m, sizeof(m));
-    // viewing_groups_off is a POINTER in the struct, so the bytes above hash the address,
-    // not the groups. Hash what it points AT as well — otherwise swapping one denied
-    // group for another (same buffer, same length) leaves the hash unchanged and the tile
-    // cache would keep serving geometry portrayed under the old settings.
+    // viewing_groups_off is a POINTER; hash what it points at too (swapping one denied
+    // group for another, same buffer/length, must still invalidate the scene).
     if (m.viewing_groups_off && m.viewing_groups_off_len)
         mix(m.viewing_groups_off, m.viewing_groups_off_len * sizeof(int32_t));
     return h;
 }
-} // namespace
 
-// ---- tessellation ----------------------------------------------------------
-// World area fill: earcut the rings (outer + holes) directly in world space.
-// Rings are decimated to the portrayal's pixel grid first — dropping sub-half-
-// pixel detail cuts the triangle count hugely on dense coastlines/depth areas
-// (the per-frame draw cost, hence the zoom framerate) with no visible change.
-// ---- shared ring tessellation (fillArea / fillPattern hot path) ------------
-// Decimate a tile57_world_rings into ONE flat point buffer and earcut it with a
-// PERSISTENT tessellator. The old shape -- mapbox::earcut<>(poly) over a fresh
-// nested vector<vector<Pt>> plus a second full `flat` copy -- rebuilt and tore
-// down the whole tessellator (node pool, index vector) and reallocated every
-// ring, per FEATURE; fillArea was the single hottest portray item in
-// Instruments. All portray runs on the GL thread, so file-scope scratch is
-// safe, and Earcut::operator() resets its own state (indices.clear(),
-// earcut.hpp:247) -- instance reuse is the intended pattern; only the free
-// function wrapper is single-shot. The returned indices point into `pts`,
-// which is laid out ring-after-ring exactly as earcut numbers its vertices.
-namespace {
-using FillPt = std::array<double, 2>;
-struct FillRingView {
-    using value_type = FillPt; // earcut.hpp derives its Point type from this
-    const FillPt* p;
-    std::size_t n;
-    std::size_t size() const { return n; }
-    bool empty() const { return n == 0; }
-    const FillPt& operator[](std::size_t i) const { return p[i]; }
-};
-struct FillPolyView {
-    using value_type = FillRingView;
-    const FillRingView* r;
-    std::size_t n;
-    std::size_t size() const { return n; }
-    bool empty() const { return n == 0; }
-    const FillRingView& operator[](std::size_t i) const { return r[i]; }
-};
-struct FillTess {
-    const std::vector<uint32_t>* idx; // triangle indices into *pts (null: nothing to fill)
-    const std::vector<FillPt>* pts;
-};
-FillTess tessellate_rings(const tile57_world_rings* p, double eps2) {
-    // thread_local, not static: tile portray runs on the worker thread while the
-    // GL thread can portray labels (and its pattern fallback fills) concurrently.
-    thread_local std::vector<FillPt> flat;                          // decimated points
-    thread_local std::vector<std::pair<uint32_t, uint32_t>> ranges; // (start,count)/ring
-    thread_local std::vector<FillRingView> views;
-    thread_local mapbox::detail::Earcut<uint32_t> earcut;
-    flat.clear();
-    ranges.clear();
-    for (uint32_t r = 0; r < p->ring_count; ++r) {
-        uint32_t s = p->ring_starts[r];
-        uint32_t e = (r + 1 < p->ring_count) ? p->ring_starts[r + 1] : p->n;
-        if (e <= s + 2)
-            continue;
-        const uint32_t start = (uint32_t)flat.size();
-        flat.push_back({p->pts[s].x, p->pts[s].y});
-        for (uint32_t i = s + 1; i < e; ++i) {
-            double dx = p->pts[i].x - flat.back()[0], dy = p->pts[i].y - flat.back()[1];
-            if (i == e - 1 || dx * dx + dy * dy >= eps2)
-                flat.push_back({p->pts[i].x, p->pts[i].y});
-        }
-        const uint32_t count = (uint32_t)flat.size() - start;
-        if (count >= 3)
-            ranges.push_back({start, count});
-        else
-            flat.resize(start); // degenerate after decimation: drop it (same gate as before)
-    }
-    if (ranges.empty())
-        return {nullptr, nullptr};
-    // Build the views only after `flat` stops growing: push_back reallocation
-    // would invalidate the pointers they hold.
-    views.clear();
-    for (auto [s, n] : ranges)
-        views.push_back({flat.data() + s, (std::size_t)n});
-    earcut(FillPolyView{views.data(), views.size()});
-    return {&earcut.indices, &flat};
-}
-} // namespace
-
-void ChartRenderer::on_fill_area(const tile57_world_rings* p, tile57_rgba c, float scamin) {
-    if (!p || p->n < 3)
-        return;
-    FillTess t = tessellate_rings(p, decimate_eps_ * decimate_eps_);
-    if (!t.idx)
-        return;
-    const auto& idx = *t.idx;
-    const auto& flat = *t.pts;
-    for (size_t i = 0; i + 2 < idx.size(); i += 3)
-        for (int k = 0; k < 3; ++k) {
-            double wx = flat[idx[i + k]][0] - ref_wx_, wy = flat[idx[i + k]][1] - ref_wy_;
-            area_.push_back({(float)wx, (float)wy, 0, 0, c.r, c.g, c.b, c.a, scamin, 0.0f});
-        }
-}
-
-// World line: expand each segment to a screen-px-wide quad — aWorld is the
-// endpoint (world), aPost carries the perpendicular * half-width in px, applied
-// AFTER the world transform so the line is a constant screen width at any zoom.
-//
-// The S-52 LS() dash (dash_on/dash_off px, (0,0) = solid) is cut in the fragment shader from
-// `dist`: each vertex's arc length from the start of its polyline. Two things make that come
-// out at the right SPACING, and both are easy to get wrong:
-//
-//  * `acc` runs CONTINUOUSLY along the whole polyline. Restart the arc length at every
-//    segment and each segment begins at phase 0 — i.e. "on" — and since an ENC's contours and
-//    coastlines are chains of segments mostly SHORTER than one dash period, essentially every
-//    segment would paint its opening dash and nothing else. The line comes out solid, which is
-//    exactly what a per-segment phase looks like: not a wrong dash, but no dash at all.
-//  * `dist` is banked in WORLD units, not px. The shader scales it by uScale, so a dash is a
-//    fixed length ON SCREEN however far in you zoom — and a cached tile drawn at a zoom it was
-//    not portrayed at (the coarse backdrop layer under a still-loading zoom does precisely
-//    this) still dashes correctly, instead of at the phase of some other zoom.
-
-// TILE57_DASH=<k>: multiply the dash run lengths tile57 sends by k, without a rebuild — the
-// same live-calibration trick as TILE57_SIZE. The engine derives the pattern from the line
-// WIDTH (MapLibre line-dasharray semantics: [4,3] in line-width units, so 4*w on / 3*w off),
-// which is a guess at the S-52 intent rather than a measured quantity. If the dash reads too
-// tight or too loose against native OpenCPN, dial k until it matches and we bake that in.
-static float dash_cal_factor() {
-    static float f = [] {
-        const char* e = std::getenv("TILE57_DASH");
-        double v = e ? std::atof(e) : 1.0;
-        return (float)((v > 0.05 && v < 20.0) ? v : 1.0);
-    }();
-    return f;
-}
-
-void ChartRenderer::on_stroke_line(const tile57_world_rings* p, float width_px, float dash_on,
-                                   float dash_off, tile57_rgba c, float scamin) {
-    if (!p || p->n < 2)
-        return;
-    float hw = std::max(0.5f, width_px * 0.5f);
-    dash_on *= dash_cal_factor();
-    dash_off *= dash_cal_factor();
-    // TILE57_DEBUG: the ACTUAL numbers behind a dashed line, once per distinct pattern. The
-    // dash is cut in px (dash_on/off) against an arc length scaled by uScale, and those two
-    // must be the same px — so if the spacing is off, this line and the uScale/device_scale
-    // line in render() are what to compare. period_px is one full on+off cycle on screen.
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg && dash_on > 0.0f) {
-        static std::vector<std::array<float, 3>> seen;
-        std::array<float, 3> key{width_px, dash_on, dash_off};
-        if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
-            seen.push_back(key);
-            wxLogMessage("tile57 DASH: width=%.2fpx on=%.2fpx off=%.2fpx period=%.2fpx "
-                         "(size_scale=%.3f, TILE57_DASH=%.2f)",
-                         width_px, dash_on, dash_off, dash_on + dash_off, size_scale_,
-                         dash_cal_factor());
-        }
-    }
-    // A sub-pixel dash cannot be resolved — it aliases into a grey smear that reads as a
-    // washed-out solid line. Draw it as the solid line it is trying to be.
-    if (dash_on < 1.0f || dash_off < 1.0f)
-        dash_on = dash_off = 0.0f;
-    const double eps2 = decimate_eps_ * decimate_eps_;
-    for (uint32_t r = 0; r < p->ring_count; ++r) {
-        uint32_t s = p->ring_starts[r];
-        uint32_t e = (r + 1 < p->ring_count) ? p->ring_starts[r + 1] : p->n;
-        // Decimate to the pixel grid before expanding (see on_fill_area).
-        std::vector<std::array<double, 2>> kept{{p->pts[s].x, p->pts[s].y}};
-        for (uint32_t i = s + 1; i < e; ++i) {
-            double dx = p->pts[i].x - kept.back()[0], dy = p->pts[i].y - kept.back()[1];
-            if (i == e - 1 || dx * dx + dy * dy >= eps2)
-                kept.push_back({p->pts[i].x, p->pts[i].y});
-        }
-        double acc = 0.0; // arc length so far along THIS ring — the dash's phase
-        for (size_t i = 0; i + 1 < kept.size(); ++i) {
-            double ax = kept[i][0] - ref_wx_, ay = kept[i][1] - ref_wy_;
-            double bx = kept[i + 1][0] - ref_wx_, by = kept[i + 1][1] - ref_wy_;
-            double dx = bx - ax, dy = by - ay, len = std::sqrt(dx * dx + dy * dy);
-            if (len < 1e-12)
-                continue;
-            float nx = (float)(-dy / len) * hw, ny = (float)(dx / len) * hw; // px offset
-            const float d0 = (float)acc, d1 = (float)(acc + len);
-            auto v = [&](double wx, double wy, float ox, float oy, float d) {
-                line_.push_back({(float)wx, (float)wy, ox, oy, c.r, c.g, c.b, c.a, scamin, d,
-                                 dash_on, dash_off});
-            };
-            v(ax, ay, nx, ny, d0);
-            v(bx, by, nx, ny, d1);
-            v(bx, by, -nx, -ny, d1);
-            v(ax, ay, nx, ny, d0);
-            v(bx, by, -nx, -ny, d1);
-            v(ax, ay, -nx, -ny, d0);
-            acc += len;
-        }
-    }
-}
-
-// Anchored fill (symbol / text): tessellate the local (px) rings with an
-// even-odd rule (group rings by containment parity so counters cut out and no
-// triangles bridge between letters), anchored at one world point via aWorld.
-static void tess_local_even_odd(const tile57_local_rings* p, double awx, double awy, tile57_rgba c,
-                                float scamin, float postrot, std::vector<ChartRenderer::Vtx>& out) {
-    if (!p || p->n < 3)
-        return;
-    using Pt = std::array<float, 2>;
-    std::vector<std::vector<Pt>> rings;
-    for (uint32_t r = 0; r < p->ring_count; ++r) {
-        uint32_t s = p->ring_starts[r];
-        uint32_t e = (r + 1 < p->ring_count) ? p->ring_starts[r + 1] : p->n;
-        if (e <= s + 2)
-            continue;
-        std::vector<Pt> ring;
-        for (uint32_t i = s; i < e; ++i)
-            ring.push_back({p->pts[i].x, p->pts[i].y});
-        rings.push_back(std::move(ring));
-    }
-    const size_t n = rings.size();
-    if (n == 0)
-        return;
-    auto in_ring = [](float x, float y, const std::vector<Pt>& ring) {
-        bool in = false;
-        for (size_t i = 0, j = ring.size() - 1; i < ring.size(); j = i++)
-            if (((ring[i][1] > y) != (ring[j][1] > y)) &&
-                (x < (ring[j][0] - ring[i][0]) * (y - ring[i][1]) / (ring[j][1] - ring[i][1]) +
-                         ring[i][0]))
-                in = !in;
-        return in;
-    };
-    std::vector<double> area(n, 0.0);
-    std::vector<int> depth(n, 0), parent(n, -1);
-    for (size_t i = 0; i < n; ++i) {
-        double a = 0;
-        for (size_t k = 0, j = rings[i].size() - 1; k < rings[i].size(); j = k++)
-            a += (double)rings[i][j][0] * rings[i][k][1] - (double)rings[i][k][0] * rings[i][j][1];
-        area[i] = std::fabs(a) * 0.5;
-    }
-    for (size_t i = 0; i < n; ++i)
-        for (size_t j = 0; j < n; ++j) {
-            if (i == j)
-                continue;
-            if (in_ring(rings[i][0][0], rings[i][0][1], rings[j])) {
-                ++depth[i];
-                if (parent[i] < 0 || area[j] < area[parent[i]])
-                    parent[i] = (int)j;
-            }
-        }
-    for (size_t i = 0; i < n; ++i) {
-        if (depth[i] % 2)
-            continue;
-        std::vector<std::vector<Pt>> poly;
-        std::vector<Pt> flat;
-        poly.push_back(rings[i]);
-        flat.insert(flat.end(), rings[i].begin(), rings[i].end());
-        for (size_t j = 0; j < n; ++j) {
-            if (parent[j] != (int)i || depth[j] % 2 == 0)
-                continue;
-            poly.push_back(rings[j]);
-            flat.insert(flat.end(), rings[j].begin(), rings[j].end());
-        }
-        std::vector<uint32_t> idx = mapbox::earcut<uint32_t>(poly);
-        for (size_t t = 0; t + 2 < idx.size(); t += 3)
-            for (int k = 0; k < 3; ++k)
-                out.push_back({(float)awx, (float)awy, flat[idx[t + k]][0], flat[idx[t + k]][1],
-                               c.r, c.g, c.b, c.a, scamin});
-    }
-}
-
-void ChartRenderer::on_draw_symbol(tile57_world_point anchor, const tile57_local_rings* p,
-                                   tile57_rgba c, int even_odd, float stroke_w,
-                                   tile57_rot_align align, float scamin) {
-    (void)even_odd;
-    double awx = anchor.x - ref_wx_, awy = anchor.y - ref_wy_;
-    // The outline arrives already turned to the symbol's own angle; MAP means that angle is
-    // chart-relative, so it must ALSO turn with the view (an ORIENT'd light, a linestyle brick).
-    const float postrot = (align == TILE57_ALIGN_MAP) ? 1.0f : 0.0f;
-    if (stroke_w > 0) {
-        // Symbol stroke: expand local polylines to px quads (aPost in local px).
-        float hw = std::max(0.5f, stroke_w * 0.5f);
-        for (uint32_t r = 0; r < p->ring_count; ++r) {
-            uint32_t s = p->ring_starts[r];
-            uint32_t e = (r + 1 < p->ring_count) ? p->ring_starts[r + 1] : p->n;
-            for (uint32_t i = s; i + 1 < e; ++i) {
-                float ax = p->pts[i].x, ay = p->pts[i].y, bx = p->pts[i + 1].x,
-                      by = p->pts[i + 1].y;
-                float dx = bx - ax, dy = by - ay, len = std::sqrt(dx * dx + dy * dy);
-                if (len < 1e-4f)
-                    continue;
-                float nx = -dy / len * hw, ny = dx / len * hw;
-                auto v = [&](float ox, float oy) {
-                    symbol_.push_back(
-                        {(float)awx, (float)awy, ox, oy, c.r, c.g, c.b, c.a, scamin, postrot});
-                };
-                v(ax + nx, ay + ny);
-                v(bx + nx, by + ny);
-                v(bx - nx, by - ny);
-                v(ax + nx, ay + ny);
-                v(bx - nx, by - ny);
-                v(ax - nx, ay - ny);
-            }
-        }
-    } else {
-        tess_local_even_odd(p, awx, awy, c, scamin, postrot, symbol_);
-    }
-}
-
-void ChartRenderer::on_draw_text(tile57_world_point anchor, const tile57_local_rings* g,
-                                 tile57_rgba c, tile57_rgba /*halo*/, tile57_rot_align align,
-                                 float scamin) {
-    tess_local_even_odd(g, anchor.x - ref_wx_, anchor.y - ref_wy_, c, scamin,
-                        (align == TILE57_ALIGN_MAP) ? 1.0f : 0.0f, text_);
-}
-
-// ---- sprite atlas (shared; loaded once in a GL context) --------------------
-namespace {
-// Normalised UV rect + the cell's logical px size (atlas px / pixelRatio), used
-// as the pattern tile's screen size (× size_scale).
-struct AtlasRect {
-    float u0, v0, u1, v1, px_w, px_h;
-};
-struct SpriteAtlas {
+// ---- shared atlas textures (baked once per process, in a live GL context) --------
+// The GPU scene's quad UVs are baked against exactly these atlases, so all we need
+// from them is the texture — no JSON metrics (tile57 already placed every glyph).
+struct AtlasTex {
     uint32_t tex = 0;
-    std::unordered_map<std::string, AtlasRect> uv; // name -> rect
     bool tried = false, ok = false;
 };
-SpriteAtlas g_atlas;
+AtlasTex g_sprite, g_glyph;
 
-double json_num(const char* s, size_t lo, size_t hi, const char* key) {
-    std::string k = std::string("\"") + key + "\"";
-    for (size_t p = lo; p + k.size() < hi; ++p)
-        if (std::memcmp(s + p, k.data(), k.size()) == 0) {
-            size_t q = p + k.size();
-            while (q < hi && (s[q] == ' ' || s[q] == ':'))
-                ++q;
-            return std::atof(s + q);
-        }
-    return 0;
-}
-
-// Parse a MapLibre sprite JSON ({"name":{"x":,"y":,"width":,"height":},..}) into
-// name -> normalised UV rect. The pivot-centred entry is the bare name.
-void parse_sprite_json(const char* s, size_t len, int tw, int th,
-                       std::unordered_map<std::string, AtlasRect>& out) {
-    if (tw <= 0 || th <= 0 || !s)
-        return;
-    size_t i = 0;
-    auto ws = [&] {
-        while (i < len && (s[i] == ' ' || s[i] == '\n' || s[i] == '\t' || s[i] == '\r'))
-            ++i;
-    };
-    ws();
-    if (i >= len || s[i] != '{')
-        return;
-    ++i;
-    while (i < len) {
-        ws();
-        if (i < len && s[i] == '}')
-            break;
-        if (i >= len || s[i] != '"')
-            break;
-        ++i;
-        size_t ns = i;
-        while (i < len && s[i] != '"')
-            ++i;
-        std::string name(s + ns, i - ns);
-        if (i < len)
-            ++i;
-        ws();
-        if (i < len && s[i] == ':')
-            ++i;
-        ws();
-        if (i >= len || s[i] != '{')
-            break;
-        int depth = 0;
-        size_t os = i;
-        while (i < len) {
-            char ch = s[i];
-            if (ch == '{')
-                ++depth;
-            else if (ch == '}') {
-                if (--depth == 0) {
-                    ++i;
-                    break;
-                }
-            }
-            ++i;
-        }
-        double x = json_num(s, os, i, "x"), y = json_num(s, os, i, "y");
-        double w = json_num(s, os, i, "width"), h = json_num(s, os, i, "height");
-        double ratio = json_num(s, os, i, "pixelRatio");
-        if (ratio <= 0)
-            ratio = 1;
-        if (w > 0 && h > 0)
-            out[name] = {(float)(x / tw),       (float)(y / th),    (float)((x + w) / tw),
-                         (float)((y + h) / th), (float)(w / ratio), (float)(h / ratio)};
-        ws();
-        if (i < len && s[i] == ',')
-            ++i;
+uint32_t upload_png_rgba(const uint8_t* png, size_t len) {
+    if (!png || !len)
+        return 0;
+    wxMemoryInputStream mis(png, len);
+    wxImage img;
+    if (!img.LoadFile(mis, wxBITMAP_TYPE_PNG))
+        return 0;
+    int tw = img.GetWidth(), th = img.GetHeight();
+    std::vector<uint8_t> rgba((size_t)tw * th * 4);
+    const uint8_t* rgb = img.GetData();
+    const uint8_t* al = img.HasAlpha() ? img.GetAlpha() : nullptr;
+    for (int p = 0; p < tw * th; ++p) {
+        rgba[p * 4 + 0] = rgb[p * 3 + 0];
+        rgba[p * 4 + 1] = rgb[p * 3 + 1];
+        rgba[p * 4 + 2] = rgb[p * 3 + 2];
+        rgba[p * 4 + 3] = al ? al[p] : 255;
     }
+    uint32_t tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return tex;
 }
 
 void load_sprite_atlas() {
-    if (g_atlas.tried)
+    if (g_sprite.tried)
         return;
-    g_atlas.tried = true;
-    tile57_assets assets{};
-    // sprite-mln: pivot-centred cells + {name:{x,y,w,h}} JSON. NULL => embedded.
-    if (tile57_bake_sprite_mln(nullptr, &assets, nullptr) != TILE57_OK)
-        return;
-    if (assets.sprite_png && assets.sprite_png_len) {
-        wxMemoryInputStream mis(assets.sprite_png, assets.sprite_png_len);
-        wxImage img;
-        if (img.LoadFile(mis, wxBITMAP_TYPE_PNG)) {
-            int tw = img.GetWidth(), th = img.GetHeight();
-            std::vector<uint8_t> rgba((size_t)tw * th * 4);
-            const uint8_t* rgb = img.GetData();
-            const uint8_t* al = img.HasAlpha() ? img.GetAlpha() : nullptr;
-            for (int p = 0; p < tw * th; ++p) {
-                rgba[p * 4 + 0] = rgb[p * 3 + 0];
-                rgba[p * 4 + 1] = rgb[p * 3 + 1];
-                rgba[p * 4 + 2] = rgb[p * 3 + 2];
-                rgba[p * 4 + 3] = al ? al[p] : 255;
-            }
-            glGenTextures(1, &g_atlas.tex);
-            glBindTexture(GL_TEXTURE_2D, g_atlas.tex);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                         rgba.data());
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            glBindTexture(GL_TEXTURE_2D, 0);
-            parse_sprite_json((const char*)assets.sprite_json, assets.sprite_json_len, tw, th,
-                              g_atlas.uv);
-            g_atlas.ok = g_atlas.tex != 0 && !g_atlas.uv.empty();
-        }
+    g_sprite.tried = true;
+    tile57_assets a{};
+    if (tile57_bake_sprite_mln(nullptr, &a, nullptr) == TILE57_OK) {
+        g_sprite.tex = upload_png_rgba(a.sprite_png, a.sprite_png_len);
+        g_sprite.ok = g_sprite.tex != 0;
     }
-    tile57_assets_free(&assets);
+    tile57_assets_free(&a);
 }
-
-// ---- SDF glyph atlas (shared; loaded once in a GL context) -----------------
-struct GlyphInfo {
-    float u0, v0, u1, v1, ox, oy, w, h, adv;
-}; // UV + EM-space quad
-struct GlyphAtlas {
-    uint32_t tex = 0;
-    std::unordered_map<uint32_t, GlyphInfo> g; // codepoint -> metrics
-    bool tried = false, ok = false;
-};
-GlyphAtlas g_glyph;
-
-// Parse {"em_px":..,"pad":..,"glyphs":{"cp":[u0,v0,u1,v1,ox,oy,w,h,adv],..}}.
-void parse_glyph_json(const char* s, size_t len, std::unordered_map<uint32_t, GlyphInfo>& out) {
-    if (!s || len < 8)
-        return;
-    size_t i = 0;
-    for (; i + 8 < len; ++i)
-        if (std::memcmp(s + i, "\"glyphs\"", 8) == 0)
-            break;
-    i += 8;
-    while (i < len && s[i] != '{')
-        ++i;
-    if (i >= len)
-        return;
-    ++i;
-    auto ws = [&] {
-        while (i < len &&
-               (s[i] == ' ' || s[i] == '\n' || s[i] == '\t' || s[i] == '\r' || s[i] == ','))
-            ++i;
-    };
-    while (i < len) {
-        ws();
-        if (i < len && s[i] == '}')
-            break;
-        if (i >= len || s[i] != '"')
-            break;
-        ++i;
-        uint32_t cp = (uint32_t)std::atoi(s + i);
-        while (i < len && s[i] != '"')
-            ++i;
-        if (i < len)
-            ++i;
-        ws();
-        if (i < len && s[i] == ':')
-            ++i;
-        ws();
-        if (i >= len || s[i] != '[')
-            break;
-        ++i;
-        float v[9] = {0};
-        for (int k = 0; k < 9; ++k) {
-            ws();
-            v[k] = (float)std::atof(s + i);
-            while (i < len && s[i] != ',' && s[i] != ']')
-                ++i;
-            if (i < len && s[i] == ',')
-                ++i;
-        }
-        while (i < len && s[i] != ']')
-            ++i;
-        if (i < len)
-            ++i;
-        out[cp] = {v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]};
-    }
-}
-
 void load_glyph_atlas() {
     if (g_glyph.tried)
         return;
     g_glyph.tried = true;
     tile57_assets a{};
-    if (tile57_bake_glyph_sdf(&a, nullptr) != TILE57_OK)
-        return;
-    if (a.sprite_png && a.sprite_png_len) {
-        wxMemoryInputStream mis(a.sprite_png, a.sprite_png_len);
-        wxImage img;
-        if (img.LoadFile(mis, wxBITMAP_TYPE_PNG)) {
-            int tw = img.GetWidth(), th = img.GetHeight();
-            std::vector<uint8_t> rgba((size_t)tw * th * 4);
-            const uint8_t* rgb = img.GetData();
-            const uint8_t* al = img.HasAlpha() ? img.GetAlpha() : nullptr;
-            for (int p = 0; p < tw * th; ++p) {
-                rgba[p * 4 + 0] = rgb[p * 3 + 0];
-                rgba[p * 4 + 1] = rgb[p * 3 + 1];
-                rgba[p * 4 + 2] = rgb[p * 3 + 2];
-                rgba[p * 4 + 3] = al ? al[p] : 255;
-            }
-            glGenTextures(1, &g_glyph.tex);
-            glBindTexture(GL_TEXTURE_2D, g_glyph.tex);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                         rgba.data());
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            glBindTexture(GL_TEXTURE_2D, 0);
-            parse_glyph_json((const char*)a.sprite_json, a.sprite_json_len, g_glyph.g);
-            g_glyph.ok = g_glyph.tex != 0 && !g_glyph.g.empty();
-        }
+    if (tile57_bake_glyph_sdf(&a, nullptr) == TILE57_OK) {
+        g_glyph.tex = upload_png_rgba(a.sprite_png, a.sprite_png_len);
+        g_glyph.ok = g_glyph.tex != 0;
     }
     tile57_assets_free(&a);
 }
 
-// Minimal UTF-8 decode (advances i); covers the atlas's ASCII + Latin-1 range.
-uint32_t decode_utf8(const char* s, size_t len, size_t& i) {
-    unsigned char c = (unsigned char)s[i++];
-    if (c < 0x80)
-        return c;
-    int n;
-    uint32_t cp;
-    if ((c & 0xE0) == 0xC0) {
-        n = 1;
-        cp = c & 0x1F;
-    } else if ((c & 0xF0) == 0xE0) {
-        n = 2;
-        cp = c & 0x0F;
-    } else if ((c & 0xF8) == 0xF0) {
-        n = 3;
-        cp = c & 0x07;
-    } else
-        return c;
-    for (int k = 0; k < n && i < len; ++k)
-        cp = (cp << 6) | ((unsigned char)s[i++] & 0x3F);
-    return cp;
-}
-} // namespace
+// ---- shaders (GLSL 1.20 — no integer/bitwise ops) --------------------------------
+// One transform, shared by every program: screen_px = R*(aWorld*uScale) + uOrigin +
+// post, with aWorld camera-relative to the scene's build centre (uOrigin folds in the
+// live pan). aPost is the tile57_gpu_vertex/quad screen-px offset (line half-width,
+// glyph/sprite corner); MAP-aligned marks (aMapAlign=1) rotate their post with the
+// chart, viewport-aligned ones stay upright. The SCAMIN + display-category gate mirror
+// lookout's chart.vert: base category (aDispCat 0) is never SCAMIN-culled; uCat is
+// per-category visibility (base, standard, other) as 0/1.
+#define T57_XFORM_UNIFORMS                                                                          \
+    "uniform float uScale; uniform vec2 uOrigin; uniform vec2 uVp; uniform float uScaminDenom;"     \
+    "uniform vec2 uRot; uniform vec3 uCat;\n"                                                       \
+    "vec2 t57rot(vec2 p){ return vec2(p.x*uRot.x - p.y*uRot.y, p.x*uRot.y + p.y*uRot.x); }\n"       \
+    "bool t57cull(float dispCat, float scamin){\n"                                                  \
+    "  float catv = dispCat < 0.5 ? uCat.x : (dispCat < 1.5 ? uCat.y : uCat.z);\n"                  \
+    "  return (catv < 0.5) || (scamin > 0.0 && dispCat > 0.5 && uScaminDenom > scamin);\n"          \
+    "}\n"
 
-// Point symbol as a textured quad from the atlas: quad of ±half centred on the
-// anchor, rotated, mapped to the symbol's atlas cell (AA'd by texture filtering).
-void ChartRenderer::on_draw_sprite(const char* name, size_t len, tile57_world_point anchor,
-                                   float rot_deg, tile57_rot_align align, float hw, float hh,
-                                   float scamin) {
-    if (!g_atlas.ok || hw <= 0 || hh <= 0)
-        return;
-    auto it = g_atlas.uv.find(std::string(name, len));
-    if (it == g_atlas.uv.end())
-        return;
-    const AtlasRect& r = it->second;
-    // TILE57_DEBUG: measure a complex linestyle's BRICK SPACING against its BRICK SIZE.
-    // The engine bakes the spacing into tile-local geometry (linestyle.drawComplexRun walks
-    // arc length in tile units), so it only lands at the intended screen spacing when the
-    // tile is drawn at its NATIVE zoom — but the brick's size (hw/hh) is constant SCREEN px.
-    // gap_px is the spacing the engine asked for, at the tile's own zoom; drawn_gap_px is
-    // what it becomes on screen at the CURRENT view zoom. If drawn_gap_px is at or below
-    // 2*hw the bricks touch or overlap — that is "too close together", measured.
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg && align == TILE57_ALIGN_MAP && portray_px_per_world_ > 0) {
-        std::string nm(name, len);
-        if (nm == dbg_sprite_name_) {
-            const double dx = anchor.x - dbg_sprite_ax_, dy = anchor.y - dbg_sprite_ay_;
-            const double gap = std::sqrt(dx * dx + dy * dy) * portray_px_per_world_;
-            static std::vector<std::string> seen;
-            if (gap > 1e-6 && std::find(seen.begin(), seen.end(), nm) == seen.end()) {
-                seen.push_back(nm);
-                wxLogMessage("tile57 BRICK: %s gap=%.1fpx size=%.1fx%.1fpx (2*hw=%.1f) -> %s "
-                             "[size_scale=%.3f, spacing baked at the tile's zoom]",
-                             nm.c_str(), gap, hw * 2, hh * 2, hw * 2,
-                             gap <= hw * 2 ? "OVERLAPPING" : "clear", size_scale_);
-            }
-        }
-        dbg_sprite_name_ = nm;
-        dbg_sprite_ax_ = anchor.x;
-        dbg_sprite_ay_ = anchor.y;
-    }
-    float awx = (float)(anchor.x - ref_wx_), awy = (float)(anchor.y - ref_wy_);
-    float rad = rot_deg * (float)kPi / 180.0f, c = std::cos(rad), s = std::sin(rad);
-    // rot_deg is baked into the quad here (a portray-time constant); the VIEW rotation is
-    // added per frame in the shader when this sprite is MAP-aligned — it must NOT be baked,
-    // or a cached tile would go stale on every degree of a turn.
-    const float postrot = (align == TILE57_ALIGN_MAP) ? 1.0f : 0.0f;
-    auto corner = [&](float lx, float ly, float u, float vv) {
-        sprite_.push_back({awx, awy, lx * c - ly * s, lx * s + ly * c, u, vv, scamin, postrot});
-    };
-    corner(-hw, -hh, r.u0, r.v0);
-    corner(hw, -hh, r.u1, r.v0);
-    corner(hw, hh, r.u1, r.v1);
-    corner(-hw, -hh, r.u0, r.v0);
-    corner(hw, hh, r.u1, r.v1);
-    corner(-hw, hh, r.u0, r.v1);
-}
+static const char* VS_FLAT = T57_XFORM_UNIFORMS
+    "attribute vec2 aWorld; attribute vec2 aPost; attribute float aScamin;\n"
+    "attribute float aDispCat; attribute float aMapAlign;\n"
+    "uniform vec4 uColor;\n"
+    "varying vec4 vCol;\n"
+    "void main(){\n"
+    "  if (t57cull(aDispCat, aScamin)) { gl_Position = vec4(2.0); vCol = vec4(0.0); return; }\n"
+    "  vec2 post = (aMapAlign > 0.5) ? t57rot(aPost) : aPost;\n"
+    "  vec2 screen = t57rot(aWorld*uScale) + uOrigin + post;\n"
+    "  gl_Position = vec4(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0, 0.0, 1.0);\n"
+    "  vCol = uColor;\n"
+    "}\n";
+static const char* FS_FLAT =
+    "varying vec4 vCol;\n"
+    "void main(){ gl_FragColor = vec4(vCol.rgb*vCol.a, vCol.a); }\n";
 
-// Area fill pattern: tessellate the polygon and tile the pattern cell across it
-// (world-anchored, constant screen size) via the pattern program.
-void ChartRenderer::on_draw_pattern(const char* name, size_t len, const tile57_world_rings* p,
-                                    float scamin) {
-    if (!g_atlas.ok || !p || p->n < 3)
-        return;
-    auto it = g_atlas.uv.find("pat:" + std::string(name, len));
-    if (it == g_atlas.uv.end()) { // unknown pattern -> flat translucent tint
-        on_fill_area(p, tile57_rgba{160, 160, 170, 140}, scamin);
-        return;
-    }
-    const AtlasRect& r = it->second;
-    float tw = std::max(1.0f, r.px_w * (float)size_scale_); // tile size in screen px
-    float th = std::max(1.0f, r.px_h * (float)size_scale_);
-    FillTess t = tessellate_rings(p, decimate_eps_ * decimate_eps_);
-    if (!t.idx)
-        return;
-    const auto& idx = *t.idx;
-    const auto& flat = *t.pts;
-    for (size_t i = 0; i + 2 < idx.size(); i += 3)
-        for (int k = 0; k < 3; ++k) {
-            float wx = (float)(flat[idx[i + k]][0] - ref_wx_),
-                  wy = (float)(flat[idx[i + k]][1] - ref_wy_);
-            pattern_.push_back({wx, wy, r.u0, r.v0, r.u1, r.v1, tw, th, scamin});
-        }
-}
+// Pattern: the polygon interior (aPost is 0), tiled per-fragment at a constant screen
+// size, anchored to the CHART. vWorldPx = aWorld*uScale is camera-relative screen px
+// (UNROTATED, so the lattice turns rigidly with the chart); phase = fract(vWorldPx /
+// period) keeps the cell fixed to the chart under a pan. Using a varying (not
+// gl_FragCoord) keeps the phase correct in the supersample FBO.
+static const char* VS_PAT = T57_XFORM_UNIFORMS
+    "attribute vec2 aWorld; attribute float aScamin; attribute float aDispCat;\n"
+    "varying vec2 vWorldPx;\n"
+    "void main(){\n"
+    "  if (t57cull(aDispCat, aScamin)) { gl_Position = vec4(2.0); vWorldPx = vec2(0.0); return; }\n"
+    "  vec2 wpx = aWorld*uScale;\n"
+    "  vec2 screen = t57rot(wpx) + uOrigin;\n"
+    "  gl_Position = vec4(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0, 0.0, 1.0);\n"
+    "  vWorldPx = wpx;\n"
+    "}\n";
+static const char* FS_PAT =
+    "uniform sampler2D uCell; uniform vec2 uPeriod;\n"
+    "varying vec2 vWorldPx;\n"
+    "void main(){\n"
+    "  vec2 uv = fract(vWorldPx / max(uPeriod, vec2(1.0)));\n"
+    "  vec4 c = texture2D(uCell, uv);\n"
+    "  if (c.a < 0.02) discard;\n"
+    "  gl_FragColor = vec4(c.rgb*c.a, c.a);\n"
+    "}\n";
 
-// Lay a label out from the SDF glyph atlas: one textured quad per glyph at the
-// anchor + local px (origin + pen + glyph offset, all × the text px size). The
-// atlas is monochrome SDF, tinted by the text colour in the glyph shader.
-void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float oy,
-                                     const char* text, size_t len, float size_px, float rot_deg,
-                                     tile57_rot_align align, tile57_rgba c, tile57_rgba /*halo*/,
-                                     float scamin) {
-    if (!g_glyph.ok || size_px <= 0 || !text)
-        return;
-    float awx = (float)(anchor.x - ref_wx_), awy = (float)(anchor.y - ref_wy_);
-    // The label's OWN angle — a depth-contour value arrives with its contour's tangent, an
-    // ordinary label with 0. Turn the laid-out run about the anchor by it (same convention as
-    // the sprite quad). The VIEW rotation is NOT folded in here: it is added per frame in the
-    // shader for a MAP-aligned label, so the cached label buffer survives a turn.
-    // The sense is settled: verified against the engine's own geometry (the emitted run lies
-    // along the contour it labels, to 0.0 degrees), so the angle is applied as given — a
-    // contour value ALWAYS follows its contour, however steep.
-    const float rad = rot_deg * (float)kPi / 180.0f;
-    const float rc = std::cos(rad), rs = std::sin(rad);
-    const float postrot = (align == TILE57_ALIGN_MAP) ? 1.0f : 0.0f;
-    float pen = 0;
-    size_t i = 0;
-    while (i < len) {
-        uint32_t cp = decode_utf8(text, len, i);
-        auto it = g_glyph.g.find(cp);
-        if (it == g_glyph.g.end()) {
-            it = g_glyph.g.find('?');
-            if (it == g_glyph.g.end())
-                continue;
-        }
-        const GlyphInfo& g = it->second;
-        if (g.w > 0 && g.h > 0) {
-            float x0 = ox + pen + g.ox * size_px, y0 = oy + g.oy * size_px;
-            float x1 = x0 + g.w * size_px, y1 = y0 + g.h * size_px;
-            auto v = [&](float px, float py, float u, float vv) {
-                glyph_.push_back({awx, awy, px * rc - py * rs, px * rs + py * rc, u, vv, c.r, c.g,
-                                  c.b, c.a, scamin, postrot});
-            };
-            v(x0, y0, g.u0, g.v0);
-            v(x1, y0, g.u1, g.v0);
-            v(x1, y1, g.u1, g.v1);
-            v(x0, y0, g.u0, g.v0);
-            v(x1, y1, g.u1, g.v1);
-            v(x0, y1, g.u0, g.v1);
-        }
-        pen += g.adv * size_px;
-    }
-}
+// Sprite: a symbol/sounding quad. The anchor (aWorld) rides the chart; the corner
+// (aPost) stays upright unless MAP-aligned. Artwork carries its own colour.
+static const char* VS_SPRITE = T57_XFORM_UNIFORMS
+    "attribute vec2 aWorld; attribute vec2 aPost; attribute vec2 aUV; attribute float aScamin;\n"
+    "attribute float aDispCat; attribute float aMapAlign;\n"
+    "varying vec2 vUV;\n"
+    "void main(){\n"
+    "  if (t57cull(aDispCat, aScamin)) { gl_Position = vec4(2.0); vUV = vec2(0.0); return; }\n"
+    "  vec2 post = (aMapAlign > 0.5) ? t57rot(aPost) : aPost;\n"
+    "  vec2 screen = t57rot(aWorld*uScale) + uOrigin + post;\n"
+    "  gl_Position = vec4(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0, 0.0, 1.0);\n"
+    "  vUV = aUV;\n"
+    "}\n";
+static const char* FS_SPRITE =
+    "uniform sampler2D uAtlas;\n"
+    "varying vec2 vUV;\n"
+    "void main(){ vec4 t = texture2D(uAtlas, vUV); gl_FragColor = vec4(t.rgb*t.a, t.a); }\n";
 
-// ---- C surface trampolines (ctx == ChartRenderer*) -------------------------
-// The scale denominator a feature is culled at — the ONE place the rule lives, so every
-// draw kind (area, line, symbol, sprite, pattern, text) gates identically.
-//
-// SUPER-SCAMIN. An ENC may leave SCAMIN off a feature entirely, and S-52 reads that as
-// "never scale-cull me". Honoured literally, a 1:12,000 harbour cell's SCAMIN-less buoys,
-// lights and soundings keep drawing however far you zoom out — at 1:1.5M the whole cell
-// lands on screen at once and the chart is a carpet of symbology. OpenCPN has the same
-// problem with the same ENCs and solves it by IMPUTING a SCAMIN from the cell's own
-// compilation scale (s52plib.cpp, m_bUseSUPER_SCAMIN):
-//
-//     if (obj->Scamin > 9e6)                      // i.e. undefined
-//         obj->SuperScamin = chart_ref_scale * 2;
-//     if (SuperScamin > 0 && vp_plib.chart_scale > obj->SuperScamin) b_visible = false;
-//
-// so a cell's ungated detail survives to 2x its compilation scale and no further. We do
-// the same, with the same factor.
-//
-// DISPLAY BASE is exempt — land areas, depth areas, the coastline: the skeleton that must
-// remain at every scale (OpenCPN spells this as an explicit class list, LNDARE/DEPARE/
-// COALNE/DRGARE/...; tile57 hands us the category directly, which is the same rule stated
-// once). SCAMIN never applies to it, imputed or authored.
-float ChartRenderer::feature_scamin(const tile57_feature* f) const {
-    if (!f)
-        return kNeverCulled;
-    if (f->disp_cat == TILE57_DISP_BASE)
-        return kNeverCulled; // the chart's skeleton: never scale-culled (tile57.h)
-    if (f->scamin > 0)
-        return (float)f->scamin; // the producer said so
-    if (!super_scamin_ || native_scale_ <= 0)
-        return kNeverCulled; // no imputation possible / turned off
-    return (float)(native_scale_ * kSuperScaminUnderzoom);
-}
-static float feat_scamin(void* c, const tile57_feature* f) {
-    return static_cast<ChartRenderer*>(c)->feature_scamin(f);
-}
-// Every draw call carries its feature's S-52 draw priority (`plane`). Record it before the
-// emit and tag the vertices it produced, so ensure_tile can sort the tile by paint order.
-// tile57 states the contract plainly: "the host owns final paint order".
-static void tr_fill(void* c, const tile57_feature* f, const tile57_world_rings* r, tile57_rgba col,
-                    int) {
-    auto* s = static_cast<ChartRenderer*>(c);
-    s->set_plane(f);
-    const size_t n0 = s->area_.size();
-    s->on_fill_area(r, col, feat_scamin(c, f));
-    s->tag_plane(s->area_pl_, n0, s->area_.size());
-}
-static void tr_stroke(void* c, const tile57_feature* f, const tile57_world_rings* l, float w,
-                      float dash_on, float dash_off, tile57_rgba col) {
-    auto* s = static_cast<ChartRenderer*>(c);
-    s->set_plane(f);
-    const size_t n0 = s->line_.size();
-    s->on_stroke_line(l, w, dash_on, dash_off, col, feat_scamin(c, f));
-    s->tag_plane(s->line_pl_, n0, s->line_.size());
-}
-static void tr_symbol(void* c, const tile57_feature* f, tile57_world_point a,
-                      const tile57_local_rings* r, tile57_rgba col, int eo, float sw,
-                      tile57_rot_align align) {
-    auto* s = static_cast<ChartRenderer*>(c);
-    s->set_plane(f);
-    const size_t n0 = s->symbol_.size();
-    s->on_draw_symbol(a, r, col, eo, sw, align, feat_scamin(c, f));
-    s->tag_plane(s->symbol_pl_, n0, s->symbol_.size());
-}
-static void tr_text(void* c, const tile57_feature* f, tile57_world_point a,
-                    const tile57_local_rings* g, tile57_rgba col, tile57_rgba halo, float,
-                    tile57_rot_align align) {
-    static_cast<ChartRenderer*>(c)->on_draw_text(a, g, col, halo, align, feat_scamin(c, f));
-}
-static void tr_sprite(void* c, const tile57_feature* f, const char* name, size_t len,
-                      tile57_world_point a, float rot, tile57_rot_align align, float hw, float hh) {
-    auto* s = static_cast<ChartRenderer*>(c);
-    s->set_plane(f);
-    const size_t n0 = s->sprite_.size();
-    s->on_draw_sprite(name, len, a, rot, align, hw, hh, feat_scamin(c, f));
-    s->tag_plane(s->sprite_pl_, n0, s->sprite_.size());
-}
-static void tr_pattern(void* c, const tile57_feature* f, const char* name, size_t len,
-                       const tile57_world_rings* rings) {
-    auto* s = static_cast<ChartRenderer*>(c);
-    s->set_plane(f);
-    const size_t n0 = s->pattern_.size();
-    s->on_draw_pattern(name, len, rings, feat_scamin(c, f));
-    s->tag_plane(s->pattern_pl_, n0, s->pattern_.size());
-}
-static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, float ox, float oy,
-                        const char* text, size_t len, float size, float rot, tile57_rot_align align,
-                        tile57_rgba col, tile57_rgba halo) {
-    // TILE57_DEBUG: what the engine actually hands us per label. A depth-contour value must
-    // arrive MAP-aligned with its contour's tangent; an ordinary label VIEWPORT + 0. If a
-    // contour label draws upright on screen, this line says whether the angle never arrived
-    // (engine/ABI) or arrived and we failed to apply it (this file). Capped — labels are many.
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    static int dbg_left = 40;
-    if (dbg && dbg_left > 0) {
-        --dbg_left;
-        // Print the POINTER, and build the string ourselves. The previous version passed a
-        // non-NUL-terminated char* to wxLogMessage's %.*s, and a Unicode wx build treats %s
-        // as wchar_t* — so "(null)" in that log may have been wx mangling a perfectly good
-        // pointer rather than tile57 handing us a null one. ptr=0x0 settles it.
-        const wxString t = text ? wxString::FromUTF8(text, len) : wxString::FromAscii("<NULL PTR>");
-        wxLogMessage(wxString::Format(
-            "tile57 TXT: cls=%s align=%s rot=%7.2f size=%.1f ox=%.1f oy=%.1f ptr=%p len=%zu [%s]",
-            wxString::FromAscii((f && f->cls) ? f->cls : "?"),
-            wxString::FromAscii(align == TILE57_ALIGN_MAP ? "MAP" : "VIEWPORT"), rot, size, ox, oy,
-            (const void*)text, len, t));
-    }
-    static_cast<ChartRenderer*>(c)->on_draw_text_str(a, ox, oy, text, len, size, rot, align, col,
-                                                     halo, feat_scamin(c, f));
-}
+// SDF glyph: same quad, but sample the signed-distance field, antialias with fwidth,
+// tint by the per-vertex colour, embolden by the per-vertex weight (S-52 important text).
+static const char* VS_GLYPH = T57_XFORM_UNIFORMS
+    "attribute vec2 aWorld; attribute vec2 aPost; attribute vec2 aUV; attribute vec4 aColor;\n"
+    "attribute float aWeight; attribute float aScamin; attribute float aDispCat;\n"
+    "attribute float aMapAlign;\n"
+    "varying vec2 vUV; varying vec4 vCol; varying float vWeight;\n"
+    "void main(){\n"
+    "  if (t57cull(aDispCat, aScamin)) { gl_Position = vec4(2.0); vUV = vec2(0.0); vCol = "
+    "vec4(0.0); vWeight = 0.0; return; }\n"
+    "  vec2 post = (aMapAlign > 0.5) ? t57rot(aPost) : aPost;\n"
+    "  vec2 screen = t57rot(aWorld*uScale) + uOrigin + post;\n"
+    "  gl_Position = vec4(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0, 0.0, 1.0);\n"
+    "  vUV = aUV; vCol = aColor; vWeight = aWeight;\n"
+    "}\n";
+static const char* FS_GLYPH =
+    "uniform sampler2D uAtlas;\n"
+    "varying vec2 vUV; varying vec4 vCol; varying float vWeight;\n"
+    "void main(){\n"
+    "  float d = texture2D(uAtlas, vUV).r;\n"
+    "  float w = fwidth(d);\n"
+    "  float edge = 0.5 - vWeight;\n"
+    "  float a = smoothstep(edge - w, edge + w, d);\n"
+    "  if (a <= 0.0) discard;\n"
+    "  float al = vCol.a * a;\n"
+    "  gl_FragColor = vec4(vCol.rgb * al, al);\n" // premultiplied
+    "}\n";
 
-// ---- chart / GL lifecycle --------------------------------------------------
-// realpath(3) is POSIX; MSVC spells it _fullpath. Both return a malloc'd absolute
-// path (or null on failure), so the caller frees either the same way.
-static std::string real_path(const std::string& path) {
-#ifdef _WIN32
-    char* rp = _fullpath(nullptr, path.c_str(), 0);
-#else
-    char* rp = realpath(path.c_str(), nullptr);
-#endif
-    if (!rp)
-        return path;
-    std::string real(rp);
-    std::free(rp);
-    return real;
-}
+static const char* VS_BLIT =
+    "attribute vec2 aPos; attribute vec2 aTex; varying vec2 vTex;\n"
+    "void main(){ vTex = aTex; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+static const char* FS_BLIT =
+    "uniform sampler2D uTex; varying vec2 vTex;\n"
+    "void main(){ gl_FragColor = texture2D(uTex, vTex); }\n";
 
-bool ChartRenderer::open_chart(const std::string& path) {
-    if (chart_)
-        return true;
-    // Only baked .pmtiles archives open as charts (cells are baked to bundles up
-    // front via the Build Charts dialog). Resolve symlinks so mmap sees the real file.
-    std::string real = real_path(path);
-    return tile57_chart_open(real.c_str(), &chart_, nullptr) == TILE57_OK && chart_;
-}
-bool ChartRenderer::get_info(tile57_info& out) const {
-    if (!chart_)
-        return false;
-    tile57_chart_get_info(chart_, &out);
-    return true;
-}
-
-// View rotation (course-up et al). uRot = (cos, sin) of the OpenCPN ViewPort rotation;
-// (1,0) is north-up. The world term is always rotated — that IS the chart turning.
-//
-// The 2x2 must match ViewPort::GetPixFromLL or the chart turns AGAINST the core's overlays
-// (ownship, routes, AIS). OpenCPN rotates in a y-UP frame and flips y only at the end:
-//     dxr = epix*cos + npix*sin;  dyr = npix*cos - epix*sin;   // npix = +NORTH
-//     screen = (w/2 + dxr, h/2 - dyr);                         // <- y flipped here
-// Our world is web-mercator y-DOWN, so npix = -uy, and that reduces to the STANDARD
-// rotation — NOT its transpose (which is what rotating naively in the y-down frame gives,
-// and which counter-rotates the chart):
-//     sx = ux*cos - uy*sin
-//     sy = ux*sin + uy*cos
-//
-// aPost is NOT: it is a screen-px offset, and whether it turns with the chart depends on
-// what it means (uPostRot selects, per draw):
-//   uPostRot=1  CHART-relative — a line's half-width normal, derived from the segment's
-//               WORLD direction at tessellation time. Leave it unrotated and the stroke
-//               offset stops being perpendicular to the rotated segment: lines shear and
-//               (at 90°) collapse to nothing.
-//   uPostRot=0  SCREEN-relative — a symbol's or glyph's local px outline. These stay
-//               UPRIGHT on screen under rotation (S-52 / MapLibre "viewport" alignment),
-//               so text stays readable and buoys stay the right way up.
-// Symbols whose rotation is referenced to NORTH (S-52 ORIENT — "map" alignment) ought to
-// turn with the chart, but tile57's surface API does not yet tell a host which those are:
-// the engine computes the flag and then drops it (`_ = rot_north` in its vector surface),
-// and neither draw_sprite nor draw_symbol carries it. They render viewport-aligned here
-// until the API exposes it.
-static const char* VS = R"(
-attribute vec2 aWorld;
-attribute vec2 aPost;
-attribute vec4 aColor;
-attribute float aScamin;
-attribute float aPostRot;
-uniform float uScale;
-uniform vec2 uOrigin;
-uniform vec2 uVp;
-uniform float uScaminDenom;
-uniform vec2 uRot;
-varying vec4 vCol;
-vec2 t57rot(vec2 p){ return vec2(p.x*uRot.x - p.y*uRot.y, p.x*uRot.y + p.y*uRot.x); }
-void main(){
-  if (uScaminDenom > aScamin) { gl_Position = vec4(2.0,2.0,2.0,1.0); vCol = vec4(0.0); return; }
-  vec2 screen = t57rot(aWorld*uScale) + uOrigin + mix(aPost, t57rot(aPost), aPostRot);
-  vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
-  gl_Position = vec4(ndc, 0.0, 1.0);
-  vCol = aColor;
-}
-)";
-static const char* FS = R"(
-varying vec4 vCol;
-void main(){ gl_FragColor = vec4(vCol.rgb*vCol.a, vCol.a); }
-)";
-// Line program: the world transform above, plus the S-52 LS() dash.
-//
-// aPost is a line's half-width normal, taken from the segment's WORLD direction at
-// tessellation time, so unlike the shared VS there is nothing to select on — it ALWAYS turns
-// with the chart (leave it unrotated and the offset stops being perpendicular to the rotated
-// segment: the stroke shears, and at 90 degrees collapses to nothing).
-//
-// The dash is cut in the fragment from the arc length. aDist arrives in WORLD units and is
-// scaled to screen px HERE, by the same uScale that places the geometry — so the dash is a
-// constant length on screen at every zoom, and it stays right for a cached tile drawn at a
-// zoom it was not portrayed at. Rotation is rigid, so it does not touch a length: the view
-// can turn without disturbing the phase.
-static const char* VS_LINE = R"(
-attribute vec2 aWorld;
-attribute vec2 aPost;
-attribute vec4 aColor;
-attribute float aScamin;
-attribute float aDist;
-attribute vec2 aDash;
-uniform float uScale;
-uniform vec2 uOrigin;
-uniform vec2 uVp;
-uniform float uScaminDenom;
-uniform vec2 uRot;
-varying vec4 vCol;
-varying float vDistPx;
-varying vec2 vDash;
-vec2 t57rot(vec2 p){ return vec2(p.x*uRot.x - p.y*uRot.y, p.x*uRot.y + p.y*uRot.x); }
-void main(){
-  if (uScaminDenom > aScamin) {
-    gl_Position = vec4(2.0,2.0,2.0,1.0);
-    vCol = vec4(0.0); vDistPx = 0.0; vDash = vec2(0.0);
-    return;
-  }
-  vec2 screen = t57rot(aWorld*uScale) + uOrigin + t57rot(aPost);
-  vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
-  gl_Position = vec4(ndc, 0.0, 1.0);
-  vCol = aColor;
-  vDistPx = aDist * uScale;
-  vDash = aDash;
-}
-)";
-// Drop the fragments that fall in a gap. vDistPx interpolates linearly ALONG the segment
-// (both corners of an end share that end's arc length, so it does not vary across the
-// stroke's width), which is what makes the gaps land square across the line.
-static const char* FS_LINE = R"(
-varying vec4 vCol;
-varying float vDistPx;
-varying vec2 vDash;
-void main(){
-  float period = vDash.x + vDash.y;   // (0,0) => solid, and the branch is skipped
-  if (period > 0.0 && mod(vDistPx, period) > vDash.x)
-    discard;
-  gl_FragColor = vec4(vCol.rgb*vCol.a, vCol.a);
-}
-)";
-// Sprite program: same world transform, but sample the atlas at aUV. Output
-// premultiplied so it composites with GL_ONE, GL_ONE_MINUS_SRC_ALPHA.
-// The anchor rotates with the chart; the quad (aPost) stays upright — see VS.
-static const char* VS_SPRITE = R"(
-attribute vec2 aWorld;
-attribute vec2 aPost;
-attribute vec2 aUV;
-attribute float aScamin;
-attribute float aPostRot;
-uniform float uScale;
-uniform vec2 uOrigin;
-uniform vec2 uVp;
-uniform float uScaminDenom;
-uniform vec2 uRot;
-varying vec2 vUV;
-vec2 t57rot(vec2 p){ return vec2(p.x*uRot.x - p.y*uRot.y, p.x*uRot.y + p.y*uRot.x); }
-void main(){
-  if (uScaminDenom > aScamin) { gl_Position = vec4(2.0,2.0,2.0,1.0); vUV = vec2(0.0); return; }
-  // MAP-aligned sprites (ORIENT'd lights, linestyle bricks) turn their quad with the chart;
-  // VIEWPORT-aligned ones (buoys, beacons) stay upright. aPostRot picks, per sprite.
-  vec2 screen = t57rot(aWorld*uScale) + uOrigin + mix(aPost, t57rot(aPost), aPostRot);
-  vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
-  gl_Position = vec4(ndc, 0.0, 1.0);
-  vUV = aUV;
-}
-)";
-static const char* FS_SPRITE = R"(
-uniform sampler2D uAtlas;
-varying vec2 vUV;
-void main(){ vec4 t = texture2D(uAtlas, vUV); gl_FragColor = vec4(t.rgb*t.a, t.a); }
-)";
-// Pattern program: tile a pattern cell across a polygon, world-anchored at a
-// constant screen size. vWorldPx (= aWorld*uScale) is the screen offset from the
-// chart reference point, so fract(vWorldPx/tile) keeps the pattern fixed to the
-// chart. The cell is a sub-rect of the atlas; wrap into it with fract.
-static const char* VS_PAT = R"(
-attribute vec2 aWorld;
-attribute vec4 aRect;
-attribute vec2 aTile;
-attribute float aScamin;
-uniform float uScale;
-uniform vec2 uOrigin;
-uniform vec2 uVp;
-uniform float uScaminDenom;
-uniform vec2 uRot;
-varying vec4 vRect;
-varying vec2 vTile;
-varying vec2 vWorldPx;
-void main(){
-  if (uScaminDenom > aScamin) { gl_Position = vec4(2.0,2.0,2.0,1.0); return; }
-  vec2 wpx = aWorld*uScale;
-  vec2 screen = vec2(wpx.x*uRot.x - wpx.y*uRot.y, wpx.x*uRot.y + wpx.y*uRot.x) + uOrigin;
-  vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
-  gl_Position = vec4(ndc, 0.0, 1.0);
-  // vWorldPx stays UNROTATED: the fill lattice is anchored in the CHART frame, so the
-  // pattern turns rigidly with the chart (as printed on it) instead of the cells sliding
-  // through the polygon as the view spins.
-  vRect = aRect; vTile = aTile; vWorldPx = wpx;
-}
-)";
-static const char* FS_PAT = R"(
-uniform sampler2D uAtlas;
-varying vec4 vRect;
-varying vec2 vTile;
-varying vec2 vWorldPx;
-void main(){
-  vec2 f = fract(vWorldPx / vTile);
-  vec2 uv = vRect.xy + f * (vRect.zw - vRect.xy);
-  vec4 t = texture2D(uAtlas, uv);
-  gl_FragColor = vec4(t.rgb*t.a, t.a);
-}
-)";
-// Glyph program: same world transform + aPost (local px), sample the SDF atlas
-// and threshold to a crisp, size-independent edge (fwidth = the on-screen slope),
-// tinted by the per-glyph colour. Output premultiplied.
-static const char* VS_GLYPH = R"(
-attribute vec2 aWorld;
-attribute vec2 aPost;
-attribute vec2 aUV;
-attribute vec4 aColor;
-attribute float aScamin;
-attribute float aPostRot;
-uniform float uScale;
-uniform vec2 uOrigin;
-uniform vec2 uVp;
-uniform float uScaminDenom;
-uniform vec2 uRot;
-varying vec2 vUV;
-varying vec4 vCol;
-vec2 t57rot(vec2 p){ return vec2(p.x*uRot.x - p.y*uRot.y, p.x*uRot.y + p.y*uRot.x); }
-void main(){
-  if (uScaminDenom > aScamin) { gl_Position = vec4(2.0,2.0,2.0,1.0); vUV = vec2(0.0); vCol = vec4(0.0); return; }
-  // The anchor always turns with the chart. The glyph quad turns only for a MAP-aligned
-  // label — a depth-contour value, which must follow its contour; an ordinary label is
-  // VIEWPORT-aligned and stays upright and readable.
-  vec2 screen = t57rot(aWorld*uScale) + uOrigin + mix(aPost, t57rot(aPost), aPostRot);
-  vec2 ndc = vec2(screen.x/uVp.x*2.0-1.0, 1.0 - screen.y/uVp.y*2.0);
-  gl_Position = vec4(ndc, 0.0, 1.0);
-  vUV = aUV; vCol = aColor;
-}
-)";
-static const char* FS_GLYPH = R"(
-uniform sampler2D uAtlas;
-varying vec2 vUV;
-varying vec4 vCol;
-void main(){
-  float d = texture2D(uAtlas, vUV).a;
-  float w = fwidth(d);
-  float a = smoothstep(0.5 - w, 0.5 + w, d);
-  gl_FragColor = vec4(vCol.rgb*vCol.a, vCol.a) * a;
-}
-)";
-// Composite program: draw the supersampled texture as a fullscreen quad,
-// down-sampled by the sampler's linear filter (already premultiplied).
-static const char* VS_BLIT = R"(
-attribute vec2 aPos;
-attribute vec2 aTex;
-varying vec2 vTex;
-void main(){ vTex = aTex; gl_Position = vec4(aPos, 0.0, 1.0); }
-)";
-static const char* FS_BLIT = R"(
-uniform sampler2D uTex;
-varying vec2 vTex;
-void main(){ gl_FragColor = texture2D(uTex, vTex); }
-)";
-static uint32_t compile(GLenum t, const char* body) {
+uint32_t compile(GLenum t, const char* body) {
     std::string src = std::string(T57_GLSL_VERSION) + body;
     const char* s = src.c_str();
     uint32_t sh = glCreateShader(t);
@@ -1184,126 +233,99 @@ static uint32_t compile(GLenum t, const char* body) {
     GLint ok = 0;
     glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
     if (!ok) {
-        char l[512];
-        glGetShaderInfoLog(sh, 512, nullptr, l);
-        wxLogMessage("tile57 shader FAIL: %s", l);
-    } else
-        wxLogMessage("tile57 shader ok (type=0x%x)", (unsigned)t);
+        char log[1024];
+        glGetShaderInfoLog(sh, sizeof(log), nullptr, log);
+        wxLogMessage("tile57 shader compile failed: %s", log);
+    }
     return sh;
 }
 
-namespace {
-// The shader programs + uniform locations + composite quad VBO are IDENTICAL for
-// every ChartRenderer, so compile them ONCE process-wide (like the atlases) instead
-// of once per quilt cell. Per-instance compiles also forced a fresh Metal render-
-// pipeline build per cell on macOS. ensure_gl() copies these handles into the
-// instance, so all the render code that reads prog_/u_scale_/… is unchanged.
+// Programs are shared process-wide (every quilt cell renders into the same context);
+// building them per renderer recompiled all five on every chart close/open churn.
 struct GlPrograms {
-    uint32_t prog = 0, prog_line = 0, prog_sprite = 0, prog_pat = 0, prog_glyph = 0, prog_blit = 0,
-             vbo_quad = 0;
-    int u_scale = -1, u_origin = -1, u_vp = -1, u_denom = -1, u_rot = -1;
-    int lu_scale = -1, lu_origin = -1, lu_vp = -1, lu_denom = -1, lu_rot = -1;
-    int su_scale = -1, su_origin = -1, su_vp = -1, su_denom = -1, su_atlas = -1, su_rot = -1;
-    int pu_scale = -1, pu_origin = -1, pu_vp = -1, pu_denom = -1, pu_atlas = -1, pu_rot = -1;
-    int gu_scale = -1, gu_origin = -1, gu_vp = -1, gu_denom = -1, gu_atlas = -1, gu_rot = -1;
-    int bu_tex = -1;
+    uint32_t flat = 0, pat = 0, sprite = 0, glyph = 0, blit = 0, vbo_quad = 0;
+    int f_scale, f_origin, f_vp, f_denom, f_rot, f_cat, f_color;
+    int p_scale, p_origin, p_vp, p_denom, p_rot, p_cat, p_cell, p_period;
+    int s_scale, s_origin, s_vp, s_denom, s_rot, s_cat, s_atlas;
+    int g_scale, g_origin, g_vp, g_denom, g_rot, g_cat, g_atlas;
+    int b_tex;
     bool ready = false;
 };
 GlPrograms g_prog;
 
+void bind_xform_attribs(uint32_t p) {
+    glBindAttribLocation(p, 0, "aWorld");
+    glBindAttribLocation(p, 1, "aPost");
+    glBindAttribLocation(p, 2, "aScamin");
+    glBindAttribLocation(p, 3, "aDispCat");
+    glBindAttribLocation(p, 4, "aMapAlign");
+}
+void get_xform_uniforms(uint32_t p, int& sc, int& or_, int& vp, int& dn, int& rot, int& cat) {
+    sc = glGetUniformLocation(p, "uScale");
+    or_ = glGetUniformLocation(p, "uOrigin");
+    vp = glGetUniformLocation(p, "uVp");
+    dn = glGetUniformLocation(p, "uScaminDenom");
+    rot = glGetUniformLocation(p, "uRot");
+    cat = glGetUniformLocation(p, "uCat");
+}
+
 void build_programs() {
     GlPrograms& g = g_prog;
-    g.prog = glCreateProgram();
-    glAttachShader(g.prog, compile(GL_VERTEX_SHADER, VS));
-    glAttachShader(g.prog, compile(GL_FRAGMENT_SHADER, FS));
-    glBindAttribLocation(g.prog, 0, "aWorld");
-    glBindAttribLocation(g.prog, 1, "aPost");
-    glBindAttribLocation(g.prog, 2, "aColor");
-    glBindAttribLocation(g.prog, 3, "aScamin");
-    glBindAttribLocation(g.prog, 4, "aPostRot");
-    glLinkProgram(g.prog);
-    g.u_scale = glGetUniformLocation(g.prog, "uScale");
-    g.u_origin = glGetUniformLocation(g.prog, "uOrigin");
-    g.u_vp = glGetUniformLocation(g.prog, "uVp");
-    g.u_denom = glGetUniformLocation(g.prog, "uScaminDenom");
-    g.u_rot = glGetUniformLocation(g.prog, "uRot");
 
-    // Line program (stroked lines + the LS() dash, cut client-side).
-    g.prog_line = glCreateProgram();
-    glAttachShader(g.prog_line, compile(GL_VERTEX_SHADER, VS_LINE));
-    glAttachShader(g.prog_line, compile(GL_FRAGMENT_SHADER, FS_LINE));
-    glBindAttribLocation(g.prog_line, 0, "aWorld");
-    glBindAttribLocation(g.prog_line, 1, "aPost");
-    glBindAttribLocation(g.prog_line, 2, "aColor");
-    glBindAttribLocation(g.prog_line, 3, "aScamin");
-    glBindAttribLocation(g.prog_line, 4, "aDist");
-    glBindAttribLocation(g.prog_line, 5, "aDash");
-    glLinkProgram(g.prog_line);
-    g.lu_scale = glGetUniformLocation(g.prog_line, "uScale");
-    g.lu_origin = glGetUniformLocation(g.prog_line, "uOrigin");
-    g.lu_vp = glGetUniformLocation(g.prog_line, "uVp");
-    g.lu_denom = glGetUniformLocation(g.prog_line, "uScaminDenom");
-    g.lu_rot = glGetUniformLocation(g.prog_line, "uRot");
+    g.flat = glCreateProgram();
+    glAttachShader(g.flat, compile(GL_VERTEX_SHADER, VS_FLAT));
+    glAttachShader(g.flat, compile(GL_FRAGMENT_SHADER, FS_FLAT));
+    bind_xform_attribs(g.flat);
+    glLinkProgram(g.flat);
+    get_xform_uniforms(g.flat, g.f_scale, g.f_origin, g.f_vp, g.f_denom, g.f_rot, g.f_cat);
+    g.f_color = glGetUniformLocation(g.flat, "uColor");
 
-    // Sprite program (textured point symbols).
-    g.prog_sprite = glCreateProgram();
-    glAttachShader(g.prog_sprite, compile(GL_VERTEX_SHADER, VS_SPRITE));
-    glAttachShader(g.prog_sprite, compile(GL_FRAGMENT_SHADER, FS_SPRITE));
-    glBindAttribLocation(g.prog_sprite, 0, "aWorld");
-    glBindAttribLocation(g.prog_sprite, 1, "aPost");
-    glBindAttribLocation(g.prog_sprite, 2, "aUV");
-    glBindAttribLocation(g.prog_sprite, 3, "aScamin");
-    glBindAttribLocation(g.prog_sprite, 4, "aPostRot");
-    glLinkProgram(g.prog_sprite);
-    g.su_scale = glGetUniformLocation(g.prog_sprite, "uScale");
-    g.su_origin = glGetUniformLocation(g.prog_sprite, "uOrigin");
-    g.su_vp = glGetUniformLocation(g.prog_sprite, "uVp");
-    g.su_denom = glGetUniformLocation(g.prog_sprite, "uScaminDenom");
-    g.su_atlas = glGetUniformLocation(g.prog_sprite, "uAtlas");
-    g.su_rot = glGetUniformLocation(g.prog_sprite, "uRot");
+    g.pat = glCreateProgram();
+    glAttachShader(g.pat, compile(GL_VERTEX_SHADER, VS_PAT));
+    glAttachShader(g.pat, compile(GL_FRAGMENT_SHADER, FS_PAT));
+    glBindAttribLocation(g.pat, 0, "aWorld");
+    glBindAttribLocation(g.pat, 2, "aScamin");
+    glBindAttribLocation(g.pat, 3, "aDispCat");
+    glLinkProgram(g.pat);
+    get_xform_uniforms(g.pat, g.p_scale, g.p_origin, g.p_vp, g.p_denom, g.p_rot, g.p_cat);
+    g.p_cell = glGetUniformLocation(g.pat, "uCell");
+    g.p_period = glGetUniformLocation(g.pat, "uPeriod");
 
-    // Pattern program (tiled area fills).
-    g.prog_pat = glCreateProgram();
-    glAttachShader(g.prog_pat, compile(GL_VERTEX_SHADER, VS_PAT));
-    glAttachShader(g.prog_pat, compile(GL_FRAGMENT_SHADER, FS_PAT));
-    glBindAttribLocation(g.prog_pat, 0, "aWorld");
-    glBindAttribLocation(g.prog_pat, 1, "aRect");
-    glBindAttribLocation(g.prog_pat, 2, "aTile");
-    glBindAttribLocation(g.prog_pat, 3, "aScamin");
-    glLinkProgram(g.prog_pat);
-    g.pu_scale = glGetUniformLocation(g.prog_pat, "uScale");
-    g.pu_origin = glGetUniformLocation(g.prog_pat, "uOrigin");
-    g.pu_vp = glGetUniformLocation(g.prog_pat, "uVp");
-    g.pu_denom = glGetUniformLocation(g.prog_pat, "uScaminDenom");
-    g.pu_atlas = glGetUniformLocation(g.prog_pat, "uAtlas");
-    g.pu_rot = glGetUniformLocation(g.prog_pat, "uRot");
+    g.sprite = glCreateProgram();
+    glAttachShader(g.sprite, compile(GL_VERTEX_SHADER, VS_SPRITE));
+    glAttachShader(g.sprite, compile(GL_FRAGMENT_SHADER, FS_SPRITE));
+    glBindAttribLocation(g.sprite, 0, "aWorld");
+    glBindAttribLocation(g.sprite, 1, "aPost");
+    glBindAttribLocation(g.sprite, 2, "aUV");
+    glBindAttribLocation(g.sprite, 3, "aScamin");
+    glBindAttribLocation(g.sprite, 4, "aDispCat");
+    glBindAttribLocation(g.sprite, 5, "aMapAlign");
+    glLinkProgram(g.sprite);
+    get_xform_uniforms(g.sprite, g.s_scale, g.s_origin, g.s_vp, g.s_denom, g.s_rot, g.s_cat);
+    g.s_atlas = glGetUniformLocation(g.sprite, "uAtlas");
 
-    // Glyph program (SDF text).
-    g.prog_glyph = glCreateProgram();
-    glAttachShader(g.prog_glyph, compile(GL_VERTEX_SHADER, VS_GLYPH));
-    glAttachShader(g.prog_glyph, compile(GL_FRAGMENT_SHADER, FS_GLYPH));
-    glBindAttribLocation(g.prog_glyph, 0, "aWorld");
-    glBindAttribLocation(g.prog_glyph, 1, "aPost");
-    glBindAttribLocation(g.prog_glyph, 2, "aUV");
-    glBindAttribLocation(g.prog_glyph, 3, "aColor");
-    glBindAttribLocation(g.prog_glyph, 4, "aScamin");
-    glBindAttribLocation(g.prog_glyph, 5, "aPostRot");
-    glLinkProgram(g.prog_glyph);
-    g.gu_scale = glGetUniformLocation(g.prog_glyph, "uScale");
-    g.gu_origin = glGetUniformLocation(g.prog_glyph, "uOrigin");
-    g.gu_vp = glGetUniformLocation(g.prog_glyph, "uVp");
-    g.gu_denom = glGetUniformLocation(g.prog_glyph, "uScaminDenom");
-    g.gu_atlas = glGetUniformLocation(g.prog_glyph, "uAtlas");
-    g.gu_rot = glGetUniformLocation(g.prog_glyph, "uRot");
+    g.glyph = glCreateProgram();
+    glAttachShader(g.glyph, compile(GL_VERTEX_SHADER, VS_GLYPH));
+    glAttachShader(g.glyph, compile(GL_FRAGMENT_SHADER, FS_GLYPH));
+    glBindAttribLocation(g.glyph, 0, "aWorld");
+    glBindAttribLocation(g.glyph, 1, "aPost");
+    glBindAttribLocation(g.glyph, 2, "aUV");
+    glBindAttribLocation(g.glyph, 3, "aColor");
+    glBindAttribLocation(g.glyph, 4, "aWeight");
+    glBindAttribLocation(g.glyph, 5, "aScamin");
+    glBindAttribLocation(g.glyph, 6, "aDispCat");
+    glBindAttribLocation(g.glyph, 7, "aMapAlign");
+    glLinkProgram(g.glyph);
+    get_xform_uniforms(g.glyph, g.g_scale, g.g_origin, g.g_vp, g.g_denom, g.g_rot, g.g_cat);
+    g.g_atlas = glGetUniformLocation(g.glyph, "uAtlas");
 
-    // Composite program + a unit fullscreen quad (pos.xy, tex.uv).
-    g.prog_blit = glCreateProgram();
-    glAttachShader(g.prog_blit, compile(GL_VERTEX_SHADER, VS_BLIT));
-    glAttachShader(g.prog_blit, compile(GL_FRAGMENT_SHADER, FS_BLIT));
-    glBindAttribLocation(g.prog_blit, 0, "aPos");
-    glBindAttribLocation(g.prog_blit, 1, "aTex");
-    glLinkProgram(g.prog_blit);
-    g.bu_tex = glGetUniformLocation(g.prog_blit, "uTex");
+    g.blit = glCreateProgram();
+    glAttachShader(g.blit, compile(GL_VERTEX_SHADER, VS_BLIT));
+    glAttachShader(g.blit, compile(GL_FRAGMENT_SHADER, FS_BLIT));
+    glBindAttribLocation(g.blit, 0, "aPos");
+    glBindAttribLocation(g.blit, 1, "aTex");
+    glLinkProgram(g.blit);
+    g.b_tex = glGetUniformLocation(g.blit, "uTex");
     const float quad[] = {-1, -1, 0, 0, 1, -1, 1, 0, 1,  1, 1, 1,
                           -1, -1, 0, 0, 1, 1,  1, 1, -1, 1, 0, 1};
     glGenBuffers(1, &g.vbo_quad);
@@ -1311,87 +333,8 @@ void build_programs() {
     glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
     g.ready = true;
 }
-} // namespace
 
-bool ChartRenderer::ensure_gl() {
-    if (gl_ready_)
-        return true;
-    if (!t57_gl_loader_init())
-        return false;
-    // Detect a DEAD context (plugin reload / context recreate): the cached program
-    // handles are context objects, so if the current context doesn't know them the
-    // whole shared block must rebuild. This replaces the old scheme of resetting
-    // g_prog in shutdown() — that reset fired on EVERY chart close (OpenCPN opens
-    // and closes charts constantly while quilting), recompiling all five shader
-    // programs mid-pan for the surviving renderers: a multi-ms hitch each time,
-    // 2.2% of a whole profile.
-    if (g_prog.ready && !glIsProgram(g_prog.prog))
-        g_prog = GlPrograms{};
-    if (!g_prog.ready)
-        build_programs();         // compile shaders/programs ONCE process-wide
-    const GlPrograms& g = g_prog; // adopt the shared handles into this instance
-    prog_ = g.prog;
-    u_scale_ = g.u_scale;
-    u_origin_ = g.u_origin;
-    u_vp_ = g.u_vp;
-    u_denom_ = g.u_denom;
-    u_rot_ = g.u_rot;
-    prog_line_ = g.prog_line;
-    lu_scale_ = g.lu_scale;
-    lu_origin_ = g.lu_origin;
-    lu_vp_ = g.lu_vp;
-    lu_denom_ = g.lu_denom;
-    lu_rot_ = g.lu_rot;
-    prog_sprite_ = g.prog_sprite;
-    su_scale_ = g.su_scale;
-    su_origin_ = g.su_origin;
-    su_vp_ = g.su_vp;
-    su_denom_ = g.su_denom;
-    su_atlas_ = g.su_atlas;
-    su_rot_ = g.su_rot;
-    prog_pat_ = g.prog_pat;
-    pu_scale_ = g.pu_scale;
-    pu_origin_ = g.pu_origin;
-    pu_vp_ = g.pu_vp;
-    pu_denom_ = g.pu_denom;
-    pu_atlas_ = g.pu_atlas;
-    pu_rot_ = g.pu_rot;
-    prog_glyph_ = g.prog_glyph;
-    gu_scale_ = g.gu_scale;
-    gu_origin_ = g.gu_origin;
-    gu_vp_ = g.gu_vp;
-    gu_denom_ = g.gu_denom;
-    gu_atlas_ = g.gu_atlas;
-    gu_rot_ = g.gu_rot;
-    prog_blit_ = g.prog_blit;
-    bu_tex_ = g.bu_tex;
-    vbo_quad_ = g.vbo_quad;
-
-    // Per-instance whole-view label buffers (each chart's own decluttered text).
-    glGenBuffers(1, &vbo_vtext_);
-    glGenBuffers(1, &vbo_vglyph_);
-
-    load_sprite_atlas();
-    load_glyph_atlas();
-
-    gl_ready_ = true;
-    return true;
-}
-
-namespace {
-// One supersample colour texture FBO shared by every chart (they render
-// sequentially into the same GL context). Rendering into it at kSS× the
-// viewport then compositing back down-sampled antialiases tessellated edges.
-// One shared FBO (not one per chart) keeps it cheap; a plain texture target
-// (no multisample resolve blit) avoids the scroll-compose glitch that a
-// resolve introduced.
-//
-// Supersample factor. 2× SSAA costs 4× the fragment work plus a full-screen
-// composite — fine on a real GPU, ruinous on a SOFTWARE rasterizer (llvmpipe &
-// co.), where every fragment is CPU work. So detect a software renderer once
-// (from GL_RENDERER, needs a live context) and drop to 1 (AA off, render
-// direct) there. TILE57_SS=<n> forces it (1 = off, 2 = 2×). Must be called with
-// a current GL context (render() guarantees it via ensure_gl()).
+// ---- supersample AA target (shared; render kSS× then composite down) -------------
 int ss_factor() {
     static int k = -1;
     if (k >= 0)
@@ -1422,7 +365,6 @@ struct SsTarget {
     bool ok = false;
 };
 SsTarget g_ss;
-
 bool ensure_ss(int w, int h) {
     if (w <= 0 || h <= 0)
         return false;
@@ -1450,7 +392,346 @@ bool ensure_ss(int w, int h) {
     g_ss.ok = ok;
     return ok;
 }
+
+std::string real_path(const std::string& path) { return path; }
 } // namespace
+
+// ---- chart open / info -----------------------------------------------------------
+bool ChartRenderer::open_chart(const std::string& path) {
+    if (chart_)
+        return true;
+    tile57_error err{};
+    if (tile57_chart_open(real_path(path).c_str(), &chart_, &err) != TILE57_OK) {
+        wxLogMessage("tile57: open failed: %s", err.message);
+        chart_ = nullptr;
+        return false;
+    }
+    return chart_ != nullptr;
+}
+
+bool ChartRenderer::get_info(tile57_info& out) const {
+    if (!chart_)
+        return false;
+    tile57_chart_get_info(chart_, &out);
+    return true;
+}
+
+void ChartRenderer::set_super_scamin(bool on, double native_scale) {
+    super_scamin_ = on;
+    native_scale_ = native_scale;
+}
+
+// ---- GL setup --------------------------------------------------------------------
+bool ChartRenderer::ensure_gl() {
+    if (gl_ready_)
+        return true;
+    if (!t57_gl_loader_init())
+        return false;
+    if (g_prog.ready && !glIsProgram(g_prog.flat))
+        g_prog = GlPrograms{}; // dead context (plugin reload) -> rebuild the shared block
+    if (!g_prog.ready)
+        build_programs();
+    const GlPrograms& g = g_prog;
+    prog_ = g.flat;
+    u_scale_ = g.f_scale;
+    u_origin_ = g.f_origin;
+    u_vp_ = g.f_vp;
+    u_denom_ = g.f_denom;
+    u_rot_ = g.f_rot;
+    u_cat_ = g.f_cat;
+    u_color_ = g.f_color;
+    prog_pat_ = g.pat;
+    pu_scale_ = g.p_scale;
+    pu_origin_ = g.p_origin;
+    pu_vp_ = g.p_vp;
+    pu_denom_ = g.p_denom;
+    pu_rot_ = g.p_rot;
+    pu_cat_ = g.p_cat;
+    pu_cell_ = g.p_cell;
+    pu_period_ = g.p_period;
+    prog_sprite_ = g.sprite;
+    su_scale_ = g.s_scale;
+    su_origin_ = g.s_origin;
+    su_vp_ = g.s_vp;
+    su_denom_ = g.s_denom;
+    su_rot_ = g.s_rot;
+    su_cat_ = g.s_cat;
+    su_atlas_ = g.s_atlas;
+    prog_glyph_ = g.glyph;
+    gu_scale_ = g.g_scale;
+    gu_origin_ = g.g_origin;
+    gu_vp_ = g.g_vp;
+    gu_denom_ = g.g_denom;
+    gu_rot_ = g.g_rot;
+    gu_cat_ = g.g_cat;
+    gu_atlas_ = g.g_atlas;
+    prog_blit_ = g.blit;
+    bu_tex_ = g.b_tex;
+    vbo_quad_ = g.vbo_quad;
+
+    load_sprite_atlas();
+    load_glyph_atlas();
+    gl_ready_ = true;
+    return true;
+}
+
+// ---- scene build / free ----------------------------------------------------------
+void ChartRenderer::free_scene() {
+    if (scene_.vbo)
+        glDeleteBuffers(1, &scene_.vbo);
+    if (scene_.ibo)
+        glDeleteBuffers(1, &scene_.ibo);
+    if (scene_.qbo)
+        glDeleteBuffers(1, &scene_.qbo);
+    for (uint32_t t : scene_.pat_tex)
+        if (t)
+            glDeleteTextures(1, &t);
+    scene_ = Scene{};
+}
+
+void ChartRenderer::build_scene(double lon, double lat, double zoom, uint32_t w, uint32_t h,
+                                const tile57_mariner& m) {
+    free_scene();
+    if (!chart_)
+        return;
+    double cx, cy;
+    lonlat_to_world(lon, lat, cx, cy);
+    // Clamp the build zoom to the archive's baked band (a chart only has tiles inside
+    // [min,max]); the camera over/under-scales the deepest/coarsest band past it.
+    double bz = std::clamp(zoom, min_zoom_, max_zoom_);
+    // Overscan the portrayed view so a pan within the margin reuses the scene.
+    uint32_t ow = (uint32_t)std::lround(w * kOverscan);
+    uint32_t oh = (uint32_t)std::lround(h * kOverscan);
+
+    tile57_gpu_scene sc{};
+    tile57_error err{};
+    tile57_mariner mm = m;
+    if (tile57_chart_gpu_scene(chart_, lon, lat, bz, ow, oh, &mm, &sc, &err) != TILE57_OK) {
+        wxLogMessage("tile57: gpu_scene failed: %s", err.message);
+        return;
+    }
+
+    // Rebase the triangle verts camera-relative to (cx,cy): the ABI hands absolute
+    // web-mercator [0,1] as f32, which loses precision at harbour zoom; small values
+    // keep f32 exact (the live pan is folded back in via uOrigin per frame).
+    if (sc.vertex_count) {
+        std::vector<tile57_gpu_vertex> v(sc.vertices, sc.vertices + sc.vertex_count);
+        for (auto& p : v) {
+            p.x -= (float)cx;
+            p.y -= (float)cy;
+        }
+        glGenBuffers(1, &scene_.vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, scene_.vbo);
+        glBufferData(GL_ARRAY_BUFFER, v.size() * sizeof(tile57_gpu_vertex), v.data(),
+                     GL_STATIC_DRAW);
+    }
+    if (sc.index_count) {
+        glGenBuffers(1, &scene_.ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, scene_.ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sc.index_count * sizeof(uint32_t), sc.indices,
+                     GL_STATIC_DRAW);
+    }
+    if (sc.quad_count) {
+        std::vector<tile57_gpu_quad> q(sc.quads, sc.quads + sc.quad_count);
+        for (auto& p : q) {
+            p.x -= (float)cx;
+            p.y -= (float)cy;
+        }
+        glGenBuffers(1, &scene_.qbo);
+        glBindBuffer(GL_ARRAY_BUFFER, scene_.qbo);
+        glBufferData(GL_ARRAY_BUFFER, q.size() * sizeof(tile57_gpu_quad), q.data(), GL_STATIC_DRAW);
+        scene_.quad_verts = (uint32_t)sc.quad_count;
+    }
+    // One texture per area-fill pattern cell (RGBA8, already at the scene's screen
+    // density, so its w/h ARE the on-screen tiling period in device px).
+    scene_.pat_tex.resize(sc.pattern_count, 0);
+    scene_.pat_wh.resize(sc.pattern_count, {1, 1});
+    for (size_t i = 0; i < sc.pattern_count; ++i) {
+        const tile57_gpu_pattern& p = sc.patterns[i];
+        if (!p.rgba || !p.w || !p.h)
+            continue;
+        uint32_t tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)p.w, (GLsizei)p.h, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, p.rgba);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        scene_.pat_tex[i] = tex;
+        scene_.pat_wh[i] = {(int)p.w, (int)p.h};
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    scene_.ranges.reserve(sc.range_count);
+    for (size_t i = 0; i < sc.range_count; ++i) {
+        const tile57_gpu_range& r = sc.ranges[i];
+        Range out;
+        out.first = r.first;
+        out.count = r.count;
+        out.kind = r.kind;
+        out.prim = r.prim;
+        out.atlas = r.atlas;
+        out.pattern = r.pattern;
+        std::memcpy(out.color, r.color, 4);
+        scene_.ranges.push_back(out);
+    }
+
+    scene_.cx = cx;
+    scene_.cy = cy;
+    scene_.build_zoom = bz;
+    double wp = 256.0 * std::pow(2.0, bz); // geographic px per world unit at the build zoom
+    scene_.half_wx = (ow * 0.5) / wp;
+    scene_.half_wy = (oh * 0.5) / wp;
+    scene_.ok = true;
+    tile57_gpu_scene_free(&sc);
+}
+
+bool ChartRenderer::scene_covers(double vwx, double vwy, double zoom) const {
+    if (!scene_.ok)
+        return false;
+    if (std::fabs(zoom - scene_.build_zoom) > kZoomRebuild)
+        return false;
+    // The live view's centre must stay inside the overscanned box, with room for at
+    // least the un-overscanned viewport half around it (approximated by half the
+    // margin, so a pan toward an edge rebuilds before it runs off the coverage).
+    double keep_x = scene_.half_wx * (1.0 / kOverscan);
+    double keep_y = scene_.half_wy * (1.0 / kOverscan);
+    return std::fabs(vwx - scene_.cx) <= (scene_.half_wx - keep_x) &&
+           std::fabs(vwy - scene_.cy) <= (scene_.half_wy - keep_y);
+}
+
+// ---- draw ------------------------------------------------------------------------
+void ChartRenderer::draw_range(const Range& r) {
+    glBindBuffer(GL_ARRAY_BUFFER, scene_.vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, scene_.ibo);
+    const GLsizei stride = sizeof(tile57_gpu_vertex);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);              // aWorld
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, (void*)8);              // aPost
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, stride, (void*)16);             // aScamin
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 1, GL_UNSIGNED_BYTE, GL_FALSE, stride, (void*)20);     // aDispCat
+    glEnableVertexAttribArray(4);
+    glVertexAttribPointer(4, 1, GL_UNSIGNED_BYTE, GL_FALSE, stride, (void*)21);     // aMapAlign
+    float col[4] = {r.color[0] / 255.f, r.color[1] / 255.f, r.color[2] / 255.f, r.color[3] / 255.f};
+    glUniform4fv(u_color_, 1, col);
+    glDrawElements(GL_TRIANGLES, (GLsizei)r.count, GL_UNSIGNED_INT,
+                   (void*)(size_t)(r.first * sizeof(uint32_t)));
+}
+
+void ChartRenderer::draw_pat_range(const Range& r) {
+    if (r.pattern == 0xFFFFFFFFu || r.pattern >= scene_.pat_tex.size())
+        return;
+    glBindBuffer(GL_ARRAY_BUFFER, scene_.vbo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, scene_.ibo);
+    const GLsizei stride = sizeof(tile57_gpu_vertex);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);          // aWorld
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, stride, (void*)16);         // aScamin
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 1, GL_UNSIGNED_BYTE, GL_FALSE, stride, (void*)20); // aDispCat
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, scene_.pat_tex[r.pattern]);
+    glUniform1i(pu_cell_, 0);
+    float period[2] = {(float)scene_.pat_wh[r.pattern].first, (float)scene_.pat_wh[r.pattern].second};
+    glUniform2fv(pu_period_, 1, period);
+    glDrawElements(GL_TRIANGLES, (GLsizei)r.count, GL_UNSIGNED_INT,
+                   (void*)(size_t)(r.first * sizeof(uint32_t)));
+}
+
+void ChartRenderer::draw_quad_range(const Range& r) {
+    glBindBuffer(GL_ARRAY_BUFFER, scene_.qbo);
+    const GLsizei stride = sizeof(tile57_gpu_quad);
+    // tile57_gpu_quad: x,y(0) ox,oy(8) u,v(16) color[4](24) weight(28) scamin(32)
+    //                  disp_cat(36) map_align(37)
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);              // aWorld
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, (void*)8);              // aPost
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, (void*)16);             // aUV
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, (void*)24);      // aColor
+    glEnableVertexAttribArray(4);
+    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, stride, (void*)28);             // aWeight
+    glEnableVertexAttribArray(5);
+    glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, stride, (void*)32);             // aScamin
+    glEnableVertexAttribArray(6);
+    glVertexAttribPointer(6, 1, GL_UNSIGNED_BYTE, GL_FALSE, stride, (void*)36);     // aDispCat
+    glEnableVertexAttribArray(7);
+    glVertexAttribPointer(7, 1, GL_UNSIGNED_BYTE, GL_FALSE, stride, (void*)37);     // aMapAlign
+    glDrawArrays(GL_TRIANGLES, (GLint)r.first, (GLsizei)r.count);
+}
+
+void ChartRenderer::draw_scene(double scale_px, const double origin[2], uint32_t vw, uint32_t vh,
+                               Rot rot, float cull_denom, uint32_t cat_mask, Pass pass) {
+    if (!scene_.ok)
+        return;
+    const bool want_text = pass != Pass::kBase;
+    const bool want_geom = pass != Pass::kText;
+    const float sc = (float)scale_px;
+    const float vp[2] = {(float)vw, (float)vh};
+    const float org[2] = {(float)origin[0], (float)origin[1]};
+    const float rv[2] = {(float)rot.c, (float)rot.s};
+    const float cat[3] = {(cat_mask & 1) ? 1.f : 0.f, (cat_mask & 2) ? 1.f : 0.f,
+                          (cat_mask & 4) ? 1.f : 0.f};
+    auto set_xform = [&](uint32_t prog, int us, int uo, int uv, int ud, int ur, int uc) {
+        glUseProgram(prog);
+        glUniform1f(us, sc);
+        glUniform2fv(uo, 1, org);
+        glUniform2fv(uv, 1, vp);
+        glUniform1f(ud, cull_denom);
+        glUniform2fv(ur, 1, rv);
+        glUniform3fv(uc, 1, cat);
+    };
+    // Ranges are already sorted into S-52 paint order — walk them in order, switching
+    // pipeline per kind. draw_pass filters TEXT so the host's base/text split works.
+    for (const Range& r : scene_.ranges) {
+        const bool is_text = r.kind == TILE57_GPU_TEXT;
+        if (is_text ? !want_text : !want_geom)
+            continue;
+        switch (r.kind) {
+        case TILE57_GPU_AREA:
+        case TILE57_GPU_LINE:
+            if (r.pattern != 0xFFFFFFFFu) {
+                set_xform(prog_pat_, pu_scale_, pu_origin_, pu_vp_, pu_denom_, pu_rot_, pu_cat_);
+                draw_pat_range(r);
+            } else {
+                set_xform(prog_, u_scale_, u_origin_, u_vp_, u_denom_, u_rot_, u_cat_);
+                draw_range(r);
+            }
+            break;
+        case TILE57_GPU_PATTERN:
+            set_xform(prog_pat_, pu_scale_, pu_origin_, pu_vp_, pu_denom_, pu_rot_, pu_cat_);
+            draw_pat_range(r);
+            break;
+        case TILE57_GPU_SYMBOL:
+        case TILE57_GPU_SOUNDING:
+            set_xform(prog_sprite_, su_scale_, su_origin_, su_vp_, su_denom_, su_rot_, su_cat_);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, g_sprite.tex);
+            glUniform1i(su_atlas_, 0);
+            draw_quad_range(r);
+            break;
+        case TILE57_GPU_TEXT:
+            set_xform(prog_glyph_, gu_scale_, gu_origin_, gu_vp_, gu_denom_, gu_rot_, gu_cat_);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, g_glyph.tex);
+            glUniform1i(gu_atlas_, 0);
+            draw_quad_range(r);
+            break;
+        default:
+            break;
+        }
+    }
+    for (int i = 0; i < 8; ++i)
+        glDisableVertexAttribArray(i);
+}
 
 void ChartRenderer::composite_ss() {
     glUseProgram(prog_blit_);
@@ -1471,879 +752,12 @@ void ChartRenderer::composite_ss() {
     glUseProgram(0);
 }
 
-// No-op sinks: a portray pass that wants only SOME draw types still gets every
-// feature portrayed by the dep; unwanted types get a no-op (emit nothing). Note the
-// dep's drawText calls draw_text UNCONDITIONALLY (no null-check) — a null there
-// crashes — so a text-suppressing pass MUST supply a non-null no-op draw_text_str
-// (dep takes the SDF path and returns before that call).
-static void tr_noop_fill(void*, const tile57_feature*, const tile57_world_rings*, tile57_rgba,
-                         int) {}
-static void tr_noop_stroke(void*, const tile57_feature*, const tile57_world_rings*, float, float,
-                           float, tile57_rgba) {}
-static void tr_noop_symbol(void*, const tile57_feature*, tile57_world_point,
-                           const tile57_local_rings*, tile57_rgba, int, float, tile57_rot_align) {}
-static void tr_noop_sprite(void*, const tile57_feature*, const char*, size_t, tile57_world_point,
-                           float, tile57_rot_align, float, float) {}
-static void tr_noop_pattern(void*, const tile57_feature*, const char*, size_t,
-                            const tile57_world_rings*) {}
-static void tr_noop_text(void*, const tile57_feature*, tile57_world_point,
-                         const tile57_local_rings*, tile57_rgba, tile57_rgba, float,
-                         tile57_rot_align) {}
-static void tr_noop_text_str(void*, const tile57_feature*, tile57_world_point, float, float,
-                             const char*, size_t, float, float, tile57_rot_align, tile57_rgba,
-                             tile57_rgba) {}
-
-// GEOMETRY callbacks (per-tile portray): everything EXCEPT text/labels. Text is
-// portrayed separately for the whole view (fill_surface_cb_labels) so its declutter
-// grid spans the view — a per-tile grid dropped labels near tile seams (missing
-// lights). Symbols do not declutter (S-52 icon-allow-overlap) so they're safe per-tile.
-// Text is suppressed via a no-op draw_text_str (routes the dep to the cheap SDF path
-// and emits nothing — a null there would crash in emitText).
-static void fill_surface_cb(tile57_surface_cb& cb, ChartRenderer* self) {
-    cb.ctx = self;
-    cb.fill_area = tr_fill;
-    cb.stroke_line = tr_stroke;
-    cb.draw_symbol = tr_symbol;
-    if (g_atlas.ok) {
-        cb.draw_sprite = tr_sprite;
-        cb.draw_pattern = tr_pattern;
-    }
-    cb.draw_text = tr_noop_text;
-    cb.draw_text_str = tr_noop_text_str;
-}
-
-// LABEL callbacks (whole-view text pass): only text/glyph emit; the rest are no-ops
-// so the dep still resolves features + runs its declutter place() across the whole
-// view, giving one shared grid so labels near tile seams survive.
-static void fill_surface_cb_labels(tile57_surface_cb& cb, ChartRenderer* self) {
-    cb.ctx = self;
-    cb.fill_area = tr_noop_fill;
-    cb.stroke_line = tr_noop_stroke;
-    cb.draw_symbol = tr_noop_symbol;
-    cb.draw_sprite = tr_noop_sprite;
-    cb.draw_pattern = tr_noop_pattern;
-    cb.draw_text = tr_text; // tessellated fallback (decluttered)
-    if (g_glyph.ok)
-        cb.draw_text_str = tr_text_str; // SDF glyphs (decluttered)
-}
-
-// Order one kind's geometry by S-52 draw priority and record the runs.
-//
-// Everything we emit is GL_TRIANGLES, so a triangle (3 consecutive vertices) is the atom: it
-// belongs to exactly one feature and therefore one priority. A stable counting sort keeps
-// same-priority features in emission order (tile57's own order within a plane), so this
-// changes ACROSS-priority order only — which is the bug — and nothing else.
-template <class V>
-static void sort_by_plane(std::vector<V>& verts, std::vector<uint8_t>& planes,
-                          std::vector<ChartRenderer::Range>& out) {
-    out.clear();
-    if (verts.empty())
-        return;
-    // planes is per-vertex and in lockstep with verts; guard anyway rather than read past it.
-    planes.resize(verts.size(), 0);
-    const size_t tris = verts.size() / 3;
-
-    uint32_t count[256] = {0};
-    for (size_t t = 0; t < tris; ++t)
-        ++count[planes[t * 3]]; // a triangle's priority == its first vertex's
-
-    uint32_t start[256] = {0};
-    uint32_t acc = 0;
-    bool single = true, seen = false;
-    uint8_t only = 0;
-    for (int p = 0; p < 256; ++p) {
-        start[p] = acc;
-        if (count[p]) {
-            if (seen)
-                single = false;
-            else {
-                seen = true;
-                only = (uint8_t)p;
-            }
-            out.push_back({(uint8_t)p, acc * 3, count[p] * 3});
-            acc += count[p];
-        }
-    }
-    if (single) { // one priority: the buffer is already in order, skip the copy
-        (void)only;
-        return;
-    }
-    // Reusable scratch (per vertex type, per thread): a fresh vector here
-    // value-initialized (memset) its whole allocation on every call only to be
-    // fully overwritten by the scatter below -- visible in Instruments as
-    // _platform_memset under vector(size_t). Grow-only reuse skips both the
-    // allocation and the zeroing after warmup. thread_local, not static: tile
-    // portray runs on the worker thread while the label pass sorts on the GL
-    // thread. Every element in [0, verts.size()) is written by the scatter
-    // before being copied back, so no stale data can leak through.
-    thread_local std::vector<V> sorted;
-    if (sorted.size() < verts.size())
-        sorted.resize(verts.size());
-    uint32_t cursor[256];
-    std::memcpy(cursor, start, sizeof cursor);
-    for (size_t t = 0; t < tris; ++t) {
-        const uint8_t p = planes[t * 3];
-        const uint32_t dst = cursor[p]++;
-        sorted[dst * 3 + 0] = verts[t * 3 + 0];
-        sorted[dst * 3 + 1] = verts[t * 3 + 1];
-        sorted[dst * 3 + 2] = verts[t * 3 + 2];
-    }
-    std::copy_n(sorted.begin(), verts.size(), verts.begin());
-}
-
-// ---- tiled path: portray + cache + compose per tile (see chart_renderer.h) -----
-// The CPU half of one tile's portray: pmtiles decode + tessellation through the shared
-// sinks + the priority sort — everything except the VBO upload. Runs on the WORKER
-// thread (or on the GL thread via ensure_tile in TILE57_SYNC mode); either way it takes
-// portray_mu_, because the tile57 handle is not internally synchronized and the sinks
-// are the shared member scratch the GL thread's label portray also writes.
-void ChartRenderer::portray_tile_cpu(const TileJob& job, TileCpu& out) {
-    std::lock_guard<std::mutex> lock(portray_mu_);
-    double n = std::pow(2.0, job.z);
-    out.ref_wx = (double)job.x / n; // tile NW corner in web-mercator [0,1]
-    out.ref_wy = (double)job.y / n;
-
-    // Portray this tile through the shared tessellation sinks (reuse the member
-    // scratch vectors), referenced to the tile origin, decimated at the tile zoom.
-    area_.clear();
-    line_.clear();
-    symbol_.clear();
-    text_.clear();
-    sprite_.clear();
-    pattern_.clear();
-    glyph_.clear();
-    area_pl_.clear();
-    line_pl_.clear();
-    symbol_pl_.clear();
-    text_pl_.clear();
-    sprite_pl_.clear();
-    pattern_pl_.clear();
-    glyph_pl_.clear();
-    ref_wx_ = out.ref_wx;
-    ref_wy_ = out.ref_wy;
-    decimate_eps_ = 0.5 / (256.0 * n);
-    portray_px_per_world_ = 256.0 * n; // px/world at the TILE's native zoom
-    size_scale_ = job.m.size_scale > 0 ? job.m.size_scale : 1.0;
-    dbg_sprite_name_.clear();
-    tile57_surface_cb cb{};
-    fill_surface_cb(cb, this);
-    tile57_chart_tile_surface(chart_, (uint8_t)job.z, job.x, job.y, &job.m, &cb, nullptr);
-
-    // PAINT ORDER. Sort each kind's TRIANGLES by S-52 draw priority before upload, and record
-    // the priority runs. Drawing kind-by-kind (all sprites after all symbols) ignored `plane`
-    // entirely, which is why soundings painted over the symbols they belong under. Sorting
-    // here — once, at portray — keeps the per-frame path a plain sequence of draws over
-    // contiguous ranges, and costs nothing on a cache hit.
-    sort_by_plane(area_, area_pl_, out.ranges[0]);
-    sort_by_plane(line_, line_pl_, out.ranges[1]);
-    sort_by_plane(symbol_, symbol_pl_, out.ranges[2]);
-    sort_by_plane(text_, text_pl_, out.ranges[3]);
-    sort_by_plane(sprite_, sprite_pl_, out.ranges[4]);
-    sort_by_plane(pattern_, pattern_pl_, out.ranges[5]);
-    sort_by_plane(glyph_, glyph_pl_, out.ranges[6]);
-
-    // Hand the finished arrays to the result; the scratch re-fills from empty next
-    // portray (the .clear()s above reset the moved-from vectors).
-    out.area = std::move(area_);
-    out.line = std::move(line_);
-    out.symbol = std::move(symbol_);
-    out.text = std::move(text_);
-    out.sprite = std::move(sprite_);
-    out.pattern = std::move(pattern_);
-    out.glyph = std::move(glyph_);
-}
-
-// GL-THREAD half: upload each layer to its own VBO (empty layers keep vbo==0, n==0)
-// and insert into the tile cache.
-ChartRenderer::TileGeom& ChartRenderer::upload_tile(TileCpu&& c) {
-    TileGeom t{};
-    t.ref_wx = c.ref_wx;
-    t.ref_wy = c.ref_wy;
-    for (int i = 0; i < 7; ++i)
-        t.ranges[i] = std::move(c.ranges[i]);
-    struct LayerSrc {
-        const void* data;
-        size_t bytes;
-        uint32_t count;
-    };
-    const LayerSrc src[7] = {
-        {c.area.data(), c.area.size() * sizeof(Vtx), (uint32_t)c.area.size()},
-        {c.line.data(), c.line.size() * sizeof(LineVtx), (uint32_t)c.line.size()},
-        {c.symbol.data(), c.symbol.size() * sizeof(Vtx), (uint32_t)c.symbol.size()},
-        {c.text.data(), c.text.size() * sizeof(Vtx), (uint32_t)c.text.size()},
-        {c.sprite.data(), c.sprite.size() * sizeof(SpriteVtx), (uint32_t)c.sprite.size()},
-        {c.pattern.data(), c.pattern.size() * sizeof(PatVtx), (uint32_t)c.pattern.size()},
-        {c.glyph.data(), c.glyph.size() * sizeof(GlyphVtx), (uint32_t)c.glyph.size()},
-    };
-    for (int i = 0; i < 7; ++i) {
-        t.n[i] = src[i].count;
-        if (!t.n[i])
-            continue;
-        glGenBuffers(1, &t.vbo[i]);
-        glBindBuffer(GL_ARRAY_BUFFER, t.vbo[i]);
-        glBufferData(GL_ARRAY_BUFFER, src[i].bytes, src[i].data, GL_STATIC_DRAW);
-    }
-    return tiles_.emplace(c.key, std::move(t)).first->second;
-}
-
-// Synchronous portray + upload, ONCE, on the calling (GL) thread — the TILE57_SYNC
-// fallback path only; the normal path is enqueue_tile -> worker -> drain.
-ChartRenderer::TileGeom& ChartRenderer::ensure_tile(int z, uint32_t x, uint32_t y,
-                                                    const tile57_mariner& m) {
-    uint64_t key = tile_key(z, x, y);
-    auto it = tiles_.find(key);
-    if (it != tiles_.end())
-        return it->second;
-    TileJob job{z, x, y, portray_gen_, m, {}};
-    TileCpu out;
-    out.key = key;
-    portray_tile_cpu(job, out);
-    return upload_tile(std::move(out));
-}
-
-// Queue one tile's CPU portray to the worker (started lazily here). GL thread only.
-void ChartRenderer::enqueue_tile(int z, uint32_t x, uint32_t y, const tile57_mariner& m) {
-    TileJob job;
-    job.z = z;
-    job.x = x;
-    job.y = y;
-    job.m = m;
-    if (m.viewing_groups_off && m.viewing_groups_off_len) // pointee only outlives the CALL
-        job.vg_off.assign(m.viewing_groups_off, m.viewing_groups_off + m.viewing_groups_off_len);
-    inflight_.insert(tile_key(z, x, y));
-    {
-        std::lock_guard<std::mutex> lock(q_mu_);
-        job.gen = portray_gen_;
-        jobs_.push_back(std::move(job));
-        if (!worker_.joinable())
-            worker_ = std::thread([this] { worker_loop(); });
-    }
-    q_cv_.notify_one();
-}
-
-void ChartRenderer::worker_loop() {
-    for (;;) {
-        TileJob job;
-        bool stale;
-        {
-            std::unique_lock<std::mutex> lk(q_mu_);
-            q_cv_.wait(lk, [&] { return quit_ || !jobs_.empty(); });
-            if (quit_)
-                return;
-            job = std::move(jobs_.front());
-            jobs_.pop_front();
-            stale = job.gen != portray_gen_; // queued for a cache clear_tiles just killed
-        }
-        TileCpu out;
-        out.key = tile_key(job.z, job.x, job.y);
-        out.gen = job.gen;
-        if (!stale) {
-            // Re-point the mariner's deny-list at OUR copy (the original pointee may be
-            // long gone — tile57 only guarantees it for the call it was passed to).
-            job.m.viewing_groups_off = job.vg_off.empty() ? nullptr : job.vg_off.data();
-            job.m.viewing_groups_off_len = (uint32_t)job.vg_off.size();
-            portray_tile_cpu(job, out);
-        }
-        // A stale job still posts its (empty) result: the GL-thread drain is the ONLY
-        // place inflight_ entries are removed, so every queued key posts exactly one.
-        {
-            std::lock_guard<std::mutex> lk(q_mu_);
-            done_.push_back(std::move(out));
-        }
-        // Ask the host for a redraw so this freshly-portrayed tile gets uploaded and
-        // composited. Coalesced on the host side, so firing per tile is fine. on_progress_
-        // is set once before the worker starts, so this read races with nothing.
-        if (on_progress_)
-            on_progress_();
-    }
-}
-
-// GL thread, at the top of every render_tiled: upload whatever the worker finished.
-int ChartRenderer::drain_portrayed_tiles() {
-    std::vector<TileCpu> ready;
-    {
-        std::lock_guard<std::mutex> lock(q_mu_);
-        if (done_.empty())
-            return 0;
-        ready.swap(done_);
-    }
-    int uploaded = 0;
-    for (auto& c : ready) {
-        inflight_.erase(c.key);
-        // Drop results portrayed under settings the cache has since been cleared for
-        // (gen mismatch); the tile re-queues under the new generation next render.
-        if (c.gen != portray_gen_ || tiles_.count(c.key))
-            continue;
-        upload_tile(std::move(c));
-        ++uploaded;
-    }
-    return uploaded;
-}
-
-void ChartRenderer::stop_worker() {
-    {
-        std::lock_guard<std::mutex> lock(q_mu_);
-        quit_ = true;
-        jobs_.clear();
-    }
-    q_cv_.notify_all();
-    if (worker_.joinable())
-        worker_.join();
-    worker_ = std::thread(); // joinable() false again -> a later enqueue can restart
-    quit_ = false;
-    done_.clear();
-    inflight_.clear();
-}
-
-ChartRenderer::~ChartRenderer() { stop_worker(); }
-
-// The cell's compilation scale (1:N) + whether to impute SCAMIN from it. Both feed
-// feature_scamin, which runs at PORTRAY time and bakes the result into the vertex buffers —
-// so a change here invalidates every cached tile and the label cache with them.
-void ChartRenderer::set_super_scamin(bool on, double native_scale) {
-    if (on == super_scamin_ && native_scale == native_scale_)
-        return;
-    {
-        // feature_scamin reads these mid-portray — possibly on the worker right now.
-        // (The tile it is baking is doomed anyway: clear_tiles below bumps the
-        // generation and its result will be dropped — this lock just keeps the reads
-        // themselves well-defined.)
-        std::lock_guard<std::mutex> lock(portray_mu_);
-        super_scamin_ = on;
-        native_scale_ = native_scale;
-    }
-    clear_tiles();
-}
-
-void ChartRenderer::clear_tiles() {
-    {
-        // Queued/running portrays were requested for the cache being cleared: bump the
-        // generation (the worker skips mismatched jobs, drain drops mismatched results)
-        // and drop the not-yet-started jobs outright. A job portraying RIGHT NOW keeps
-        // its inflight_ entry until its stale result drains — so it cannot be re-queued
-        // early, and re-queues fresh right after.
-        std::lock_guard<std::mutex> lock(q_mu_);
-        ++portray_gen_;
-        for (auto& j : jobs_)
-            inflight_.erase(tile_key(j.z, j.x, j.y));
-        jobs_.clear();
-    }
-    for (auto& kv : tiles_)
-        for (int i = 0; i < 7; ++i)
-            if (kv.second.vbo[i])
-                glDeleteBuffers(1, &kv.second.vbo[i]);
-    tiles_.clear();
-    labels_valid_ = false; // labels share the portrayal that just changed (mariner/chart)
-}
-
-// Evict least-recently-drawn tiles (and free their VBOs) until at most `cap` remain.
-// Tiles drawn this frame carry the newest used_ms, so they sort last and are kept.
-void ChartRenderer::evict_lru(size_t cap) {
-    if (tiles_.size() <= cap)
-        return;
-    std::vector<std::pair<int64_t, uint64_t>> by_age; // (used_ms, key)
-    by_age.reserve(tiles_.size());
-    for (auto& kv : tiles_)
-        by_age.push_back({kv.second.used_ms, kv.first});
-    std::sort(by_age.begin(), by_age.end()); // oldest first
-    size_t to_drop = tiles_.size() - cap;
-    for (size_t i = 0; i < to_drop && i < by_age.size(); ++i) {
-        auto it = tiles_.find(by_age[i].second);
-        if (it == tiles_.end())
-            continue;
-        for (int j = 0; j < 7; ++j)
-            if (it->second.vbo[j])
-                glDeleteBuffers(1, &it->second.vbo[j]);
-        tiles_.erase(it);
-    }
-}
-
-// Compose the view from cached tiles: ensure each visible tile is portrayed (once)
-// then draw the cached tile VBOs in paint order, each with its own per-tile origin
-// uniform. Layer indices: 0 area, 1 line, 2 symbol, 3 text, 4 sprite, 5 pattern,
-// 6 glyph. Batched by program (one program bind per layer, inner loop over tiles).
-void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m, float cull_denom,
-                                 double vwx, double vwy, double scale_px, int z, uint32_t x0,
-                                 uint32_t x1, uint32_t y0, uint32_t y1, int budget,
-                                 int max_portray_ms, Rot rot) {
-    // Budget the per-frame portray: a big first-visit burst (many tiles entering on a
-    // zoom-out) is spread over frames instead of freezing one. Uncached tiles beyond
-    // the budget are skipped this frame and flagged pending; the plugin re-requests a
-    // redraw (tiles_pending()) so they finish — progressive fill, not a hitch. Cached
-    // tiles always draw. (unordered_map refs stay valid across inserts/erases of OTHER
-    // elements, so the pointers gathered here remain good through eviction + draw.)
-    const int kPortrayBudgetPerFrame = budget;
-    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::steady_clock::now().time_since_epoch())
-                      .count();
-    // The portray time budget must bound the FRAME, not this renderer: a quilt draws a
-    // dozen cells per paint and each has its own ChartRenderer, so a per-renderer 8 ms
-    // cap compounds into a ~100 ms pan frame — the budget never actually protected the
-    // frame. All cells render sequentially on the GL thread, so a shared pool works: a
-    // gap since the last render_tiled call longer than a frame's worth of compose marks
-    // a NEW paint and refills the pool; renders inside the same paint all burn from it.
-    static int64_t s_pool_start_ms = 0; // wall-clock start of this paint's portray pool
-    static int64_t s_last_call_ms = 0;  // last render_tiled entry, for paint detection
-    // Refill on a paint boundary (gap since the previous cell's render), and in any case
-    // once per ~frame period — back-to-back fast paints (120 Hz trackpad pan) can leave
-    // gaps under the threshold forever, which would starve portray completely.
-    if (now - s_last_call_ms > 12 || now - s_pool_start_ms >= 16)
-        s_pool_start_ms = now;
-    s_last_call_ms = now;
-    tiles_pending_ = false;
-    // ASYNC PORTRAY (the normal path): the worker thread does the CPU portray; here we
-    // upload whatever it finished since the last paint, and below, a cache miss just
-    // queues a job and draws the backdrop — the paint thread NEVER portrays, so a frame
-    // costs compose only, no matter how many tiles a zoom-out dumped on us. The budget
-    // machinery above only applies to the TILE57_SYNC fallback. The existing
-    // tiles_pending_ -> CallAfter(Refresh) loop keeps repainting (and thus draining)
-    // until the worker catches up.
-    static const bool sync_portray = std::getenv("TILE57_SYNC") != nullptr;
-    int portrayed = drain_portrayed_tiles();
-    std::vector<const TileGeom*> vis;
-    vis.reserve((size_t)(x1 - x0 + 1) * (y1 - y0 + 1));
-    for (uint32_t ty = y0; ty <= y1; ++ty)
-        for (uint32_t tx = x0; tx <= x1; ++tx) {
-            uint64_t key = tile_key(z, tx, ty);
-            auto it = tiles_.find(key);
-            if (it == tiles_.end() && !sync_portray) {
-                if (!inflight_.count(key)) // queue once; drained on a later paint
-                    enqueue_tile(z, tx, ty, m);
-                tiles_pending_ = true;
-                continue;
-            }
-            if (it == tiles_.end()) {
-                // TILE57_SYNC fallback. Two ways to defer an uncached tile to a later
-                // frame: a hard COUNT cap (used while MOVING, to keep the pan frame
-                // cheap) and a wall-clock TIME cap (used when SETTLED, where we want to
-                // finish the whole view in as few redraws as possible — ideally one —
-                // without freezing on a huge burst). Each deferral schedules exactly one
-                // more redraw (tiles_pending_).
-                bool over_count = portrayed >= kPortrayBudgetPerFrame;
-                // Time cap measured against the SHARED pool start (all cells in this
-                // paint), not this call's entry. No portrayed>0 floor: with 12 cells a
-                // one-tile-each floor is itself a 12-tile frame, and the backdrop +
-                // pending-refresh already guarantee the deferred tiles arrive.
-                bool over_time =
-                    max_portray_ms > 0 && (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                               std::chrono::steady_clock::now().time_since_epoch())
-                                               .count() -
-                                           s_pool_start_ms) >= max_portray_ms;
-                if (over_count || over_time) {
-                    tiles_pending_ = true;
-                    continue;
-                }
-                ensure_tile(z, tx, ty, m); // portray + insert (once, ever)
-                ++portrayed;
-                it = tiles_.find(key);
-                if (it == tiles_.end())
-                    continue; // (defensive; ensure_tile always inserts)
-            }
-            it->second.used_ms = now; // LRU: mark drawn this frame
-            const TileGeom& t = it->second;
-            for (int i = 0; i < 7; ++i)
-                if (t.n[i]) {
-                    vis.push_back(&t);
-                    break;
-                }
-        }
-    // BACKDROP (fixes the "gray tiles fill in top-down during zoom" flicker): OpenCPN
-    // disables its FBO chart cache on Retina, so there is no cached frame to show while a
-    // new zoom level's tiles portray — cold patches read as gray. Instead, when the target
-    // zoom still has cold tiles, draw the last FULLY-cached zoom's tiles underneath. They
-    // sit at the correct geo position (per-tile ref_wx/ref_wy origin) just at a coarser
-    // bake, so the view stays continuous (blurry -> sharp, map-style) instead of gray.
-    // Cached tiles only — the backdrop NEVER portrays (no added per-frame cost).
-    std::vector<const TileGeom*> back_vis;
-    if (tiles_pending_ && backdrop_z_ >= 0 && backdrop_z_ != z && std::abs(backdrop_z_ - z) <= 4) {
-        double half_wx, half_wy;
-        rotated_half_extent(w, h, scale_px, rot, half_wx, half_wy);
-        double nb = std::pow(2.0, backdrop_z_), maxb = nb - 1.0;
-        long bx0 = (long)std::floor(std::clamp((vwx - half_wx) * nb, 0.0, maxb));
-        long bx1 = (long)std::floor(std::clamp((vwx + half_wx) * nb, 0.0, maxb));
-        long by0 = (long)std::floor(std::clamp((vwy - half_wy) * nb, 0.0, maxb));
-        long by1 = (long)std::floor(std::clamp((vwy + half_wy) * nb, 0.0, maxb));
-        if ((bx1 - bx0 + 1) * (by1 - by0 + 1) <= 4096) {
-            for (long ty = by0; ty <= by1; ++ty)
-                for (long tx = bx0; tx <= bx1; ++tx) {
-                    auto it = tiles_.find(tile_key(backdrop_z_, (uint32_t)tx, (uint32_t)ty));
-                    if (it == tiles_.end())
-                        continue;             // draw cached backdrop tiles only
-                    it->second.used_ms = now; // keep them alive through eviction
-                    const TileGeom& t = it->second;
-                    for (int i = 0; i < 7; ++i)
-                        if (t.n[i]) {
-                            back_vis.push_back(&t);
-                            break;
-                        }
-                }
-        }
-    }
-
-    // TILE57_DEBUG: portraying is the expensive path — a healthy steady frame portrays 0
-    // tiles. This line printing every frame with the SAME z and a cache pinned at the LRU
-    // cap means eviction churn; alternating z values mean the zoom is flapping across a
-    // band boundary; see also the "cache CLEARED" line (mariner-hash flap) in render().
-    static const bool dbg_portray = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg_portray && portrayed > 0)
-        wxLogMessage("tile57 DBG: portrayed %d tiles z=%d range=%ux%u cache=%zu pending=%d",
-                     portrayed, z, x1 - x0 + 1, y1 - y0 + 1, tiles_.size(), (int)tiles_pending_);
-    // Bound cache memory: drop least-recently-drawn tiles (never this frame's target OR
-    // backdrop — both just stamped used_ms=now, so they sort last and survive; the gathered
-    // pointers stay valid across erases of OTHER elements).
-    evict_lru(512);
-    if (vis.empty() && back_vis.empty())
-        return;
-
-    const float vp[2] = {(float)w, (float)h};
-    const float rv[2] = {(float)rot.c, (float)rot.s};
-    // The tile's world reference point, placed on screen THROUGH the rotation. The shader
-    // rotates only the aWorld term, so pre-rotating the origin here completes the rotation
-    // about the viewport centre: screen = R*(world) + [C + R*(ref - view)].
-    auto set_origin = [&](int uloc, const TileGeom* t) {
-        const double ox = (t->ref_wx - vwx) * scale_px, oy = (t->ref_wy - vwy) * scale_px;
-        float o[2] = {(float)(ox * rot.c - oy * rot.s + w * 0.5),
-                      (float)(ox * rot.s + oy * rot.c + h * 0.5)};
-        glUniform2fv(uloc, 1, o);
-    };
-    // Whether a vertex's local px offset turns with the chart is now PER-VERTEX (aPostRot),
-    // because tile57 reports rotation-alignment per feature and one buffer mixes both kinds.
-    // `plane` selects ONE S-52 draw priority from each tile (< 0 = the whole buffer, for the
-    // unquilted/label paths that have no priority interleaving to resolve).
-    // `plane_lo..plane_hi` selects an INCLUSIVE run of S-52 draw priorities from each
-    // tile (lo < 0 = the whole buffer). A tile's vertices are sorted by priority at
-    // portray, so a run's ranges sit back-to-back in the VBO and collapse into ONE
-    // glDrawArrays per tile. Most of the per-draw cost on macOS is Apple's GL-on-Metal
-    // dispatch (gldUpdateDispatch / buildPipelineState in Instruments), so fewer,
-    // fatter draws is the whole game here.
-    auto layer = [&](const std::vector<const TileGeom*>& list, int prog, int u_scale, int u_vp,
-                     int u_denom, int u_origin, int u_rot, int idx,
-                     void (ChartRenderer::*drawfn)(uint32_t, uint32_t, uint32_t), uint32_t tex,
-                     int u_atlas, int plane_lo = -1, int plane_hi = -1) {
-        glUseProgram(prog);
-        glUniform1f(u_scale, (float)scale_px);
-        glUniform2fv(u_vp, 1, vp);
-        glUniform1f(u_denom, cull_denom);
-        glUniform2fv(u_rot, 1, rv);
-        if (tex) {
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, tex);
-            glUniform1i(u_atlas, 0);
-        }
-        for (auto* t : list)
-            if (t->n[idx]) {
-                if (plane_lo < 0) {
-                    set_origin(u_origin, t);
-                    (this->*drawfn)(t->vbo[idx], 0, t->n[idx]);
-                    continue;
-                }
-                // Merge every range inside the window: ranges are sorted by plane and
-                // adjacent in the buffer (offsets accumulate with no gaps), so the
-                // window is a single contiguous span.
-                uint32_t first = 0, count = 0;
-                for (const auto& r : t->ranges[idx])
-                    if ((int)r.plane >= plane_lo && (int)r.plane <= plane_hi) {
-                        if (!count)
-                            first = r.first;
-                        count += r.count;
-                    }
-                if (count) {
-                    set_origin(u_origin, t);
-                    (this->*drawfn)(t->vbo[idx], first, count);
-                }
-            }
-        if (tex)
-            glBindTexture(GL_TEXTURE_2D, 0);
-    };
-    // PAINT ORDER (S-52). tile57 tags every feature with its draw priority and leaves the
-    // order to us; batching purely by geometry KIND drew all sprites after all symbols, so a
-    // sounding painted over a symbol that outranks it. Walk PRIORITY as the outer key, and
-    // keep the kind order (fills, patterns, lines, symbols, sprites) within a priority — that
-    // is the S-52 rule: priority first, and inside one priority, area before line before
-    // point. Layers 3/6 (text/glyph) never populate for tiles — labels are a separate pass
-    // drawn last, above all of this.
-    //
-    // DRAW-CALL REDUCTION, order unchanged: `kinds_at` records which kinds exist at each
-    // priority across all tiles. Passes for (kind, priority) combinations nothing uses are
-    // skipped outright (the old loop bound the program and set five uniforms for every
-    // present priority x 5 kinds, hit or not), and a RUN of consecutive priorities occupied
-    // by a SINGLE kind is drawn as one merged pass — S-52 order only constrains draws
-    // between DIFFERENT kinds, and within one kind the priority order is preserved by the
-    // VBO's plane sort. Typical charts are long single-kind runs (fills low, lines mid,
-    // points high), so this collapses hundreds of draws into a handful.
-    auto draw_layers = [&](const std::vector<const TileGeom*>& list) {
-        if (list.empty())
-            return;
-        uint8_t kinds_at[256] = {0}; // bit k set: some tile draws kind k at this priority
-        for (const auto* t : list)
-            for (int k = 0; k < 7; ++k)
-                for (const auto& r : t->ranges[k])
-                    kinds_at[r.plane] |= (uint8_t)(1u << k);
-
-        for (int p = 0; p < 256;) {
-            const uint8_t kinds = kinds_at[p];
-            if (!kinds) {
-                ++p;
-                continue;
-            }
-            int pe = p;
-            if ((kinds & (kinds - 1)) == 0) // single kind here: extend the run
-                while (pe + 1 < 256 && (kinds_at[pe + 1] == 0 || kinds_at[pe + 1] == kinds))
-                    ++pe;
-            if (kinds & (1u << 0))
-                layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 0,
-                      &ChartRenderer::draw_range, 0, -1, p, pe); // area
-            if ((kinds & (1u << 5)) && g_atlas.ok)
-                layer(list, prog_pat_, pu_scale_, pu_vp_, pu_denom_, pu_origin_, pu_rot_, 5,
-                      &ChartRenderer::draw_pat_range, g_atlas.tex, pu_atlas_, p, pe); // pattern
-            if (kinds & (1u << 1))
-                layer(list, prog_line_, lu_scale_, lu_vp_, lu_denom_, lu_origin_, lu_rot_, 1,
-                      &ChartRenderer::draw_line_range, 0, -1, p, pe); // line (fragment dash)
-            if (kinds & (1u << 2))
-                layer(list, prog_, u_scale_, u_vp_, u_denom_, u_origin_, u_rot_, 2,
-                      &ChartRenderer::draw_range, 0, -1, p, pe); // symbol (tessellated)
-            if ((kinds & (1u << 4)) && g_atlas.ok)
-                layer(list, prog_sprite_, su_scale_, su_vp_, su_denom_, su_origin_, su_rot_, 4,
-                      &ChartRenderer::draw_sprite_range, g_atlas.tex, su_atlas_, p, pe); // sprite
-            p = pe + 1;
-        }
-    };
-    draw_layers(back_vis); // coarser fallback zoom underneath (only when target incomplete)
-    draw_layers(vis);      // target zoom on top
-    glUseProgram(0);
-
-    // Remember the newest zoom that is fully cached for the whole view — that is what a
-    // later (still-loading) zoom uses as its backdrop.
-    if (!tiles_pending_)
-        backdrop_z_ = z;
-}
-
-// Portray the WHOLE view's labels (one shared declutter grid → no per-tile seam drops)
-// into the view-label buffers, referenced to the view centre. Geometry callbacks are
-// no-ops (the dep still runs its declutter), but this is NOT cheap — it decodes the
-// pmtiles and decluttters every sounding, so render() calls it only on settle/view-change
-// (see the label cache there), not every frame.
-void ChartRenderer::portray_view_labels(double lon, double lat, double zoom, double rotation,
-                                        uint32_t w, uint32_t h, const tile57_mariner& m) {
-    // TILE57_DEBUG: the settings the LABEL cache is baked with. Soundings live in the TILE
-    // cache and labels here, so if the two are portrayed under different mariner states the
-    // chart shows a mixture — e.g. soundings converted to feet while the depth-contour values
-    // still read in metres. This line says which unit THIS cache was built with.
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg) {
-        static int last_unit = -1;
-        if ((int)m.depth_unit != last_unit) {
-            last_unit = (int)m.depth_unit;
-            wxLogMessage("tile57 LBL: portraying labels with depth_unit=%s safety=%.1f",
-                         m.depth_unit == TILE57_DEPTH_FEET ? "FEET" : "METRES", m.safety_contour);
-        }
-    }
-    // One portray at a time, whichever thread: the tile worker uses the same tile57
-    // handle and the same member scratch/params this pass writes below. Runs at settle
-    // only, so blocking briefly on an in-flight tile portray is fine.
-    std::lock_guard<std::mutex> portray_lock(portray_mu_);
-    text_.clear();
-    glyph_.clear();
-    lonlat_to_world(lon, lat, ref_wx_, ref_wy_); // labels referenced to view centre
-    decimate_eps_ = 0.5 / (256.0 * std::pow(2.0, zoom));
-    size_scale_ = m.size_scale > 0 ? m.size_scale : 1.0;
-    tile57_surface_cb cb{};
-    fill_surface_cb_labels(cb, this);
-    tile57_chart_surface(chart_, lon, lat, zoom, rotation, w, h, &m, &cb, nullptr);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_vtext_);
-    glBufferData(GL_ARRAY_BUFFER, text_.size() * sizeof(Vtx), text_.data(), GL_DYNAMIC_DRAW);
-    n_vtext_ = (uint32_t)text_.size();
-    glBindBuffer(GL_ARRAY_BUFFER, vbo_vglyph_);
-    glBufferData(GL_ARRAY_BUFFER, glyph_.size() * sizeof(GlyphVtx), glyph_.data(), GL_DYNAMIC_DRAW);
-    n_vglyph_ = (uint32_t)glyph_.size();
-}
-
-// Draw the view-label buffers. Their verts are relative to the world point the cache was
-// portrayed at (lbl_ref_*), so place that point on screen for the CURRENT view — the same
-// per-tile origin math as render_tiled. When the cache was portrayed THIS frame lbl_ref_*
-// == the view centre, so the origin is just (w/2, h/2); when reused across a pan/zoom the
-// labels ride the view correctly.
-void ChartRenderer::draw_view_labels(double scale_px, float cull_denom, uint32_t w, uint32_t h,
-                                     double vwx, double vwy, Rot rot) {
-    if (!n_vtext_ && !n_vglyph_)
-        return;
-    // Same pre-rotated origin as the tiles: place the cache's world reference point on
-    // screen THROUGH the rotation, so the labels ride the turning chart. Their glyph quads
-    // (aPost) are left unrotated by the shaders, so the text itself stays upright.
-    const double ox = (lbl_ref_wx_ - vwx) * scale_px, oy = (lbl_ref_wy_ - vwy) * scale_px;
-    const float origin[2] = {(float)(ox * rot.c - oy * rot.s + w * 0.5),
-                             (float)(ox * rot.s + oy * rot.c + h * 0.5)};
-    const float vp[2] = {(float)w, (float)h};
-    const float rv[2] = {(float)rot.c, (float)rot.s};
-    if (n_vtext_) { // tessellated fallback (usually empty)
-        glUseProgram(prog_);
-        glUniform1f(u_scale_, (float)scale_px);
-        glUniform2fv(u_origin_, 1, origin);
-        glUniform2fv(u_vp_, 1, vp);
-        glUniform1f(u_denom_, cull_denom);
-        glUniform2fv(u_rot_, 1, rv);
-        draw_range(vbo_vtext_, 0, n_vtext_);
-    }
-    if (n_vglyph_ && g_glyph.ok) {
-        glUseProgram(prog_glyph_);
-        glUniform1f(gu_scale_, (float)scale_px);
-        glUniform2fv(gu_origin_, 1, origin);
-        glUniform2fv(gu_vp_, 1, vp);
-        glUniform1f(gu_denom_, cull_denom);
-        glUniform2fv(gu_rot_, 1, rv);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, g_glyph.tex);
-        glUniform1i(gu_atlas_, 0);
-        draw_glyph_range(vbo_vglyph_, 0, n_vglyph_);
-        glBindTexture(GL_TEXTURE_2D, 0);
-    }
-    glUseProgram(0);
-}
-
-void ChartRenderer::draw_range(uint32_t vbo, uint32_t first, uint32_t count) {
-    if (!count)
-        return;
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)offsetof(Vtx, wx));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)offsetof(Vtx, px));
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vtx), (void*)offsetof(Vtx, r));
-    glEnableVertexAttribArray(3);
-    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)offsetof(Vtx, scamin));
-    glEnableVertexAttribArray(4);
-    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(Vtx), (void*)offsetof(Vtx, postrot));
-    glDrawArrays(GL_TRIANGLES, (GLint)first, (GLsizei)count);
-    glDisableVertexAttribArray(0);
-    glDisableVertexAttribArray(1);
-    glDisableVertexAttribArray(2);
-    glDisableVertexAttribArray(3);
-    glDisableVertexAttribArray(4);
-}
-
-// Draw one LineVtx buffer (prog_line_ must be bound + uniforms set by caller).
-void ChartRenderer::draw_line_range(uint32_t vbo, uint32_t first, uint32_t count) {
-    if (!count)
-        return;
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(LineVtx), (void*)offsetof(LineVtx, wx));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(LineVtx), (void*)offsetof(LineVtx, px));
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(LineVtx),
-                          (void*)offsetof(LineVtx, r));
-    glEnableVertexAttribArray(3);
-    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(LineVtx),
-                          (void*)offsetof(LineVtx, scamin));
-    glEnableVertexAttribArray(4);
-    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(LineVtx),
-                          (void*)offsetof(LineVtx, dist));
-    glEnableVertexAttribArray(5);
-    glVertexAttribPointer(5, 2, GL_FLOAT, GL_FALSE, sizeof(LineVtx),
-                          (void*)offsetof(LineVtx, dash_on));
-    glDrawArrays(GL_TRIANGLES, (GLint)first, (GLsizei)count);
-    glDisableVertexAttribArray(0);
-    glDisableVertexAttribArray(1);
-    glDisableVertexAttribArray(2);
-    glDisableVertexAttribArray(3);
-    glDisableVertexAttribArray(4);
-    glDisableVertexAttribArray(5);
-}
-
-// Draw one PatVtx buffer (prog_pat_ must be bound + uniforms/atlas set by caller).
-void ChartRenderer::draw_pat_range(uint32_t vbo, uint32_t first, uint32_t count) {
-    if (!count)
-        return;
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, wx));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, u0));
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(PatVtx), (void*)offsetof(PatVtx, tw));
-    glEnableVertexAttribArray(3);
-    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(PatVtx),
-                          (void*)offsetof(PatVtx, scamin));
-    glDrawArrays(GL_TRIANGLES, (GLint)first, (GLsizei)count);
-    glDisableVertexAttribArray(0);
-    glDisableVertexAttribArray(1);
-    glDisableVertexAttribArray(2);
-    glDisableVertexAttribArray(3);
-}
-
-// Draw one SpriteVtx buffer (prog_sprite_ bound + uniforms/atlas set by caller).
-void ChartRenderer::draw_sprite_range(uint32_t vbo, uint32_t first, uint32_t count) {
-    if (!count)
-        return;
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx),
-                          (void*)offsetof(SpriteVtx, wx));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx),
-                          (void*)offsetof(SpriteVtx, px));
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx),
-                          (void*)offsetof(SpriteVtx, u));
-    glEnableVertexAttribArray(3);
-    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx),
-                          (void*)offsetof(SpriteVtx, scamin));
-    glEnableVertexAttribArray(4);
-    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(SpriteVtx),
-                          (void*)offsetof(SpriteVtx, postrot));
-    glDrawArrays(GL_TRIANGLES, (GLint)first, (GLsizei)count);
-    glDisableVertexAttribArray(0);
-    glDisableVertexAttribArray(1);
-    glDisableVertexAttribArray(2);
-    glDisableVertexAttribArray(3);
-    glDisableVertexAttribArray(4);
-}
-
-// Draw one GlyphVtx buffer (prog_glyph_ bound + uniforms/atlas set by caller).
-void ChartRenderer::draw_glyph_range(uint32_t vbo, uint32_t first, uint32_t count) {
-    if (!count)
-        return;
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx),
-                          (void*)offsetof(GlyphVtx, wx));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx),
-                          (void*)offsetof(GlyphVtx, px));
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx), (void*)offsetof(GlyphVtx, u));
-    glEnableVertexAttribArray(3);
-    glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GlyphVtx),
-                          (void*)offsetof(GlyphVtx, r));
-    glEnableVertexAttribArray(4);
-    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx),
-                          (void*)offsetof(GlyphVtx, scamin));
-    glEnableVertexAttribArray(5);
-    glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, sizeof(GlyphVtx),
-                          (void*)offsetof(GlyphVtx, postrot));
-    glDrawArrays(GL_TRIANGLES, (GLint)first, (GLsizei)count);
-    glDisableVertexAttribArray(0);
-    glDisableVertexAttribArray(1);
-    glDisableVertexAttribArray(2);
-    glDisableVertexAttribArray(3);
-    glDisableVertexAttribArray(4);
-    glDisableVertexAttribArray(5);
-}
-
-void ChartRenderer::rotated_half_extent(uint32_t w, uint32_t h, double scale_px, Rot rot,
-                                        double& half_wx, double& half_wy, double slack) {
-    const double ac = std::min(1.0, std::fabs(rot.c) + slack);
-    const double as = std::min(1.0, std::fabs(rot.s) + slack);
-    half_wx = (w * ac + h * as) * 0.5 / scale_px;
-    half_wy = (w * as + h * ac) * 0.5 / scale_px;
-}
-
+// ---- render ----------------------------------------------------------------------
 void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint32_t h,
                            const tile57_mariner& m, Pass pass, bool stencil_clip,
                            double device_scale, double cull_bias, double rotation,
                            double scamin_display_denom, const int* patch_fb) {
+    (void)patch_fb; // one overscanned scene covers the whole view; the host's GL scissor clips it
     if (!chart_ || !ensure_gl())
         return;
     if (!have_range_) {
@@ -2358,30 +772,22 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
         b_e_ = info.east;
         b_n_ = info.north;
     }
-    // The tile cache is the ONLY geometry source. Invalidate it when the mariner
-    // settings change (they change the portrayal).
-    // TILE57_DEBUG: a cache clear is supposed to be RARE (an options change). If the
-    // log shows this line every frame the hash is flapping — portray cost then explodes
-    // to a full re-tessellation per frame, which is exactly what an 80%-in-ensure_tile
-    // profile looks like. The hash values identify WHICH two states it flaps between.
-    static const bool dbg_cache = std::getenv("TILE57_DEBUG") != nullptr;
+
+    double vwx, vwy;
+    lonlat_to_world(lon, lat, vwx, vwy);
+
+    // Rebuild the scene on a mariner change or when the view leaves the cached
+    // coverage / zoom band. Serialize with the object-query path (chart_ is not
+    // internally synchronized).
     uint64_t mh = mariner_hash(m);
-    if (mh != tiles_mhash_) {
-        if (dbg_cache && tiles_mhash_)
-            wxLogMessage("tile57 DBG: tile cache CLEARED (%zu tiles) mariner hash %llx -> %llx "
-                         "changed: %s",
-                         tiles_.size(), (unsigned long long)tiles_mhash_, (unsigned long long)mh,
-                         mariner_diff(tiles_m_, m).c_str());
-        clear_tiles();
-        tiles_mhash_ = mh;
-        tiles_m_ = m; // the settings this cache is portrayed under (for the diff above)
+    {
+        std::lock_guard<std::mutex> lk(portray_mu_);
+        if (mh != scene_mhash_ || !scene_covers(vwx, vwy, zoom)) {
+            build_scene(lon, lat, zoom, w, h, m);
+            scene_mhash_ = mh;
+        }
     }
 
-    // Motion (pan, zoom or TURN) this frame — used only to gate the offscreen supersample
-    // (AA when settled, direct during a gesture). Tiles are cached, so pan/zoom/rotate just
-    // re-transform them on the GPU; no re-portray is tied to motion. The rotation epsilon
-    // is coarse (~0.06°) so a dithering course-up heading doesn't read as perpetual motion
-    // and suppress AA forever.
     bool moving = (std::fabs(lon - last_lon_) > 1e-9 || std::fabs(lat - last_lat_) > 1e-9 ||
                    std::fabs(zoom - last_zoom_r_) > 1e-4 || std::fabs(rotation - last_rot_) > 1e-3);
     last_lon_ = lon;
@@ -2389,81 +795,30 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     last_zoom_r_ = zoom;
     last_rot_ = rotation;
 
-    // Per-frame transform: screen = R*(aWorld*uScale) + uOrigin + aPost (uOrigin per tile,
-    // pre-rotated on the CPU in set_origin). R is the view rotation about the viewport
-    // centre, in the y-DOWN screen frame — the same 2x2 OpenCPN's ViewPort::GetPixFromLL
-    // applies, so our geometry lands where the core's overlays (ownship, routes, AIS) do:
-    //   sx = ux*cos - uy*sin
-    //   sy = ux*sin + uy*cos
-    // (See the VS comment: OpenCPN rotates y-UP and flips y last, so this is the STANDARD
-    // matrix. Using its transpose here turned the chart the wrong way.)
     const Rot rot{std::cos(rotation), std::sin(rotation)};
-    double vwx, vwy;
-    lonlat_to_world(lon, lat, vwx, vwy);
-    // Projection at the PHYSICAL framebuffer: geographic zoom scaled by device_scale
-    // (a 2x HiDPI framebuffer gets 2x px per world unit; zoom — and the SCAMIN cull
-    // below — stays geographic).
-    double scale_px = 256.0 * std::pow(2.0, zoom) * device_scale; // px per world[0,1]
-    // TILE57_DEBUG: scale_px IS the shader's uScale, and the line shader turns a vertex's
-    // world arc length into screen px with it (vDistPx = aDist * uScale). The dash is cut
-    // against that in px, so scale_px and the DASH: line above must be the SAME px — if
-    // device_scale is 2 here but the dash arrived in logical px, every dash is half length.
-    {
-        static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-        static double last = -1;
-        if (dbg && scale_px != last) {
-            last = scale_px;
-            wxLogMessage("tile57 SCALE: zoom=%.2f device_scale=%.2f -> uScale=%.1f px/world "
-                         "(=%.2f px per tile-px at z%d)",
-                         zoom, device_scale, scale_px, scale_px / (256.0 * std::pow(2.0, zoom)),
-                         (int)std::floor(zoom));
-        }
-    }
-    // The SCAMIN cull denominator: the host's real display scale (1:N), compared per vertex
-    // against the feature's own SCAMIN — hide when the display is SMALLER scale (zoomed out)
-    // than the feature allows, i.e. denom > SCAMIN. 0 disables the cull entirely (OpenCPN's
-    // "Use SCAMIN" off), since 0 can never exceed any SCAMIN.
-    //
-    // cull_bias is 0 unless the user opted into extra thinning (TILE57_DECLUTTER): a bias
-    // of B levels is a factor 2^B on the denominator (one zoom level = one doubling of 1:N),
-    // applied to EVERY layer — labels included — so a feature's symbol and text always hide
-    // at the same zoom.
+    // px per world[0,1] at the PHYSICAL framebuffer (geographic zoom * HiDPI density).
+    double scale_px = 256.0 * std::pow(2.0, zoom) * device_scale;
+    // uOrigin folds in the live pan relative to the scene's build centre (kept small
+    // for f32): screen(worldRel=0) = vp_centre - R*((view - build)*scale).
+    double dcx = (vwx - scene_.cx) * scale_px;
+    double dcy = (vwy - scene_.cy) * scale_px;
+    double origin[2] = {w * 0.5 - (rot.c * dcx - rot.s * dcy),
+                        h * 0.5 - (rot.s * dcx + rot.c * dcy)};
+    // SCAMIN cull denominator (host display scale; 0 disables). cull_bias doublings.
     float cull_denom = (float)(scamin_display_denom * std::pow(2.0, cull_bias));
     if (scamin_display_denom <= 0.0)
-        cull_denom = 0.0f; // cull off — keep it exactly 0, don't let the bias resurrect it
+        cull_denom = 0.0f;
+    // Display-category mask (base always on; the engine also gates by disp_cat).
+    uint32_t cat_mask = (m.display_base ? 1u : 0u) | (m.display_standard ? 2u : 0u) |
+                        (m.display_other ? 4u : 0u);
 
-    // When OpenCPN can't use FBOs it clips quilt patches with the STENCIL buffer and
-    // passes b_use_stencil=true (arrives here as stencil_clip) on the base pass. Our
-    // offscreen-supersample composite clips with SCISSOR, which does NOT align with that
-    // stencil path — the composite renders black/misplaced, and because only SOME passes/
-    // cells hit the SS branch, the view alternates good<->black frame to frame == flicker.
-    // Latch it: once the host has ever asked for stencil clipping, this GL context has no
-    // usable FBO path, so force DIRECT rendering for every pass (== auto TILE57_NOSS). The
-    // text/unquilted passes pass stencil_clip=false, hence the sticky flag rather than a
-    // per-call test. (Machines WITH FBOs never set it, so they keep the AA path.)
     if (stencil_clip)
         host_stencil_mode_ = true;
-    // Render the scene into the SS FBO (at kSS× res), then composite it back
-    // down-sampled — antialiasing tessellated text/lines/area edges. Clip to the
-    // chart's quilt patch via OpenCPN's SCISSOR (SetClipRect) rather than a
-    // stencil EQUAL test (unreliable across GL backends).
-    // Antialias (offscreen supersample) only when the view is SETTLED (see the
-    // `moving` computation above). During pan/zoom motion render DIRECT into
-    // OpenCPN's cache so accelerated panning's partial strip updates align
-    // (offscreen compositing tore); AA pops in when motion stops. Text (a light,
-    // separate pass) always supersamples.
-    // TILE57_NOSS forces DIRECT rendering (no offscreen supersample FBO). Needed when
-    // OpenCPN itself reports "Framebuffer Objects unavailable" and falls back to stencil
-    // clipping (some NVIDIA/driver combos): our offscreen FBO + composite doesn't align
-    // with that no-FBO path and renders black. Direct render (as during pan) works.
     static const bool noss = std::getenv("TILE57_NOSS") != nullptr;
-    const int kSS = ss_factor(); // 1 on software GL (AA off); 2 on real GPUs
+    const int kSS = ss_factor();
     bool ss = !noss && !host_stencil_mode_ && kSS > 1 && ensure_ss((int)w, (int)h) &&
               !(moving && pass != Pass::kText);
-    // Saving GL state (glGetIntegerv/glIsEnabled) forces a driver sync — a GPU
-    // pipeline stall. It is only needed to RESTORE the FBO/viewport/scissor after
-    // an offscreen pass, so read it back only when supersampling; the direct
-    // motion path (the interactive hot path) skips all four reads.
+
     GLint prev_fbo = 0, prev_vp[4] = {0, 0, 0, 0}, prev_sc[4] = {0, 0, 0, 0};
     GLboolean sc_on = GL_FALSE;
     if (ss) {
@@ -2481,207 +836,45 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_DEPTH_TEST);
-    // Do NOT touch GL_STENCIL_TEST: the caller may have a quilt-patch mask enabled in it
-    // (see QuiltClip in tile57_chart.cpp). Disabling it here is what let every cell in the
-    // quilt paint the whole canvas. We never WRITE stencil (the mask is 0 there), so leaving
-    // the caller's test enabled is safe; when there is no clip it is simply off already.
 
-    // GEOMETRY (base pass / unquilted): compose from cached tiles. Pick the tile zoom
-    // (the baked band the view falls in) and the visible x/y range, clamped to the
-    // chart coverage so a zoomed-out view doesn't enumerate empty tiles. render_tiled
-    // portrays any missing tile (budgeted) and draws the cached tiles per-tile.
-    if (pass != Pass::kText) {
-        int z = (int)std::lround(zoom);
-        if (z < (int)min_zoom_)
-            z = (int)min_zoom_;
-        if (z > (int)max_zoom_)
-            z = (int)max_zoom_;
-        double n = std::pow(2.0, z);
-        double half_wx, half_wy;
-        rotated_half_extent(w, h, scale_px, rot, half_wx, half_wy);
-        double wminx = vwx - half_wx, wmaxx = vwx + half_wx;
-        double wminy = vwy - half_wy, wmaxy = vwy + half_wy;
-        // Narrow the range to the QUILT PATCH this chart owns, not the whole viewport. A
-        // quilted cell paints a sliver of the screen — often a thin strip — but the range
-        // above is the entire view, so every chart was portraying (pmtiles decode + gunzip +
-        // earcut) every tile under the WHOLE canvas and then letting the scissor throw nearly
-        // all of it away. With a dozen cells in a quilt that is the same ground tessellated a
-        // dozen times and discarded: the profile's 82% in ensure_tile. Tiles OUTSIDE the
-        // patch cannot appear on screen, so they need never be portrayed.
-        if (patch_fb) {
-            // Invert the shader's transform for the patch's 4 corners: it maps
-            //   screen = R*(world - view)*scale_px + centre  =>  world = view + R^-1*(screen - centre)/scale
-            // R^-1 is R transposed (a rotation), so this stays exact under a turned chart.
-            const double cx = w * 0.5, cy = h * 0.5;
-            const double xs[2] = {(double)patch_fb[0], (double)(patch_fb[0] + patch_fb[2])};
-            const double ys[2] = {(double)patch_fb[1], (double)(patch_fb[1] + patch_fb[3])};
-            double pminx = 1e30, pmaxx = -1e30, pminy = 1e30, pmaxy = -1e30;
-            for (int i = 0; i < 2; ++i)
-                for (int j = 0; j < 2; ++j) {
-                    const double sx = xs[i] - cx, sy = ys[j] - cy;
-                    const double ux = (sx * rot.c + sy * rot.s) / scale_px; // R^-1 * screen
-                    const double uy = (-sx * rot.s + sy * rot.c) / scale_px;
-                    pminx = std::min(pminx, vwx + ux);
-                    pmaxx = std::max(pmaxx, vwx + ux);
-                    pminy = std::min(pminy, vwy + uy);
-                    pmaxy = std::max(pmaxy, vwy + uy);
-                }
-            wminx = std::max(wminx, pminx);
-            wmaxx = std::min(wmaxx, pmaxx);
-            wminy = std::max(wminy, pminy);
-            wmaxy = std::min(wmaxy, pmaxy);
-        }
-        if (have_bounds_) {
-            double nwx, nwy, sex, sey;
-            lonlat_to_world(b_w_, b_n_, nwx, nwy); // NW -> (min x, min y)
-            lonlat_to_world(b_e_, b_s_, sex, sey); // SE -> (max x, max y)
-            wminx = std::max(wminx, nwx);
-            wmaxx = std::min(wmaxx, sex);
-            wminy = std::max(wminy, nwy);
-            wmaxy = std::min(wmaxy, sey);
-        }
-        double maxt = n - 1.0;
-        long x0 = (long)std::floor(std::clamp(wminx * n, 0.0, maxt));
-        long x1 = (long)std::floor(std::clamp(wmaxx * n, 0.0, maxt));
-        long y0 = (long)std::floor(std::clamp(wminy * n, 0.0, maxt));
-        long y1 = (long)std::floor(std::clamp(wmaxy * n, 0.0, maxt));
-        // WHILE MOVING: portray only a few cold tiles per frame (hard count cap) so the
-        // pan frame stays cheap — OpenCPN is already repainting every frame during the
-        // gesture, so tiles fill as you move. WHEN SETTLED: finish the whole view in as
-        // FEW redraws as possible (ideally one) — a count cap of 8 spread a cold view over
-        // ceil(N/8) frames, and because OpenCPN re-tessellates the world basemap on the CPU
-        // every full repaint, each of those frames was a fresh basemap re-tessellation ->
-        // the visible "rebuild"/flicker as tiles dribbled in. So lift the count cap and
-        // instead bound the frame by wall-clock: portray until ~30 ms elapses, defer the
-        // rest to one more redraw. Typical views finish in a single frame; a pathological
-        // burst still can't freeze.
-        // The backdrop (coarser cached zoom, drawn underneath) now hides any not-yet-portrayed
-        // target tiles, so motion no longer has to crawl at a 2-tile budget to avoid gray gaps.
-        // Give motion a WALL-CLOCK budget instead: portray as many as fit in ~8 ms/frame so the
-        // sharp layer catches up fast over the blur, while the time cap keeps the pan/zoom frame
-        // bounded. Settled: finish the view (up to 30 ms) in ideally one redraw.
-        int budget = moving ? 256 : 4096;
-        int portray_ms = moving ? 8 : 30;
-        if (wmaxx >= wminx && wmaxy >= wminy && (x1 - x0 + 1) * (y1 - y0 + 1) <= 4096)
-            render_tiled(w, h, m, cull_denom, vwx, vwy, scale_px, z, (uint32_t)x0, (uint32_t)x1,
-                         (uint32_t)y0, (uint32_t)y1, budget, portray_ms, rot);
-    }
-    // LABELS (text pass / unquilted): portray the whole view's text with a single
-    // declutter grid (per-tile grids dropped labels at seams — the missing lights). This
-    // portray (pmtiles decode + declutter + soundings) is the costliest per-frame item
-    // (~21% in Instruments), so cache it like the geometry tiles: portray only when the
-    // view has SETTLED at a new place/zoom (or nothing is cached yet); during a gesture
-    // reuse the cached buffers, drawn with a transformed origin. `moving` is unreliable
-    // here (the base pass already stamped last_*_ this frame), so detect settle from the
-    // previous TEXT frame (lbl_prev_*_).
-    if (pass != Pass::kBase) {
-        // A turn only invalidates the label cache's EXTENT and declutter, not its contents
-        // (see lbl_rot_): tolerate kLblRotSlack of drift before re-portraying, and portray
-        // the extent with that much slack built in so the tolerated angles stay covered.
-        constexpr double kLblRotSlack = 0.09; // ~5°
-        bool lbl_moving =
-            std::fabs(lon - lbl_prev_lon_) > 1e-9 || std::fabs(lat - lbl_prev_lat_) > 1e-9 ||
-            std::fabs(zoom - lbl_prev_zoom_) > 1e-4 || std::fabs(rotation - lbl_prev_rot_) > 1e-3;
-        lbl_prev_lon_ = lon;
-        lbl_prev_lat_ = lat;
-        lbl_prev_zoom_ = zoom;
-        lbl_prev_rot_ = rotation;
-        bool stale = std::fabs(lon - lbl_lon_) > 1e-9 || std::fabs(lat - lbl_lat_) > 1e-9 ||
-                     std::fabs(zoom - lbl_zoom_) > 1e-4 ||
-                     std::fabs(rotation - lbl_rot_) > kLblRotSlack;
-        labels_pending_ = false;
-        if (!labels_valid_ || (stale && !lbl_moving)) {
-            // Portray the ROTATED view's world AABB, widened by the rotation slack above so
-            // labels exist out to the corners a turn exposes. North-up (rotation exactly 0,
-            // the common case) takes no slack and portrays exactly the view, as before.
-            double lhx, lhy;
-            rotated_half_extent(w, h, scale_px, rot, lhx, lhy,
-                                rotation == 0.0 ? 0.0 : kLblRotSlack);
-            // CLAMP the zoom to the archive's baked range, exactly as the geometry pass does.
-            // tile57 picks its own tiles from the zoom we hand it, and a chart only HAS tiles
-            // inside [min_zoom, max_zoom] — so one step past a cell's max zoom it asked for a
-            // level that does not exist and emitted NOTHING, and every label on that chart
-            // vanished (contour values included) while the geometry kept drawing from the
-            // clamped level. Overzooming a cell is the normal case, not an edge case.
-            //
-            // Rescale the px extent by the same factor, so the clamped zoom still portrays the
-            // SAME piece of world: at zoom lz the view is 2^(lz - zoom) times fewer px across.
-            const double lz = std::clamp(zoom, (double)min_zoom_, (double)max_zoom_);
-            const double k = std::pow(2.0, lz - zoom);
-            portray_view_labels(lon, lat, lz, rotation,
-                                (uint32_t)std::lround(2.0 * lhx * scale_px * k),
-                                (uint32_t)std::lround(2.0 * lhy * scale_px * k), m);
-            lbl_lon_ = lon;
-            lbl_lat_ = lat;
-            lbl_zoom_ = zoom;
-            lbl_rot_ = rotation;
-            lbl_ref_wx_ = ref_wx_;
-            lbl_ref_wy_ = ref_wy_; // portray set these to the view centre
-            labels_valid_ = true;
-        } else if (stale) {
-            labels_pending_ =
-                true; // moved this frame — refresh once motion stops (ask for a redraw)
-        }
-        // Labels cull at the SAME denominator as every other layer. SCAMIN hides the
-        // whole feature — symbol and text together; when this pass used the unbiased
-        // denominator while the base pass biased its cull, features in the gap drew
-        // their TEXT with no SYMBOL. cull_denom == the true display denominator unless
-        // the user opted into TILE57_DECLUTTER, and then the bias moves both in lockstep.
-        draw_view_labels(scale_px, cull_denom, w, h, vwx, vwy, rot);
-    }
+    // The host renders a base pass (everything but text) then a text pass, so text
+    // lands above OpenCPN's own overlays; one scene serves both. uVp stays the PHYSICAL
+    // viewport even under supersample — the kSS× GL viewport does the upscale, and the
+    // screen-px transform (scale_px / origin) is in physical px.
+    draw_scene(scale_px, origin, w, h, rot, cull_denom, cat_mask, pass);
 
     if (ss) {
-        // Composite the supersampled texture over OpenCPN's FBO, down-sampled by
-        // the sampler's linear filter, clipped to the same patch scissor.
         glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
         glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
         if (sc_on)
             glScissor(prev_sc[0], prev_sc[1], prev_sc[2], prev_sc[3]);
         composite_ss();
     }
-    // Restore the GL state OpenCPN's fixed-function / gluTess clip-region drawing
-    // relies on. Leaving a vertex-attrib array enabled or a VBO bound makes its
-    // immediate-mode glDrawArrays read OUR buffer out of bounds → crash (seen on
-    // macOS: SetClipRegion → gluTessEndPolygon → glDrawArrays_IMM_Exec). Belt-and-
-    // suspenders: our draw_* helpers already disable their arrays, but tiles churn
-    // VBOs so we hard-reset here after every render.
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < 8; ++i)
         glDisableVertexAttribArray(i);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
     glUseProgram(0);
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg) {
-        static int cnt = 0;
-        if (cnt++ < 10) {
-            GLenum e = glGetError();
-            wxLogMessage("tile57 GL: pass=%d ss=%d tiles=%zu pending=%d prev_fbo=%d "
-                         "vp=[%d,%d,%d,%d] scissor_on=%d sc=[%d,%d,%d,%d] glerr=0x%x",
-                         (int)pass, ss ? 1 : 0, tiles_.size(), (int)tiles_pending_, prev_fbo,
-                         prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3], (int)sc_on, prev_sc[0],
-                         prev_sc[1], prev_sc[2], prev_sc[3], (unsigned)e);
-        }
-    }
 }
 
 void ChartRenderer::shutdown() {
-    stop_worker(); // no portray may be running when chart_ closes below
+    std::lock_guard<std::mutex> lk(portray_mu_);
+    free_scene();
+    scene_mhash_ = 0;
     gl_ready_ = false;
-    prog_ = prog_sprite_ = prog_pat_ = prog_glyph_ = prog_blit_ = 0;
+    prog_ = prog_pat_ = prog_sprite_ = prog_glyph_ = prog_blit_ = 0;
     vbo_quad_ = 0;
     have_range_ = false;
-    tiles_.clear();
-    tiles_mhash_ = 0; // GL buffers die with the context on shutdown
-    // Do NOT reset g_prog here: it is SHARED by every renderer, and shutdown() runs
-    // on every chart close — OpenCPN closes charts constantly while quilting, and
-    // resetting here forced a full 5-program shader recompile on the next paint of
-    // every surviving chart (a repeating multi-ms hitch, 2.2% of a whole profile).
-    // A genuinely dead context (plugin reload / context recreate) is detected in
-    // ensure_gl via glIsProgram and rebuilds there.
+    // Do NOT reset g_prog: it is shared by every renderer and shutdown() runs on every
+    // chart close (OpenCPN churns charts while quilting). A dead context is caught in
+    // ensure_gl via glIsProgram.
     if (chart_) {
         tile57_chart_close(chart_);
         chart_ = nullptr;
     }
 }
+
+ChartRenderer::~ChartRenderer() { shutdown(); }
 
 } // namespace t57
