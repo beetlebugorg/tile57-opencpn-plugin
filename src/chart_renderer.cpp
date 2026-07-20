@@ -192,7 +192,7 @@ FillTess tessellate_rings(const tile57_world_rings* p, double eps2) {
 }
 } // namespace
 
-void ChartRenderer::on_fill_area(const tile57_world_rings* p, tile57_rgba c, float scamin) {
+void ChartRenderer::on_fill_area(const tile57_world_rings* p, Rgba8 c, float scamin) {
     if (!p || p->n < 3)
         return;
     FillTess t = tessellate_rings(p, decimate_eps_ * decimate_eps_);
@@ -240,28 +240,12 @@ static float dash_cal_factor() {
 }
 
 void ChartRenderer::on_stroke_line(const tile57_world_rings* p, float width_px, float dash_on,
-                                   float dash_off, tile57_rgba c, float scamin) {
+                                   float dash_off, Rgba8 c, float scamin) {
     if (!p || p->n < 2)
         return;
     float hw = std::max(0.5f, width_px * 0.5f);
     dash_on *= dash_cal_factor();
     dash_off *= dash_cal_factor();
-    // TILE57_DEBUG: the ACTUAL numbers behind a dashed line, once per distinct pattern. The
-    // dash is cut in px (dash_on/off) against an arc length scaled by uScale, and those two
-    // must be the same px — so if the spacing is off, this line and the uScale/device_scale
-    // line in render() are what to compare. period_px is one full on+off cycle on screen.
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg && dash_on > 0.0f) {
-        static std::vector<std::array<float, 3>> seen;
-        std::array<float, 3> key{width_px, dash_on, dash_off};
-        if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
-            seen.push_back(key);
-            wxLogMessage("tile57 DASH: width=%.2fpx on=%.2fpx off=%.2fpx period=%.2fpx "
-                         "(size_scale=%.3f, TILE57_DASH=%.2f)",
-                         width_px, dash_on, dash_off, dash_on + dash_off, size_scale_,
-                         dash_cal_factor());
-        }
-    }
     // A sub-pixel dash cannot be resolved — it aliases into a grey smear that reads as a
     // washed-out solid line. Draw it as the solid line it is trying to be.
     if (dash_on < 1.0f || dash_off < 1.0f)
@@ -304,7 +288,7 @@ void ChartRenderer::on_stroke_line(const tile57_world_rings* p, float width_px, 
 // Anchored fill (symbol / text): tessellate the local (px) rings with an
 // even-odd rule (group rings by containment parity so counters cut out and no
 // triangles bridge between letters), anchored at one world point via aWorld.
-static void tess_local_even_odd(const tile57_local_rings* p, double awx, double awy, tile57_rgba c,
+static void tess_local_even_odd(const tile57_local_rings* p, double awx, double awy, Rgba8 c,
                                 float scamin, float postrot, std::vector<ChartRenderer::Vtx>& out) {
     if (!p || p->n < 3)
         return;
@@ -372,7 +356,7 @@ static void tess_local_even_odd(const tile57_local_rings* p, double awx, double 
 }
 
 void ChartRenderer::on_draw_symbol(tile57_world_point anchor, const tile57_local_rings* p,
-                                   tile57_rgba c, int even_odd, float stroke_w,
+                                   Rgba8 c, int even_odd, float stroke_w,
                                    tile57_rot_align align, float scamin) {
     (void)even_odd;
     double awx = anchor.x - ref_wx_, awy = anchor.y - ref_wy_;
@@ -410,7 +394,7 @@ void ChartRenderer::on_draw_symbol(tile57_world_point anchor, const tile57_local
 }
 
 void ChartRenderer::on_draw_text(tile57_world_point anchor, const tile57_local_rings* g,
-                                 tile57_rgba c, tile57_rgba /*halo*/, tile57_rot_align align,
+                                 Rgba8 c, Rgba8 /*halo*/, tile57_rot_align align,
                                  float scamin) {
     tess_local_even_odd(g, anchor.x - ref_wx_, anchor.y - ref_wy_, c, scamin,
                         (align == TILE57_ALIGN_MAP) ? 1.0f : 0.0f, text_);
@@ -681,32 +665,6 @@ void ChartRenderer::on_draw_sprite(const char* name, size_t len, tile57_world_po
     if (it == g_atlas.uv.end())
         return;
     const AtlasRect& r = it->second;
-    // TILE57_DEBUG: measure a complex linestyle's BRICK SPACING against its BRICK SIZE.
-    // The engine bakes the spacing into tile-local geometry (linestyle.drawComplexRun walks
-    // arc length in tile units), so it only lands at the intended screen spacing when the
-    // tile is drawn at its NATIVE zoom — but the brick's size (hw/hh) is constant SCREEN px.
-    // gap_px is the spacing the engine asked for, at the tile's own zoom; drawn_gap_px is
-    // what it becomes on screen at the CURRENT view zoom. If drawn_gap_px is at or below
-    // 2*hw the bricks touch or overlap — that is "too close together", measured.
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg && align == TILE57_ALIGN_MAP && portray_px_per_world_ > 0) {
-        std::string nm(name, len);
-        if (nm == dbg_sprite_name_) {
-            const double dx = anchor.x - dbg_sprite_ax_, dy = anchor.y - dbg_sprite_ay_;
-            const double gap = std::sqrt(dx * dx + dy * dy) * portray_px_per_world_;
-            static std::vector<std::string> seen;
-            if (gap > 1e-6 && std::find(seen.begin(), seen.end(), nm) == seen.end()) {
-                seen.push_back(nm);
-                wxLogMessage("tile57 BRICK: %s gap=%.1fpx size=%.1fx%.1fpx (2*hw=%.1f) -> %s "
-                             "[size_scale=%.3f, spacing baked at the tile's zoom]",
-                             nm.c_str(), gap, hw * 2, hh * 2, hw * 2,
-                             gap <= hw * 2 ? "OVERLAPPING" : "clear", size_scale_);
-            }
-        }
-        dbg_sprite_name_ = nm;
-        dbg_sprite_ax_ = anchor.x;
-        dbg_sprite_ay_ = anchor.y;
-    }
     float awx = (float)(anchor.x - ref_wx_), awy = (float)(anchor.y - ref_wy_);
     float rad = rot_deg * (float)kPi / 180.0f, c = std::cos(rad), s = std::sin(rad);
     // rot_deg is baked into the quad here (a portray-time constant); the VIEW rotation is
@@ -732,7 +690,7 @@ void ChartRenderer::on_draw_pattern(const char* name, size_t len, const tile57_w
         return;
     auto it = g_atlas.uv.find("pat:" + std::string(name, len));
     if (it == g_atlas.uv.end()) { // unknown pattern -> flat translucent tint
-        on_fill_area(p, tile57_rgba{160, 160, 170, 140}, scamin);
+        on_fill_area(p, Rgba8{160, 160, 170, 140}, scamin);
         return;
     }
     const AtlasRect& r = it->second;
@@ -756,7 +714,7 @@ void ChartRenderer::on_draw_pattern(const char* name, size_t len, const tile57_w
 // atlas is monochrome SDF, tinted by the text colour in the glyph shader.
 void ChartRenderer::on_draw_text_str(tile57_world_point anchor, float ox, float oy,
                                      const char* text, size_t len, float size_px, float rot_deg,
-                                     tile57_rot_align align, tile57_rgba c, tile57_rgba /*halo*/,
+                                     tile57_rot_align align, Rgba8 c, Rgba8 /*halo*/,
                                      float scamin) {
     if (!g_glyph.ok || size_px <= 0 || !text)
         return;
@@ -839,35 +797,36 @@ static float feat_scamin(void* c, const tile57_feature* f) {
 // Every draw call carries its feature's S-52 draw priority (`plane`). Record it before the
 // emit and tag the vertices it produced, so ensure_tile can sort the tile by paint order.
 // tile57 states the contract plainly: "the host owns final paint order".
-static void tr_fill(void* c, const tile57_feature* f, const tile57_world_rings* r, tile57_rgba col,
+static void tr_fill(void* c, const tile57_feature* f, const tile57_world_rings* r, tile57_color col,
                     int) {
     auto* s = static_cast<ChartRenderer*>(c);
     s->set_plane(f);
     const size_t n0 = s->area_.size();
-    s->on_fill_area(r, col, feat_scamin(c, f));
+    s->on_fill_area(r, tile57_unpack(col), feat_scamin(c, f));
     s->tag_plane(s->area_pl_, n0, s->area_.size());
 }
 static void tr_stroke(void* c, const tile57_feature* f, const tile57_world_rings* l, float w,
-                      float dash_on, float dash_off, tile57_rgba col) {
+                      float dash_on, float dash_off, tile57_color col) {
     auto* s = static_cast<ChartRenderer*>(c);
     s->set_plane(f);
     const size_t n0 = s->line_.size();
-    s->on_stroke_line(l, w, dash_on, dash_off, col, feat_scamin(c, f));
+    s->on_stroke_line(l, w, dash_on, dash_off, tile57_unpack(col), feat_scamin(c, f));
     s->tag_plane(s->line_pl_, n0, s->line_.size());
 }
 static void tr_symbol(void* c, const tile57_feature* f, tile57_world_point a,
-                      const tile57_local_rings* r, tile57_rgba col, int eo, float sw,
+                      const tile57_local_rings* r, tile57_color col, int eo, float sw,
                       tile57_rot_align align) {
     auto* s = static_cast<ChartRenderer*>(c);
     s->set_plane(f);
     const size_t n0 = s->symbol_.size();
-    s->on_draw_symbol(a, r, col, eo, sw, align, feat_scamin(c, f));
+    s->on_draw_symbol(a, r, tile57_unpack(col), eo, sw, align, feat_scamin(c, f));
     s->tag_plane(s->symbol_pl_, n0, s->symbol_.size());
 }
 static void tr_text(void* c, const tile57_feature* f, tile57_world_point a,
-                    const tile57_local_rings* g, tile57_rgba col, tile57_rgba halo, float,
-                    tile57_rot_align align) {
-    static_cast<ChartRenderer*>(c)->on_draw_text(a, g, col, halo, align, feat_scamin(c, f));
+                    const tile57_local_rings* g, tile57_color col, tile57_color halo, float,
+                    tile57_rot_align align, int32_t /*text_group*/) {
+    static_cast<ChartRenderer*>(c)->on_draw_text(a, g, tile57_unpack(col), tile57_unpack(halo),
+                                                 align, feat_scamin(c, f));
 }
 static void tr_sprite(void* c, const tile57_feature* f, const char* name, size_t len,
                       tile57_world_point a, float rot, tile57_rot_align align, float hw, float hh) {
@@ -887,28 +846,10 @@ static void tr_pattern(void* c, const tile57_feature* f, const char* name, size_
 }
 static void tr_text_str(void* c, const tile57_feature* f, tile57_world_point a, float ox, float oy,
                         const char* text, size_t len, float size, float rot, tile57_rot_align align,
-                        tile57_rgba col, tile57_rgba halo) {
-    // TILE57_DEBUG: what the engine actually hands us per label. A depth-contour value must
-    // arrive MAP-aligned with its contour's tangent; an ordinary label VIEWPORT + 0. If a
-    // contour label draws upright on screen, this line says whether the angle never arrived
-    // (engine/ABI) or arrived and we failed to apply it (this file). Capped — labels are many.
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    static int dbg_left = 40;
-    if (dbg && dbg_left > 0) {
-        --dbg_left;
-        // Print the POINTER, and build the string ourselves. The previous version passed a
-        // non-NUL-terminated char* to wxLogMessage's %.*s, and a Unicode wx build treats %s
-        // as wchar_t* — so "(null)" in that log may have been wx mangling a perfectly good
-        // pointer rather than tile57 handing us a null one. ptr=0x0 settles it.
-        const wxString t = text ? wxString::FromUTF8(text, len) : wxString::FromAscii("<NULL PTR>");
-        wxLogMessage(wxString::Format(
-            "tile57 TXT: cls=%s align=%s rot=%7.2f size=%.1f ox=%.1f oy=%.1f ptr=%p len=%zu [%s]",
-            wxString::FromAscii((f && f->cls) ? f->cls : "?"),
-            wxString::FromAscii(align == TILE57_ALIGN_MAP ? "MAP" : "VIEWPORT"), rot, size, ox, oy,
-            (const void*)text, len, t));
-    }
-    static_cast<ChartRenderer*>(c)->on_draw_text_str(a, ox, oy, text, len, size, rot, align, col,
-                                                     halo, feat_scamin(c, f));
+                        tile57_color col, tile57_color halo, int32_t /*text_group*/) {
+    static_cast<ChartRenderer*>(c)->on_draw_text_str(a, ox, oy, text, len, size, rot, align,
+                                                     tile57_unpack(col), tile57_unpack(halo),
+                                                     feat_scamin(c, f));
 }
 
 // ---- chart / GL lifecycle --------------------------------------------------
@@ -1476,22 +1417,23 @@ void ChartRenderer::composite_ss() {
 // dep's drawText calls draw_text UNCONDITIONALLY (no null-check) — a null there
 // crashes — so a text-suppressing pass MUST supply a non-null no-op draw_text_str
 // (dep takes the SDF path and returns before that call).
-static void tr_noop_fill(void*, const tile57_feature*, const tile57_world_rings*, tile57_rgba,
+static void tr_noop_fill(void*, const tile57_feature*, const tile57_world_rings*, tile57_color,
                          int) {}
 static void tr_noop_stroke(void*, const tile57_feature*, const tile57_world_rings*, float, float,
-                           float, tile57_rgba) {}
+                           float, tile57_color) {}
 static void tr_noop_symbol(void*, const tile57_feature*, tile57_world_point,
-                           const tile57_local_rings*, tile57_rgba, int, float, tile57_rot_align) {}
+                           const tile57_local_rings*, tile57_color, int, float,
+                           tile57_rot_align) {}
 static void tr_noop_sprite(void*, const tile57_feature*, const char*, size_t, tile57_world_point,
                            float, tile57_rot_align, float, float) {}
 static void tr_noop_pattern(void*, const tile57_feature*, const char*, size_t,
                             const tile57_world_rings*) {}
 static void tr_noop_text(void*, const tile57_feature*, tile57_world_point,
-                         const tile57_local_rings*, tile57_rgba, tile57_rgba, float,
-                         tile57_rot_align) {}
+                         const tile57_local_rings*, tile57_color, tile57_color, float,
+                         tile57_rot_align, int32_t) {}
 static void tr_noop_text_str(void*, const tile57_feature*, tile57_world_point, float, float,
-                             const char*, size_t, float, float, tile57_rot_align, tile57_rgba,
-                             tile57_rgba) {}
+                             const char*, size_t, float, float, tile57_rot_align, tile57_color,
+                             tile57_color, int32_t) {}
 
 // GEOMETRY callbacks (per-tile portray): everything EXCEPT text/labels. Text is
 // portrayed separately for the whole view (fill_surface_cb_labels) so its declutter
@@ -1622,9 +1564,7 @@ void ChartRenderer::portray_tile_cpu(const TileJob& job, TileCpu& out) {
     ref_wx_ = out.ref_wx;
     ref_wy_ = out.ref_wy;
     decimate_eps_ = 0.5 / (256.0 * n);
-    portray_px_per_world_ = 256.0 * n; // px/world at the TILE's native zoom
     size_scale_ = job.m.size_scale > 0 ? job.m.size_scale : 1.0;
-    dbg_sprite_name_.clear();
     tile57_surface_cb cb{};
     fill_surface_cb(cb, this);
     tile57_chart_tile_surface(chart_, (uint8_t)job.z, job.x, job.y, &job.m, &cb, nullptr);
@@ -2125,19 +2065,6 @@ void ChartRenderer::render_tiled(uint32_t w, uint32_t h, const tile57_mariner& m
 // (see the label cache there), not every frame.
 void ChartRenderer::portray_view_labels(double lon, double lat, double zoom, double rotation,
                                         uint32_t w, uint32_t h, const tile57_mariner& m) {
-    // TILE57_DEBUG: the settings the LABEL cache is baked with. Soundings live in the TILE
-    // cache and labels here, so if the two are portrayed under different mariner states the
-    // chart shows a mixture — e.g. soundings converted to feet while the depth-contour values
-    // still read in metres. This line says which unit THIS cache was built with.
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg) {
-        static int last_unit = -1;
-        if ((int)m.depth_unit != last_unit) {
-            last_unit = (int)m.depth_unit;
-            wxLogMessage("tile57 LBL: portraying labels with depth_unit=%s safety=%.1f",
-                         m.depth_unit == TILE57_DEPTH_FEET ? "FEET" : "METRES", m.safety_contour);
-        }
-    }
     // One portray at a time, whichever thread: the tile worker uses the same tile57
     // handle and the same member scratch/params this pass writes below. Runs at settle
     // only, so blocking briefly on an in-flight tile portray is fine.
@@ -2404,21 +2331,6 @@ void ChartRenderer::render(double lon, double lat, double zoom, uint32_t w, uint
     // (a 2x HiDPI framebuffer gets 2x px per world unit; zoom — and the SCAMIN cull
     // below — stays geographic).
     double scale_px = 256.0 * std::pow(2.0, zoom) * device_scale; // px per world[0,1]
-    // TILE57_DEBUG: scale_px IS the shader's uScale, and the line shader turns a vertex's
-    // world arc length into screen px with it (vDistPx = aDist * uScale). The dash is cut
-    // against that in px, so scale_px and the DASH: line above must be the SAME px — if
-    // device_scale is 2 here but the dash arrived in logical px, every dash is half length.
-    {
-        static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-        static double last = -1;
-        if (dbg && scale_px != last) {
-            last = scale_px;
-            wxLogMessage("tile57 SCALE: zoom=%.2f device_scale=%.2f -> uScale=%.1f px/world "
-                         "(=%.2f px per tile-px at z%d)",
-                         zoom, device_scale, scale_px, scale_px / (256.0 * std::pow(2.0, zoom)),
-                         (int)std::floor(zoom));
-        }
-    }
     // The SCAMIN cull denominator: the host's real display scale (1:N), compared per vertex
     // against the feature's own SCAMIN — hide when the display is SMALLER scale (zoomed out)
     // than the feature allows, i.e. denom > SCAMIN. 0 disables the cull entirely (OpenCPN's

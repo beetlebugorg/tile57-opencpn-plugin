@@ -29,6 +29,18 @@
 
 namespace t57 {
 
+// tile57 hands colours across the C ABI as a packed 0xRRGGBBAA scalar
+// (tile57_color) rather than a 4-byte struct, because passing a small struct by
+// value across callconv(.c) is miscompiled by zig on aarch64 in optimized
+// builds. Unpack once at the callback boundary and keep using channels inside.
+struct Rgba8 {
+    unsigned char r, g, b, a;
+};
+static inline Rgba8 tile57_unpack(tile57_color c) {
+    return Rgba8{(unsigned char)((c >> 24) & 0xFF), (unsigned char)((c >> 16) & 0xFF),
+                 (unsigned char)((c >> 8) & 0xFF), (unsigned char)(c & 0xFF)};
+}
+
 class ChartRenderer {
   public:
     enum class Pass { kBase, kText, kAll };
@@ -167,15 +179,6 @@ class ChartRenderer {
     double ref_wx_ = 0, ref_wy_ = 0;
     // Geometry decimation epsilon in world units (~half a portrayal pixel).
     double decimate_eps_ = 0;
-    // Screen px per world unit AT THE TILE'S OWN ZOOM (256 * 2^z). The engine bakes
-    // complex-linestyle brick SPACING into tile-local geometry, so it only lands at the
-    // intended screen spacing when the tile is drawn at its native zoom. TILE57_DEBUG uses
-    // this to report the spacing the engine actually asked for, in px.
-    double portray_px_per_world_ = 0;
-    // TILE57_DEBUG only: the previous sprite anchor, to measure brick spacing along a
-    // complex linestyle (consecutive same-name MAP-aligned sprites are one style's bricks).
-    std::string dbg_sprite_name_;
-    double dbg_sprite_ax_ = 0, dbg_sprite_ay_ = 0;
     // Display scale (mariner size_scale) — pattern tile screen size.
     double size_scale_ = 1.0;
     // Super-SCAMIN state (see feature_scamin / set_super_scamin): the cell's compilation
@@ -184,14 +187,14 @@ class ChartRenderer {
     bool super_scamin_ = true;
     // Callback handlers (world/local geometry -> Vtx). `align` is tile57's per-feature
     // rotation-alignment; it becomes the vertex's postrot (see the note above).
-    void on_fill_area(const tile57_world_rings* r, tile57_rgba c, float scamin);
+    void on_fill_area(const tile57_world_rings* r, Rgba8 c, float scamin);
     // dash_on/dash_off: the LS() pattern in px, as tile57 hands it over ((0,0) = solid).
     void on_stroke_line(const tile57_world_rings* l, float width_px, float dash_on, float dash_off,
-                        tile57_rgba c, float scamin);
-    void on_draw_symbol(tile57_world_point anchor, const tile57_local_rings* r, tile57_rgba c,
+                        Rgba8 c, float scamin);
+    void on_draw_symbol(tile57_world_point anchor, const tile57_local_rings* r, Rgba8 c,
                         int even_odd, float stroke_w, tile57_rot_align align, float scamin);
-    void on_draw_text(tile57_world_point anchor, const tile57_local_rings* g, tile57_rgba c,
-                      tile57_rgba halo, tile57_rot_align align, float scamin);
+    void on_draw_text(tile57_world_point anchor, const tile57_local_rings* g, Rgba8 c,
+                      Rgba8 halo, tile57_rot_align align, float scamin);
     void on_draw_sprite(const char* name, size_t len, tile57_world_point anchor, float rot_deg,
                         tile57_rot_align align, float half_w, float half_h, float scamin);
     void on_draw_pattern(const char* name, size_t len, const tile57_world_rings* rings,
@@ -201,7 +204,7 @@ class ChartRenderer {
     // contour's tangent), appending one quad per glyph to glyph_.
     void on_draw_text_str(tile57_world_point anchor, float ox, float oy, const char* text,
                           size_t len, float size_px, float rot_deg, tile57_rot_align align,
-                          tile57_rgba color, tile57_rgba halo, float scamin);
+                          Rgba8 color, Rgba8 halo, float scamin);
 
     // ---- tiled path (MapLibre model): portray+tessellate each baked tile ONCE,
     // cache its GPU geometry, compose the view from cached tiles. This is the only
