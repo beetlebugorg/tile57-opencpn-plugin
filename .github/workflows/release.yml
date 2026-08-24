@@ -4,9 +4,6 @@ name: Release
 # packaged as an OpenCPN import tarball, and the tarballs are attached to a
 # GitHub release with checksums. A tag carrying a suffix (`v0.2.0-rc1`)
 # publishes as a prerelease — use one to prove the matrix before the real tag.
-#
-# macOS is intentionally absent: cmake/Package.cmake has no macOS import-tarball
-# layout yet. CI builds the macOS dylib; releases do not ship it.
 on:
   push:
     tags: ["v*"]
@@ -163,8 +160,83 @@ jobs:
           path: build/tile57_pi_*.tar.gz
           if-no-files-found: error
 
+  # Mirrors the CI macos job: per-arch native builds against wxwidgets@3.2,
+  # retargeted to the OpenCPN.app extracted from the release pkg. See ci.yml
+  # for why each step is what it is.
+  macos:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    env:
+      OCPN_PKG_URL: https://github.com/OpenCPN/OpenCPN/releases/download/Release_5.14.0/OpenCPN_5.14.0-universal%2B17193.91f3b6743-14.pkg
+    steps:
+      - name: Checkout plugin (with submodules)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Checkout tile57 engine
+        uses: actions/checkout@v7
+        with:
+          repository: beetlebugorg/tile57
+          ref: ${{ env.TILE57_REF }}
+          submodules: recursive
+          path: tile57
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build tile57 (static lib)
+        working-directory: tile57
+        run: zig build lib -Doptimize=ReleaseFast
+
+      - name: Install build dependencies
+        run: brew install wxwidgets@3.2 glew
+
+      - name: Fetch OpenCPN.app (bundled wxWidgets to retarget against)
+        id: ocpn
+        run: |
+          curl -fsSL -o opencpn.pkg "$OCPN_PKG_URL"
+          pkgutil --expand-full opencpn.pkg ocpn-pkg
+          frameworks=$(find ocpn-pkg -type d -path "*/Contents/Frameworks" | head -1)
+          if [ -z "$frameworks" ]; then
+            echo "::error::no Contents/Frameworks in the expanded pkg"; find ocpn-pkg -maxdepth 3; exit 1
+          fi
+          echo "app=$PWD/$(dirname "$(dirname "$frameworks")")" >> "$GITHUB_OUTPUT"
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DTILE57_DIR="${{ github.workspace }}/tile57"
+          -DOCPN_APP="${{ steps.ocpn.outputs.app }}"
+          -DwxWidgets_CONFIG_EXECUTABLE="$(brew --prefix wxwidgets@3.2)/bin/wx-config-3.2"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Verify wxWidgets retarget
+        run: |
+          otool -L build/libtile57_pi.dylib | grep wx
+          if otool -L build/libtile57_pi.dylib | grep libwx | grep -v "@executable_path/../Frameworks/"; then
+            echo "::error::wxWidgets reference not retargeted to OpenCPN.app"; exit 1
+          fi
+
+      - name: Package (OpenCPN import tarball)
+        run: cmake --build build --target package
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-${{ runner.arch }}
+          path: build/tile57_pi_*.tar.gz
+          if-no-files-found: error
+
   release:
-    needs: [linux, windows]
+    needs: [linux, windows, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
