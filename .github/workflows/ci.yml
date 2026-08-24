@@ -212,18 +212,24 @@ jobs:
       - name: Install build dependencies
         run: brew install wxwidgets glew
 
-      # Extract OpenCPN.app from the release pkg without installing it. The
-      # POST_BUILD retarget (cmake/fix-macos-libs.sh) rebinds the plugin's wx
-      # references to the app's bundled copies and re-signs ad hoc — exactly what
-      # a local build against /Applications/OpenCPN.app does.
+      # Extract the app from the release pkg without installing it. The pkg's
+      # install-location IS /Applications/OpenCPN.app, so its payload root is the
+      # app's Contents/ directly — no directory named OpenCPN.app exists in the
+      # expanded tree. Locate Contents/Frameworks (the only part the retarget
+      # reads) and hand its app root to -DOCPN_APP; the POST_BUILD retarget
+      # (cmake/fix-macos-libs.sh) then rebinds the plugin's wx references to the
+      # app's bundled copies and re-signs ad hoc — exactly what a local build
+      # against /Applications/OpenCPN.app does.
       - name: Fetch OpenCPN.app (bundled wxWidgets to retarget against)
         id: ocpn
         run: |
           curl -fsSL -o opencpn.pkg "$OCPN_PKG_URL"
           pkgutil --expand-full opencpn.pkg ocpn-pkg
-          app=$(find ocpn-pkg -maxdepth 4 -name "OpenCPN.app" -type d | head -1)
-          if [ -z "$app" ]; then echo "::error::no OpenCPN.app in the expanded pkg"; exit 1; fi
-          echo "app=$PWD/$app" >> "$GITHUB_OUTPUT"
+          frameworks=$(find ocpn-pkg -type d -path "*/Contents/Frameworks" | head -1)
+          if [ -z "$frameworks" ]; then
+            echo "::error::no Contents/Frameworks in the expanded pkg"; find ocpn-pkg -maxdepth 3; exit 1
+          fi
+          echo "app=$PWD/$(dirname "$(dirname "$frameworks")")" >> "$GITHUB_OUTPUT"
 
       - name: Configure
         run: >
