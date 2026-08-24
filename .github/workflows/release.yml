@@ -5,8 +5,8 @@ name: Release
 # GitHub release with checksums. A tag carrying a suffix (`v0.2.0-rc1`)
 # publishes as a prerelease — use one to prove the matrix before the real tag.
 #
-# macOS is intentionally absent (it needs an OpenCPN.app to retarget wxWidgets
-# against, and cmake/Package.cmake has no macOS layout) — same standing as CI.
+# macOS is intentionally absent: cmake/Package.cmake has no macOS import-tarball
+# layout yet. CI builds the macOS dylib; releases do not ship it.
 on:
   push:
     tags: ["v*"]

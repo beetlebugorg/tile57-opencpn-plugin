@@ -6,8 +6,9 @@ on:
   pull_request:
 
 # The plugin links libtile57.a (the tile57 engine, built with Zig) and the vendored
-# OpenCPN api-19 submodule. macOS is intentionally NOT built here (it needs an
-# OpenCPN.app to retarget/re-sign wxWidgets against — see cmake/fix-macos-libs.sh).
+# OpenCPN api-19 submodule. macOS builds against a real OpenCPN.app extracted from
+# the release pkg, so the wxWidgets retarget/re-sign (cmake/fix-macos-libs.sh) runs
+# the same way it does on a user's machine.
 
 # The engine commit the plugin builds against. release.yml carries the same pin —
 # bump both together when tracking a new engine.
@@ -166,4 +167,86 @@ jobs:
         with:
           name: tile57_pi-windows
           path: build/tile57_pi_*.tar.gz
+          if-no-files-found: error
+
+  # A plugin must match the arch OpenCPN runs as, and the universal app runs
+  # natively on both — so build each arch on its own runner (Homebrew's wx and
+  # GLEW are host-arch). No package step: cmake/Package.cmake has no macOS
+  # layout, so the artifact is the bare retargeted dylib.
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    env:
+      # The release pkg whose bundled wxWidgets the plugin is retargeted to.
+      # Bump when tracking a new OpenCPN release.
+      OCPN_PKG_URL: https://github.com/OpenCPN/OpenCPN/releases/download/Release_5.14.0/OpenCPN_5.14.0-universal%2B17193.91f3b6743-14.pkg
+    steps:
+      - name: Checkout plugin (with submodules)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Checkout tile57 engine
+        uses: actions/checkout@v7
+        with:
+          repository: beetlebugorg/tile57
+          ref: ${{ env.TILE57_REF }}
+          submodules: recursive
+          path: tile57
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build tile57 (static lib)
+        working-directory: tile57
+        # `lib` builds ONLY libtile57.a (what the plugin links); the default step also
+        # builds the host-only bake CLI. Native build — tile57's macOS lib repack
+        # (macho-align.sh) can only run for the host arch.
+        run: zig build lib -Doptimize=ReleaseFast
+
+      - name: Install build dependencies
+        run: brew install wxwidgets glew
+
+      # Extract OpenCPN.app from the release pkg without installing it. The
+      # POST_BUILD retarget (cmake/fix-macos-libs.sh) rebinds the plugin's wx
+      # references to the app's bundled copies and re-signs ad hoc — exactly what
+      # a local build against /Applications/OpenCPN.app does.
+      - name: Fetch OpenCPN.app (bundled wxWidgets to retarget against)
+        id: ocpn
+        run: |
+          curl -fsSL -o opencpn.pkg "$OCPN_PKG_URL"
+          pkgutil --expand-full opencpn.pkg ocpn-pkg
+          app=$(find ocpn-pkg -maxdepth 4 -name "OpenCPN.app" -type d | head -1)
+          if [ -z "$app" ]; then echo "::error::no OpenCPN.app in the expanded pkg"; exit 1; fi
+          echo "app=$PWD/$app" >> "$GITHUB_OUTPUT"
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DTILE57_DIR="${{ github.workspace }}/tile57"
+          -DOCPN_APP="${{ steps.ocpn.outputs.app }}"
+
+      - name: Build
+        run: cmake --build build -j
+
+      # fix-macos-libs.sh warns-and-continues when the app is missing, so assert
+      # the retarget actually happened: every wx reference must point into the
+      # app bundle, or the plugin loads a second wxWidgets and never appears.
+      - name: Verify wxWidgets retarget
+        run: |
+          otool -L build/libtile57_pi.dylib | grep wx
+          if otool -L build/libtile57_pi.dylib | grep libwx | grep -v "@executable_path/../Frameworks/"; then
+            echo "::error::wxWidgets reference not retargeted to OpenCPN.app"; exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tile57_pi-macos-${{ runner.arch }}
+          path: build/libtile57_pi.dylib
           if-no-files-found: error
