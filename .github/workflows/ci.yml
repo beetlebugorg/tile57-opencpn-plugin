@@ -13,7 +13,7 @@ on:
 # The engine commit the plugin builds against. release.yml carries the same pin —
 # bump both together when tracking a new engine.
 env:
-  TILE57_REF: edcac132a2dad7cbb0144947bac7d1a838e7ee57
+  TILE57_REF: 1d7a7b7b183bebb69342d66f3b2daec5adb3fd8c
 
 jobs:
   format:
