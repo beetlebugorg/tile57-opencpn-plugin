@@ -1,0 +1,193 @@
+name: Release
+
+# Push a `vX.Y.Z` tag to cut a release: every supported target is built and
+# packaged as an OpenCPN import tarball, and the tarballs are attached to a
+# GitHub release with checksums. A tag carrying a suffix (`v0.2.0-rc1`)
+# publishes as a prerelease — use one to prove the matrix before the real tag.
+#
+# macOS is intentionally absent: cmake/Package.cmake has no macOS import-tarball
+# layout yet. CI builds the macOS dylib; releases do not ship it.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+# The engine commit the plugin builds against. ci.yml carries the same pin —
+# bump both together when tracking a new engine.
+env:
+  TILE57_REF: 60fd2c4f38e0e338b1d982c91686385d0e6c3d3a
+
+jobs:
+  # The version is written in two places and the tag is a third. A mismatch
+  # ships a tarball whose manifest contradicts its download, or a plugin that
+  # reports the wrong version inside OpenCPN.
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the tag against the version in the source
+        run: |
+          v="${GITHUB_REF_NAME#v}"; v="${v%%-*}"
+          grep -q "set(PKG_VERSION \"$v\"" cmake/Package.cmake
+          major="${v%%.*}"; minor="${v#*.}"; minor="${minor%%.*}"
+          grep -q "GetPlugInVersionMajor() override { return $major; }" src/tile57_pi.cpp
+          grep -q "GetPlugInVersionMinor() override { return $minor; }" src/tile57_pi.cpp
+
+  linux:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        # PKG_TARGET resolves to ubuntu-x86_64 / ubuntu-aarch64 (Package.cmake
+        # reads lsb_release + CMAKE_SYSTEM_PROCESSOR), so the tarball names
+        # never collide.
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout plugin (with submodules)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Checkout tile57 engine
+        uses: actions/checkout@v7
+        with:
+          repository: beetlebugorg/tile57
+          ref: ${{ env.TILE57_REF }}
+          submodules: recursive
+          path: tile57
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build tile57 (static lib)
+        working-directory: tile57
+        run: zig build lib -Doptimize=ReleaseFast
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake \
+            libwxgtk3.2-dev \
+            libglew-dev libgl1-mesa-dev libglu1-mesa-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTILE57_DIR="${{ github.workspace }}/tile57"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Package (OpenCPN import tarball)
+        run: cmake --build build --target package
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ runner.arch }}
+          path: build/tile57_pi_*.tar.gz
+          if-no-files-found: error
+
+  # Mirrors the CI windows job: tile57 built for the 32-bit MSVC ABI, wx/GLEW
+  # from OpenCPN's prebuilt cache (win_deps.bat), plugin built -A Win32.
+  windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - name: Checkout plugin (with submodules)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Checkout tile57 engine
+        uses: actions/checkout@v7
+        with:
+          repository: beetlebugorg/tile57
+          ref: ${{ env.TILE57_REF }}
+          submodules: recursive
+          path: tile57
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build tile57 (MSVC-ABI static lib)
+        working-directory: tile57
+        run: zig build lib -Dtarget=x86-windows-msvc -Doptimize=ReleaseFast
+
+      - name: Locate tile57 lib
+        id: t57lib
+        shell: bash
+        run: |
+          lib=$(find tile57/zig-out \( -name '*.lib' -o -name '*.a' \) 2>/dev/null | head -1)
+          if [ -z "$lib" ]; then echo "::error::no tile57 static lib produced by zig build lib"; exit 1; fi
+          echo "path=$lib" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout OpenCPN (prebuilt 32-bit wx + GLEW)
+        uses: actions/checkout@v7
+        with:
+          repository: OpenCPN/OpenCPN
+          path: OpenCPN
+          fetch-depth: 1
+
+      - name: Fetch Windows deps (OpenCPN prebuilt wx/GLEW)
+        working-directory: OpenCPN/buildwin
+        shell: cmd
+        run: win_deps.bat
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -A Win32
+          -DOCPN_SRC_DIR="${{ github.workspace }}/OpenCPN"
+          -DTILE57_DIR="${{ github.workspace }}/tile57"
+          -DTILE57_LIB="${{ steps.t57lib.outputs.path }}"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package (OpenCPN import tarball)
+        run: cmake --build build --target package --config Release
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x86
+          path: build/tile57_pi_*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && shasum -a 256 tile57_pi_* > SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # A release may already exist: cutting one from the web UI is what
+          # created the tag that started this run, and a re-run after a failed
+          # leg lands here twice. Attach to it instead of failing on the 422,
+          # and leave hand-written notes alone.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag \
+              ${{ contains(github.ref_name, '-') && '--prerelease' || '' }} \
+              dist/*
+          fi
