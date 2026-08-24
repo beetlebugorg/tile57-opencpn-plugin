@@ -1,36 +1,48 @@
-name: CI
+name: Release
 
+# Push a `vX.Y.Z` tag to cut a release: every supported target is built and
+# packaged as an OpenCPN import tarball, and the tarballs are attached to a
+# GitHub release with checksums. A tag carrying a suffix (`v0.2.0-rc1`)
+# publishes as a prerelease — use one to prove the matrix before the real tag.
+#
+# macOS is intentionally absent (it needs an OpenCPN.app to retarget wxWidgets
+# against, and cmake/Package.cmake has no macOS layout) — same standing as CI.
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags: ["v*"]
 
-# The plugin links libtile57.a (the tile57 engine, built with Zig) and the vendored
-# OpenCPN api-19 submodule. macOS is intentionally NOT built here (it needs an
-# OpenCPN.app to retarget/re-sign wxWidgets against — see cmake/fix-macos-libs.sh).
+permissions:
+  contents: write
 
-# The engine commit the plugin builds against. release.yml carries the same pin —
+# The engine commit the plugin builds against. ci.yml carries the same pin —
 # bump both together when tracking a new engine.
 env:
   TILE57_REF: edcac132a2dad7cbb0144947bac7d1a838e7ee57
 
 jobs:
-  format:
+  # The version is written in two places and the tag is a third. A mismatch
+  # ships a tarball whose manifest contradicts its download, or a plugin that
+  # reports the wrong version inside OpenCPN.
+  version:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Pin the exact clang-format so the check matches local formatting byte-for-byte
-      # (clang-format output drifts between versions). Only our own src/ — vendored
-      # third_party/ and the opencpn-libs submodule are left alone.
-      - name: clang-format check
-        run: pipx run --spec "clang-format==22.1.8" clang-format --dry-run --Werror src/*.cpp src/*.h
+      - name: Check the tag against the version in the source
+        run: |
+          v="${GITHUB_REF_NAME#v}"; v="${v%%-*}"
+          grep -q "set(PKG_VERSION \"$v\"" cmake/Package.cmake
+          major="${v%%.*}"; minor="${v#*.}"; minor="${minor%%.*}"
+          grep -q "GetPlugInVersionMajor() override { return $major; }" src/tile57_pi.cpp
+          grep -q "GetPlugInVersionMinor() override { return $minor; }" src/tile57_pi.cpp
 
   linux:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
-        # Both Linux release targets (release.yml builds the same pair), so a
-        # broken leg surfaces here instead of on tag day.
+        # PKG_TARGET resolves to ubuntu-x86_64 / ubuntu-aarch64 (Package.cmake
+        # reads lsb_release + CMAKE_SYSTEM_PROCESSOR), so the tarball names
+        # never collide.
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
@@ -54,8 +66,6 @@ jobs:
 
       - name: Build tile57 (static lib)
         working-directory: tile57
-        # `lib` builds ONLY libtile57.a (what the plugin links); the default step also
-        # builds the host-only bake CLI, which can't cross-compile.
         run: zig build lib -Doptimize=ReleaseFast
 
       - name: Install build dependencies
@@ -75,18 +85,16 @@ jobs:
       - name: Package (OpenCPN import tarball)
         run: cmake --build build --target package
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7
         with:
-          name: tile57_pi-linux-${{ runner.arch }}
+          name: linux-${{ runner.arch }}
           path: build/tile57_pi_*.tar.gz
           if-no-files-found: error
 
-  # Best-effort Windows build. The plugin links the vendored MSVC OpenCPN import lib
-  # (opencpn-libs/api-19/msvc-wx32/opencpn.lib), so tile57 must be built for the 32-bit
-  # MSVC ABI too, and wxWidgets/GLEW come from OpenCPN's prebuilt cache (win_deps.bat).
-  # A failure here does not block the Linux build.
+  # Mirrors the CI windows job: tile57 built for the 32-bit MSVC ABI, wx/GLEW
+  # from OpenCPN's prebuilt cache (win_deps.bat), plugin built -A Win32.
   windows:
+    needs: version
     runs-on: windows-latest
     steps:
       - name: Checkout plugin (with submodules)
@@ -103,7 +111,6 @@ jobs:
           path: tile57
 
       - name: Set up MSVC environment
-        # OpenCPN for Windows is a 32-bit process, so the plugin (and tile57) must be x86.
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x86
@@ -115,26 +122,16 @@ jobs:
 
       - name: Build tile57 (MSVC-ABI static lib)
         working-directory: tile57
-        # `lib` builds ONLY libtile57.a for the MSVC ABI; the default step also builds
-        # the host-only bake CLI, which can't cross-compile. x86 = 32-bit, to match OpenCPN.
         run: zig build lib -Dtarget=x86-windows-msvc -Doptimize=ReleaseFast
 
       - name: Locate tile57 lib
         id: t57lib
         shell: bash
         run: |
-          echo "=== tile57/zig-out tree ==="
-          find tile57/zig-out -type f 2>/dev/null | sort || echo "(no zig-out)"
-          # Search the whole zig-out, not just lib/, in case the archive lands elsewhere.
           lib=$(find tile57/zig-out \( -name '*.lib' -o -name '*.a' \) 2>/dev/null | head -1)
-          echo "Found tile57 lib: $lib"
           if [ -z "$lib" ]; then echo "::error::no tile57 static lib produced by zig build lib"; exit 1; fi
           echo "path=$lib" >> "$GITHUB_OUTPUT"
 
-      # wx + GLEW come from OpenCPN's own prebuilt 32-bit (vc14x) cache, not vcpkg:
-      # building wxWidgets from source in vcpkg took 15-25 min. win_deps.bat downloads
-      # the prebuilt binaries (self-installs wget/7z via choco) into OpenCPN/cache/,
-      # which is exactly what the plugin's OCPN_SRC_DIR discovery reads.
       - name: Checkout OpenCPN (prebuilt 32-bit wx + GLEW)
         uses: actions/checkout@v7
         with:
@@ -148,7 +145,6 @@ jobs:
         run: win_deps.bat
 
       - name: Configure
-        # -A Win32 keeps the plugin 32-bit to match OpenCPN's Windows process.
         run: >
           cmake -S . -B build -A Win32
           -DOCPN_SRC_DIR="${{ github.workspace }}/OpenCPN"
@@ -161,9 +157,37 @@ jobs:
       - name: Package (OpenCPN import tarball)
         run: cmake --build build --target package --config Release
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7
         with:
-          name: tile57_pi-windows
+          name: windows-x86
           path: build/tile57_pi_*.tar.gz
           if-no-files-found: error
+
+  release:
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && shasum -a 256 tile57_pi_* > SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # A release may already exist: cutting one from the web UI is what
+          # created the tag that started this run, and a re-run after a failed
+          # leg lands here twice. Attach to it instead of failing on the 422,
+          # and leave hand-written notes alone.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag \
+              ${{ contains(github.ref_name, '-') && '--prerelease' || '' }} \
+              dist/*
+          fi
