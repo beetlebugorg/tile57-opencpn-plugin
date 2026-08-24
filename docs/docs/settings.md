@@ -42,10 +42,9 @@ mariner fields:
 | Show M-object boundaries (meta) | `show_meta_bounds` |
 | Data quality (per canvas) | `data_quality` |
 
-Change any of these in OpenCPN and the chart re-portrays with the new settings on the
-next redraw. Because a change to depth contours or the palette changes the portrayal,
-the plugin invalidates its tile cache when the mariner settings change and re-bakes the
-visible tiles.
+Change any of these in OpenCPN and the chart re-portrays with the new settings: a
+settings change builds a new scene on the worker thread, and the next redraw adopts
+it. Display category and SCAMIN toggles apply in the vertex shader without a rebuild.
 
 :::note Light descriptions
 

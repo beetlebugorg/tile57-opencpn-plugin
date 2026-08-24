@@ -26,11 +26,10 @@ vector geometry on the GPU.
 
 The plugin installs a **first-class GL vector chart**, not an overlay. OpenCPN
 discovers a tile57 chart by file mask, adds it to the chart database, and drives it
-like any native chart — chart bar, quilting, and scale transitions included. When
-OpenCPN asks the chart to draw, the plugin runs tile57's S-52 portrayal, tessellates
-the resulting vector primitives, caches them as per-tile GPU buffers, and composes
-the view — the same "bake once, compose on demand" model a web MapLibre client uses,
-but inside OpenCPN's own render loop.
+like any native chart, chart bar, quilting, and scale transitions included. When
+OpenCPN asks the chart to draw, tile57 portrays the whole view into draw-ready GPU
+buffers, the plugin uploads them once, and every frame draws them under a per-frame
+transform inside OpenCPN's own render loop.
 
 ## How it fits together
 
@@ -41,10 +40,10 @@ but inside OpenCPN's own render loop.
   (bake up front)            │                              │
       ▼                      │   RenderRegionViewOnGL        │
  PMTiles bundles ────────────┤─────────────────────────────►│ S-52 portrayal
-      │                      │   per-tile portray + labels   │ (draw callbacks)
+      │                      │   whole-view GPU scene        │ (tile57_chart_gpu_scene)
       ▼                      │◄─────────────────────────────┤
-  chart directory            │   per-tile GPU cache          │
-      └──────────────────────►   composed on the GPU         │
+  chart directory            │   uploaded once, drawn per   │
+      └──────────────────────►   frame as a GPU transform    │
 ```
 
 Charts are baked to PMTiles bundles once (via the plugin's Build Charts dialog), then

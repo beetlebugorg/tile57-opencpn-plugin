@@ -174,7 +174,6 @@ class ChartTile57 : public PlugInChartBaseExtended {
 
     wxWindow* canvas_ = nullptr; // canvas for CallAfter(Refresh) (progressive-tile redraw)
     bool logged_entry_ = false;  // TILE57_DEBUG: render_pass gate report, once per chart
-    double dbg_zoom_ = 1e9;      // TILE57_DEBUG: last zoom THIS chart logged (see render_pass)
 
     wxDECLARE_DYNAMIC_CLASS(ChartTile57);
 };

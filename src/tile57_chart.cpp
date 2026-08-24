@@ -19,27 +19,19 @@
 #include <wx/log.h>
 #include <wx/timer.h>
 
-// Coalesced redraw scheduler shared by every ChartTile57 cell on the canvas. It exists to
-// keep progressive tile fill-in from defeating OpenCPN's accelerated pan.
+// Coalesced redraw scheduler shared by every ChartTile57 cell on the canvas.
 //
-// The old scheme asked for a full-frame Refresh(true) on EVERY frame while any tile or
-// label was pending. Refresh(true) invalidates the glChartCanvas FBO, so every pan frame
-// became a full re-render (the ~13% every-frame compose seen in profiles) and accelerated
-// pan — which would otherwise just blit the cached frame and re-render the thin exposed
-// margin — never engaged.
-//
-// Instead:
-//   - request_now(): the portray worker calls this (via ChartRenderer's progress callback)
-//     the moment it finishes a tile, so freshly-baked tiles are uploaded and composited
-//     promptly, including mid-pan. Coalesced by an atomic so a burst of completions queues
-//     at most one redraw. Thread-safe (CallAfter marshals onto the GUI thread).
-//   - arm_settle(): the render pass calls this while anything is still pending; it (re)arms
-//     a one-shot debounce that fires ~after motion/loading quiesces, catching the label
-//     re-portray on settle and any final tile drain. Restarted every pending frame, so
-//     during a continuous gesture it never fires — OpenCPN's own gesture paints + the
-//     worker's request_now carry the frame, and accelerated pan keeps the steady pan cheap.
-// Refresh(true) is still used (eraseBackground=true is load-bearing: it forces the real
-// render pass that portrays/drains, per the gray-tile fix) — just far less often.
+// Refresh(true) invalidates the glChartCanvas FBO and forces a full re-render, which
+// defeats OpenCPN's accelerated pan when it is requested every frame. So redraws are
+// requested only when there is something new to show:
+//   - request_now(): the scene builder calls this from its thread when a scene is
+//     ready to adopt. Coalesced by an atomic so a burst of completions queues one
+//     redraw. CallAfter marshals onto the GUI thread.
+//   - arm_settle(): the render pass calls this while a build is pending. It restarts
+//     a one-shot timer, so during a continuous gesture the timer never fires and one
+//     redraw follows once the view settles.
+// Refresh(true) rather than Refresh(false): only the erasing refresh runs the render
+// pass that adopts a finished scene.
 namespace {
 class RedrawScheduler : public wxEvtHandler {
   public:
@@ -902,12 +894,10 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
     // one more redraw so they fill in.
     if (!canvas_) {
         canvas_ = GetOCPNCanvasWindow();
-        // Construct the shared scheduler HERE, on the GUI thread, before any worker can
-        // start — its wxTimer/Bind must not be first-touched from the worker's request_now.
+        // Construct the shared scheduler on the GUI thread, before the build worker can
+        // call request_now: its wxTimer and Bind must be created here.
         RedrawScheduler::instance();
-        // The worker fires this the instant it finishes a tile (off the GUI thread);
-        // route it to the coalesced scheduler so the tile composites promptly without a
-        // per-frame full re-render. Reads canvas_ live; the worker is joined in
+        // Called from the build worker when a scene is ready. The worker is joined in
         // ~ChartRenderer before this object dies, so canvas_ is valid whenever it runs.
         renderer_.set_progress_callback([this] {
             if (canvas_)
@@ -984,27 +974,6 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
         mariner_.ignore_scamin
             ? 0.0
             : (vp.chart_scale > 0 ? (double)vp.chart_scale : scale_denom(zoom, vp.clat));
-    // TILE57_DEBUG: one line per zoom step exposing the HiDPI coupling — scamin_denom is what
-    // the SCAMIN shader test uses (a feature hides when scamin_denom > its SCAMIN; 0 = cull
-    // off). gate = fbw vs pix_width*csf shows why device_scale resolves to 1.
-    //
-    // dbg_zoom_ is PER CHART, deliberately: a quilt draws a dozen cells into one view, and a
-    // function-level static let only the first of them ever log — precisely hiding the thing
-    // worth seeing, which is WHICH CELLS paint a given view. `cell` is this chart's own
-    // compilation scale; when chart_scale > super_scamin, everything but the display-base
-    // skeleton of THIS cell should be gone from the screen.
-    static const bool dbg = std::getenv("TILE57_DEBUG") != nullptr;
-    if (dbg && pass != t57::ChartRenderer::Pass::kText && std::fabs(zoom - dbg_zoom_) > 0.02) {
-        dbg_zoom_ = zoom;
-        wxLogMessage("tile57 DBG: %s zoom=%.3f scamin_denom=1:%.0f (chart_scale=1:%.0f "
-                     "bias=%.2f) super_scamin=1:%.0f cell=1:%d dev_scale=%.2f csf=%.2f "
-                     "pixW=%d fbW=%u gate(pixW*csf)=%ld size_scale=%.3f ppm=%.5f",
-                     m_Name.c_str(), zoom, scamin_display_denom * std::pow(2.0, cull_bias),
-                     (double)vp.chart_scale, cull_bias,
-                     mariner_.ignore_scamin ? 0.0 : m_Chart_Scale * 2.0, m_Chart_Scale,
-                     device_scale, csf, vp.pix_width, fbw, std::lround(vp.pix_width * csf),
-                     mariner_.size_scale, ppm);
-    }
     // Chart rotation (course-up / head-up, and the manual rotate control). OpenCPN does NOT
     // rotate the framebuffer for us — a GL chart is handed the rotation and is expected to
     // draw its own geometry turned, exactly as the core's native vector charts do (see
@@ -1020,20 +989,6 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
         return e ? std::atof(e) * kPi / 180.0 : 1e9; // 1e9 sentinel: use the host's angle
     }();
     const double rot = rot_override < 1e8 ? rot_override : vp.rotation;
-    // What the host actually handed us. Logged on CHANGE (not per frame) so turning the
-    // chart prints one line: if rotation stays 0.0 while the ownship turns, the angle never
-    // reached the plugin and the transform below is not the problem.
-    if (dbg && pass != t57::ChartRenderer::Pass::kText) {
-        static double dbg_rot = 1e9;
-        if (std::fabs(vp.rotation - dbg_rot) > 0.002) {
-            dbg_rot = vp.rotation;
-            wxLogMessage("tile57 ROT: vp.rotation=%.4f rad (%.1f°) vp.skew=%.4f rad (%.1f°) "
-                         "applied=%.1f° rv_rect=[%d,%d %dx%d] pix=%dx%d fb=%ux%u",
-                         vp.rotation, vp.rotation * 180.0 / kPi, vp.skew, vp.skew * 180.0 / kPi,
-                         rot * 180.0 / kPi, vp.rv_rect.x, vp.rv_rect.y, vp.rv_rect.width,
-                         vp.rv_rect.height, vp.pix_width, vp.pix_height, fbw, fbh);
-        }
-    }
     // Clip to the patch this cell owns BEFORE drawing anything (see QuiltClip). Scoped, so
     // the GL clip state is restored however we leave.
     {
@@ -1067,13 +1022,8 @@ int ChartTile57::render_pass(const PlugIn_ViewPort& vp, t57::ChartRenderer::Pass
                              device_scale, cull_bias, rot, scamin_display_denom, patch_fb);
         }
     }
-    // Progressive fill WITHOUT defeating accelerated pan. Tiles that finish are composited
-    // by the worker's request_now (set up above), so we don't force a redraw here for them.
-    // We only (re)arm the settle debounce while anything is still pending — tiles OR a
-    // stale label re-portray deferred to settle (tiles_pending() covers both). During a
-    // continuous gesture this keeps getting pushed out and never fires, so accelerated pan
-    // stays engaged; ~60 ms after activity stops it fires one Refresh(true) to re-portray
-    // labels and drain any last tiles. (See RedrawScheduler above for the full rationale.)
+    // A finished scene asks for its own redraw through request_now. While a build is
+    // still pending, arm the settle timer so one redraw follows the end of a gesture.
     if (renderer_.tiles_pending() && canvas_)
         RedrawScheduler::instance().arm_settle(canvas_);
     if (pass != t57::ChartRenderer::Pass::kText)

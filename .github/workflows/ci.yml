@@ -31,6 +31,8 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: beetlebugorg/tile57
+          # The plugin tracks the GPU scene ABI on this branch.
+          ref: fix/maplibre-rendering
           submodules: recursive
           path: tile57
 
@@ -85,6 +87,8 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: beetlebugorg/tile57
+          # The plugin tracks the GPU scene ABI on this branch.
+          ref: fix/maplibre-rendering
           submodules: recursive
           path: tile57
 
