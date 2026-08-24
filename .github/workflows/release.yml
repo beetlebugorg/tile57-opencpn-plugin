@@ -17,7 +17,7 @@ permissions:
 # The engine commit the plugin builds against. ci.yml carries the same pin —
 # bump both together when tracking a new engine.
 env:
-  TILE57_REF: 1d7a7b7b183bebb69342d66f3b2daec5adb3fd8c
+  TILE57_REF: 60fd2c4f38e0e338b1d982c91686385d0e6c3d3a
 
 jobs:
   # The version is written in two places and the tag is a third. A mismatch
