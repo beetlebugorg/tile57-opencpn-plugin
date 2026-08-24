@@ -211,8 +211,9 @@ jobs:
 
       # wxwidgets@3.2, not wxwidgets: Homebrew's main formula is wx 3.3, but
       # OpenCPN.app bundles 3.2 and the retarget only rebinds within the same
-      # minor (wx keeps ABI across 3.2.x, not across 3.2 -> 3.3). The versioned
-      # keg is keg-only, so Configure names its wx-config explicitly.
+      # minor (wx keeps ABI across 3.2.x, not across 3.2 -> 3.3). The formula
+      # installs its script as wx-config-3.2 to avoid clashing with the main
+      # formula, so Configure names it explicitly.
       - name: Install build dependencies
         run: brew install wxwidgets@3.2 glew
 
@@ -240,7 +241,7 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           -DTILE57_DIR="${{ github.workspace }}/tile57"
           -DOCPN_APP="${{ steps.ocpn.outputs.app }}"
-          -DwxWidgets_CONFIG_EXECUTABLE="$(brew --prefix wxwidgets@3.2)/bin/wx-config"
+          -DwxWidgets_CONFIG_EXECUTABLE="$(brew --prefix wxwidgets@3.2)/bin/wx-config-3.2"
 
       - name: Build
         run: cmake --build build -j
