@@ -4,6 +4,10 @@ name: Release
 # packaged as an OpenCPN import tarball, and the tarballs are attached to a
 # GitHub release with checksums. A tag carrying a suffix (`v0.2.0-rc1`)
 # publishes as a prerelease — use one to prove the matrix before the real tag.
+#
+# The tag is the single source of the version: every leg passes it to the build
+# as PKG_VERSION, which stamps the tarball name, the manifest, and the version
+# the plugin reports to OpenCPN. Nothing in the source needs bumping to release.
 on:
   push:
     tags: ["v*"]
@@ -17,23 +21,7 @@ env:
   TILE57_REF: 60fd2c4f38e0e338b1d982c91686385d0e6c3d3a
 
 jobs:
-  # The version is written in two places and the tag is a third. A mismatch
-  # ships a tarball whose manifest contradicts its download, or a plugin that
-  # reports the wrong version inside OpenCPN.
-  version:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Check the tag against the version in the source
-        run: |
-          v="${GITHUB_REF_NAME#v}"; v="${v%%-*}"
-          grep -q "set(PKG_VERSION \"$v\"" cmake/Package.cmake
-          major="${v%%.*}"; minor="${v#*.}"; minor="${minor%%.*}"
-          grep -q "GetPlugInVersionMajor() override { return $major; }" src/tile57_pi.cpp
-          grep -q "GetPlugInVersionMinor() override { return $minor; }" src/tile57_pi.cpp
-
   linux:
-    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -74,7 +62,10 @@ jobs:
             libglew-dev libgl1-mesa-dev libglu1-mesa-dev
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTILE57_DIR="${{ github.workspace }}/tile57"
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DTILE57_DIR="${{ github.workspace }}/tile57"
+          -DPKG_VERSION="${GITHUB_REF_NAME#v}"
 
       - name: Build
         run: cmake --build build -j
@@ -91,7 +82,6 @@ jobs:
   # Mirrors the CI windows job: tile57 built for the 32-bit MSVC ABI, wx/GLEW
   # from OpenCPN's prebuilt cache (win_deps.bat), plugin built -A Win32.
   windows:
-    needs: version
     runs-on: windows-latest
     steps:
       - name: Checkout plugin (with submodules)
@@ -142,11 +132,14 @@ jobs:
         run: win_deps.bat
 
       - name: Configure
+        # bash, not the default pwsh: for the "${GITHUB_REF_NAME#v}" expansion.
+        shell: bash
         run: >
           cmake -S . -B build -A Win32
           -DOCPN_SRC_DIR="${{ github.workspace }}/OpenCPN"
           -DTILE57_DIR="${{ github.workspace }}/tile57"
           -DTILE57_LIB="${{ steps.t57lib.outputs.path }}"
+          -DPKG_VERSION="${GITHUB_REF_NAME#v}"
 
       - name: Build
         run: cmake --build build --config Release
@@ -164,7 +157,6 @@ jobs:
   # retargeted to the OpenCPN.app extracted from the release pkg. See ci.yml
   # for why each step is what it is.
   macos:
-    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -215,6 +207,7 @@ jobs:
           -DTILE57_DIR="${{ github.workspace }}/tile57"
           -DOCPN_APP="${{ steps.ocpn.outputs.app }}"
           -DwxWidgets_CONFIG_EXECUTABLE="$(brew --prefix wxwidgets@3.2)/bin/wx-config-3.2"
+          -DPKG_VERSION="${GITHUB_REF_NAME#v}"
 
       - name: Build
         run: cmake --build build -j

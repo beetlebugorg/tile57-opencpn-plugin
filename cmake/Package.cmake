@@ -20,7 +20,8 @@
 # host's arch string (arm64, or x86_64 — what a Rosetta-translated OpenCPN also
 # reports), so the two per-arch tarballs land on the right hosts.
 
-set(PKG_VERSION "0.1.0" CACHE STRING "Plugin package version, as it appears in the manifest")
+# PKG_VERSION comes from CMakeLists.txt: the git tag on release builds, a
+# `git describe` fallback otherwise.
 
 # Distinguishes the macOS tarballs: their PKG_TARGET is the fixed "darwin-wx32",
 # unlike Linux, where the arch is already inside PKG_TARGET.
