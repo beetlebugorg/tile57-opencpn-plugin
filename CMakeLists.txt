@@ -18,6 +18,34 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # clangd reads build/compile_commands.json for editor diagnostics.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# The plugin version. The git tag is the single source: release builds pass
+# -DPKG_VERSION=<tag without the v> (release.yml derives it from the tag that
+# triggered the run), and it flows into the tarball name, the manifest, and the
+# version the plugin reports to OpenCPN. Unpassed (dev and CI) builds fall back
+# to `git describe`, so a build names the tag or commit it came from, or 0.0.0
+# with no git history at all.
+set(PKG_VERSION "" CACHE STRING "Plugin version; release builds pass the tag version")
+if(NOT PKG_VERSION)
+  find_package(Git QUIET)
+  if(GIT_FOUND)
+    execute_process(COMMAND ${GIT_EXECUTABLE} -C ${CMAKE_SOURCE_DIR} describe --tags --always
+                    OUTPUT_VARIABLE PKG_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  endif()
+  if(NOT PKG_VERSION)
+    set(PKG_VERSION "0.0.0")
+  endif()
+  string(REGEX REPLACE "^v" "" PKG_VERSION "${PKG_VERSION}")
+endif()
+# GetPlugInVersionMajor/Minor are ints; a describe fallback that is a bare
+# commit hash reports 0.0.
+if(PKG_VERSION MATCHES "^([0-9]+)\\.([0-9]+)")
+  set(PKG_VERSION_MAJOR ${CMAKE_MATCH_1})
+  set(PKG_VERSION_MINOR ${CMAKE_MATCH_2})
+else()
+  set(PKG_VERSION_MAJOR 0)
+  set(PKG_VERSION_MINOR 0)
+endif()
+
 # Static CRT on Windows. OpenCPN bundles its own msvcp140/vcruntime140 (14.12, from
 # VS2017) in its program directory and loads them at startup, so they are already in
 # the process by the time a plugin is loaded — a plugin linked against the shared CRT
@@ -162,7 +190,8 @@ add_library(tile57_pi MODULE
 target_include_directories(tile57_pi PRIVATE
   ${CMAKE_SOURCE_DIR}/src
   ${TILE57_INCLUDE} ${GLEW_INCLUDE_DIR})
-target_compile_definitions(tile57_pi PRIVATE ${wxWidgets_DEFINITIONS})
+target_compile_definitions(tile57_pi PRIVATE ${wxWidgets_DEFINITIONS}
+  PKG_VERSION_MAJOR=${PKG_VERSION_MAJOR} PKG_VERSION_MINOR=${PKG_VERSION_MINOR})
 
 if(WIN32)
   # ocpn_plugin.h expands DECL_EXP to __declspec(dllexport) only when __WXMSW__ is

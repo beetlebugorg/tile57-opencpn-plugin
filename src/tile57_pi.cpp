@@ -102,8 +102,9 @@ class Tile57Plugin : public opencpn_plugin_119 {
     // soundings, lights, light descriptions, display category) that the chart mirrors
     // into tile57's mariner settings. See CMakeLists.
     int GetAPIVersionMinor() override { return 19; }
-    int GetPlugInVersionMajor() override { return 0; }
-    int GetPlugInVersionMinor() override { return 1; }
+    // From the build: the git tag on release builds, 0.0 otherwise (CMakeLists).
+    int GetPlugInVersionMajor() override { return PKG_VERSION_MAJOR; }
+    int GetPlugInVersionMinor() override { return PKG_VERSION_MINOR; }
     wxBitmap* GetPlugInBitmap() override {
         static wxBitmap b(32, 32);
         return &b;
