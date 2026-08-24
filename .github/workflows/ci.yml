@@ -171,8 +171,7 @@ jobs:
 
   # A plugin must match the arch OpenCPN runs as, and the universal app runs
   # natively on both — so build each arch on its own runner (Homebrew's wx and
-  # GLEW are host-arch). No package step: cmake/Package.cmake has no macOS
-  # layout, so the artifact is the bare retargeted dylib.
+  # GLEW are host-arch).
   macos:
     strategy:
       fail-fast: false
@@ -256,9 +255,12 @@ jobs:
             echo "::error::wxWidgets reference not retargeted to OpenCPN.app"; exit 1
           fi
 
+      - name: Package (OpenCPN import tarball)
+        run: cmake --build build --target package
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: tile57_pi-macos-${{ runner.arch }}
-          path: build/libtile57_pi.dylib
+          path: build/tile57_pi_*.tar.gz
           if-no-files-found: error
