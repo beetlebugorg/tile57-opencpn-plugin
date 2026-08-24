@@ -6,122 +6,116 @@ sidebar_position: 5
 
 # Rendering
 
-The renderer (`src/chart_renderer.cpp`) turns tile57's S-52 portrayal into GPU
-geometry and draws it inside OpenCPN's render loop. The model mirrors a web MapLibre
-client: **portray and tessellate each tile once, cache it, and compose the view from
-cached tiles** — so panning and zooming are GPU transforms, not re-portrayals.
+The renderer draws tile57's draw-ready GPU scene inside OpenCPN's render loop. tile57
+portrays a whole view once into vertex, index and quad buffers that are already
+tessellated, already in S-52 paint order, and already split into ranges that each
+draw with one pipeline. The plugin uploads those buffers and draws them under a
+per-frame transform. A pan, zoom or rotation is a uniform change; the scene is
+rebuilt only when the view leaves its coverage or the mariner settings change.
 
-## Two passes
+The code is split by responsibility:
 
-OpenCPN calls the chart twice per frame for a quilted vector chart, and the renderer
-maps each onto a `Pass`:
+| File | Role |
+| --- | --- |
+| `src/chart_renderer.*` | the host-facing API, the rebuild policy, and the render targets |
+| `src/scene_build.*` | the CPU build (`tile57_chart_gpu_scene`) and its worker thread |
+| `src/gpu_scene.*` | a resident scene: GL buffers, pattern textures, batched draw lists |
+| `src/chart_programs.*` | the GLSL 1.20 programs and vertex stream bindings |
+| `src/chart_atlases.*` | the symbol and glyph atlas textures and the halo colors |
+| `src/gl_objects.h` | move-only owners for GL objects |
 
-- `RenderRegionViewOnGLNoText` → **`kBase`** — tiled geometry, clipped to the chart's
+## Passes
+
+OpenCPN calls a quilted vector chart twice per frame, and the renderer maps each call
+onto a `Pass`:
+
+- `RenderRegionViewOnGLNoText` is `kBase`: everything but text, clipped to the chart's
   quilt patch.
-- `RenderRegionViewOnGLTextOnly` → **`kText`** — the whole-view label pass, drawn once
-  across the quilt.
+- `RenderRegionViewOnGLTextOnly` is `kText`: text only, drawn above OpenCPN's overlays.
 
-(A single, unquilted chart uses `kAll`, which does both.)
+A single unquilted chart uses `kAll`. One scene serves every pass; the pass selects
+which ranges are batched.
 
-## Tiled geometry
+## Scenes and coverage
 
-`render_tiled()` enumerates the tiles visible in the current view (at the baked zoom
-band nearest the view's zoom, clamped to the chart's coverage), and for each:
+A scene is portrayed for a view 1.25 times the viewport on each axis, at the view's
+zoom. It stays valid while the live view keeps the whole viewport inside that box and
+the zoom stays within 0.3 of the build zoom. Vertices are uploaded relative to the
+scene's build center so single-precision floats hold their accuracy at harbor zoom.
 
-- **cache hit** — draws the tile's cached GPU buffers;
-- **cache miss** — calls `ensure_tile()`, which portrays that one tile through
-  tile57's `tile57_chart_tile_surface`, tessellates the resolved primitives, and
-  stores per-layer vertex buffers keyed by `(z, x, y)`.
+The first scene for a chart is built on the render thread, because nothing is on
+screen yet. Every later build runs on a worker thread while the current scene keeps
+drawing. When a build finishes, the worker asks the canvas for one redraw, and the
+next render pass adopts the new scene. One request is pending at a time; a newer
+request replaces one that has not started.
 
-A tile holds up to seven layer buffers — area fills, lines, tessellated symbols,
-textured sprites, and area-fill patterns (text and glyph layers are handled by the
-label pass, below). Vertices are stored **relative to the tile's north-west world
-corner**, keeping the floating-point coordinates small and the buffers reusable across
-any view.
+The rebuild policy:
 
-Drawing batches by shader program — one program bind per layer, then an inner loop
-over the visible tiles, each placed with its own origin uniform — so a full view is a
-handful of state changes regardless of tile count.
+- a settings change or a pan out of the coverage box rebuilds at once;
+- a zoom drift past the band waits while a gesture is in progress, up to one full zoom
+  level, then rebuilds when the view settles;
+- a zoom-out is built 0.15 levels further out than the view, so its coverage is a
+  superset of every view on the way there.
 
-### Budget and eviction
+## Draw lists
 
-A cold view (say, a big zoom-out) can bring many tiles into view at once. Portraying
-them all in one frame would hitch, so `render_tiled` **portrays at most a few per
-frame** (2 while the view is moving, 8 when settled) and flags the rest pending; the
-chart then asks OpenCPN for another redraw, so the view *fills in progressively*
-instead of freezing. Cached tiles are always drawn.
+`tile57_gpu_batch` turns a scene's ranges into draw calls, merging neighbors that share
+a pipeline, atlas and pattern. The plugin caches one draw list per combination of pass,
+text and soundings switches, available atlases, and depth mode.
 
-The cache is bounded by an **LRU** (cap 512 tiles): tiles drawn this frame carry the
-newest timestamp and survive; the least-recently-drawn are evicted and their buffers
-freed. The whole cache is invalidated when the mariner settings change (they change
-the portrayal) or the chart is swapped.
-
-## The label pass
-
-Labels are **not** tiled. tile57's declutter grid is per-surface, so decluttering each
-tile in isolation drops labels at tile seams — most visibly, light descriptions. So
-text is portrayed **once for the whole view** with a single shared declutter grid
-(`portray_view_labels` → `tile57_chart_surface`, text only), into one pair of
-vertex/glyph buffers referenced to the view centre.
-
-That whole-view portray is the most expensive per-frame operation (it decodes the
-PMTiles and declutters every sounding), so it is **cached like the tiles**: it
-re-portrays only when the view has settled at a new place or zoom, and during a pan or
-zoom gesture it reuses the cached label buffers, drawn with a transformed origin so
-they ride the view. A refresh deferred mid-gesture is picked up once motion stops (the
-same "ask for one more redraw" mechanism the tiles use).
-
-Labels are drawn at the **true** zoom, not the SCAMIN-biased cull zoom used for
-symbols — text and soundings already self-declutter, so biasing them would hide labels
-(lights first) on high-DPI displays.
+When a depth buffer is available, opaque fills are drawn first, front to back, with
+depth writes on, and the depth test drops the fragments later paint would cover. The
+remaining ranges then draw in paint order with the depth test on and writes off. The
+supersample target always has a depth buffer; direct rendering uses the host's when it
+has one.
 
 ## The vertex model
 
 Every vertex is transformed in the shader as:
 
 ```
-screen = aWorld * uScale + uOrigin + aPost
+screen = R * (aWorld * uScale) + uOrigin + post
 ```
 
-- **`aWorld`** — the vertex's world offset from its tile/view reference (small f32);
-  `uScale` is pixels per world unit; `uOrigin` places the reference on screen.
-- **`aPost`** — a post-transform, screen-pixel offset: zero for area fills, the
-  perpendicular half-width for line quads, and the local glyph/symbol quad corner for
-  anchored text and symbols — so symbols and text keep a constant on-screen size while
-  the map scales.
-- **`aThresh`** — a per-vertex **SCAMIN** cull threshold. The shader discards the
-  vertex when `uZoom < aThresh`, so features drop out at the scale S-52 says they
-  should, entirely on the GPU.
+- `aWorld` is the vertex's world position relative to the scene's build center;
+  `uScale` is framebuffer px per world unit; `uOrigin` places the center on screen;
+  `R` is the view rotation.
+- `post` is a screen-space offset in device px: zero for area fills, the half-width
+  for line edges, the corner for a glyph or symbol quad. A map-aligned offset is
+  rotated with the chart; a viewport-aligned one stays upright. A text run flagged to
+  flip turns 180 degrees when its tangent would read into the left half of the screen.
+- `aScamin` and `aDispCat` gate visibility on the GPU against the live display scale
+  and category switches, so neither forces a rebuild.
+- `aDepth` is tile57's paint-order key.
 
-Five shader programs (compiled once, process-wide, and shared by every chart
-instance) cover the layers: solid geometry, textured sprites, tiled-pattern area
-fills, SDF text, and a fullscreen blit for compositing.
+Colors are per vertex. SDF text carries a halo width per vertex and draws the halo in
+the scheme's background color.
+
+## Atlases
+
+The symbol atlas is baked per pixel ratio and color scheme; the SDF glyph atlases are
+baked per face (regular, bold, italic). Each is uploaded on first use and shared by
+every chart in the process.
 
 ## Antialiasing
 
-When the view is **settled**, the scene is rendered into an offscreen
-super-sampled framebuffer (2× by default) and composited back down — antialiasing
-tessellated edges and text. During a pan or zoom the renderer draws **directly** into
-OpenCPN's buffer instead (offscreen compositing tore against OpenCPN's accelerated-pan
-strip updates); the crisp AA pops back in when motion stops. Super-sampling is
-disabled automatically on software renderers (llvmpipe and friends).
+When the view is settled, the scene is rendered into a supersampled framebuffer (2x by
+default) and composited down. During a pan or zoom the renderer draws directly into
+OpenCPN's buffer, because an offscreen composite tears against OpenCPN's accelerated
+pan. Supersampling is off on software renderers.
 
-## Playing nice with OpenCPN's GL
+## OpenCPN's GL state
 
-OpenCPN mixes its own fixed-function and `gluTess` drawing with the plugin's modern
-GL. At the end of every frame the renderer **hard-resets GL state** — disables its
-vertex-attribute arrays, unbinds buffers and textures, and clears the active program —
-so OpenCPN's immediate-mode clip-region drawing can't read the plugin's vertex buffer
-out of bounds (a crash seen on macOS).
+OpenCPN mixes fixed-function drawing with the plugin's programs. At the end of every
+draw the renderer disables its vertex attribute arrays, unbinds buffers and textures,
+clears the active program, and restores the depth mask.
 
-## Environment knobs
-
-A few environment variables tune the renderer for debugging and calibration:
+## Environment variables
 
 | Variable | Effect |
 | --- | --- |
-| `TILE57_SS=<n>` | super-sample factor (default 2; 1 disables AA) |
-| `TILE57_NOSS` | force direct rendering, no offscreen FBO |
-| `TILE57_SIZE` / `TILE57_CALIB` | physical symbol/text size calibration |
-| `TILE57_DECLUTTER=<levels>` | override the SCAMIN cull bias |
-| `TILE57_DEBUG` | log the per-zoom projection / cull state |
+| `TILE57_SS=<n>` | supersample factor (default 2; 1 disables AA) |
+| `TILE57_NOSS` | draw directly, no offscreen target |
+| `TILE57_SIZE` / `TILE57_CALIB` | physical symbol and text size calibration |
+| `TILE57_DECLUTTER=<levels>` | SCAMIN cull bias |
+| `TILE57_DEBUG` | log scene builds and the render entry state |

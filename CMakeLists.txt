@@ -152,11 +152,15 @@ endif()
 add_library(tile57_pi MODULE
   src/tile57_pi.cpp
   src/tile57_chart.cpp
+  src/chart_programs.cpp
+  src/chart_atlases.cpp
+  src/scene_build.cpp
+  src/gpu_scene.cpp
   src/chart_renderer.cpp
   src/build_charts.cpp)
 
 target_include_directories(tile57_pi PRIVATE
-  ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party
+  ${CMAKE_SOURCE_DIR}/src
   ${TILE57_INCLUDE} ${GLEW_INCLUDE_DIR})
 target_compile_definitions(tile57_pi PRIVATE ${wxWidgets_DEFINITIONS})
 

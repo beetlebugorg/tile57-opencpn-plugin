@@ -23,19 +23,18 @@ The plugin installs a **first-class GL vector chart** (`ChartTile57`, a
 mask, adds it to the chart database, and drives it like any native chart: chart bar,
 quilting, and scale transitions included. OpenCPN owns the draw order.
 
-When OpenCPN renders the chart, the plugin follows the MapLibre "bake once, compose on
-demand" model:
+When OpenCPN renders the chart, the plugin draws tile57's draw-ready GPU scene:
 
-1. it converts OpenCPN's `PlugIn_ViewPort` into a tile57 camera (centre + a continuous
-   web-mercator zoom);
-2. for each visible tile, it runs tile57's S-52 portrayal once
-   (`tile57_chart_tile_surface`), tessellates the resolved primitives to GPU buffers,
-   and **caches** them keyed by `(z, x, y)` (LRU, budgeted so a cold view fills in
-   progressively rather than freezing);
-3. it composes the view from the cached tiles as a GPU transform — so panning and
-   zooming reuse geometry instead of re-portraying;
-4. labels are portrayed once for the whole view with a single declutter grid (and
-   cached the same way) so text doesn't clash at tile seams.
+1. it converts OpenCPN's `PlugIn_ViewPort` into a tile57 camera (center and a
+   continuous web-mercator zoom);
+2. tile57 portrays the whole view, with an overscan margin, into vertex, index and
+   quad buffers that are already tessellated and in S-52 paint order
+   (`tile57_chart_gpu_scene`); the plugin uploads them once;
+3. every frame draws those buffers under a per-frame transform, so a pan, zoom or
+   rotation inside the margin is a uniform change and the SCAMIN and display-category
+   gates run in the vertex shader;
+4. when the view leaves the margin or the settings change, a worker thread builds the
+   next scene while the current one keeps drawing.
 
 ENC cells are baked to `*.pmtiles` bundles up front (via the plugin's Build Charts
 dialog or the `tile57` CLI); OpenCPN then loads those bundles like any chart directory.
@@ -45,13 +44,17 @@ for the full picture.
 ## Layout
 
 ```
-src/tile57_pi.cpp        OpenCPN plugin entry (create_pi / plugin class); registers the chart + dialogs
-src/tile57_chart.*       ChartTile57Pmtiles (PlugInChartBaseExtended) — opens a baked *.pmtiles bundle
-src/chart_renderer.*     tiled portray -> tessellate -> cache -> compose on the GPU
+src/tile57_pi.cpp        OpenCPN plugin entry (create_pi / plugin class); registers the chart and dialogs
+src/tile57_chart.*       ChartTile57Pmtiles (PlugInChartBaseExtended): opens a baked *.pmtiles bundle
+src/chart_renderer.*     the renderer's host-facing API, rebuild policy and render targets
+src/scene_build.*        the CPU scene build (tile57_chart_gpu_scene) and its worker thread
+src/gpu_scene.*          a resident scene: GL buffers, pattern textures, batched draw lists
+src/chart_programs.*     the GLSL 1.20 programs and vertex stream bindings
+src/chart_atlases.*      symbol and glyph atlas textures, halo colors
+src/gl_objects.h         move-only owners for GL objects
 src/build_charts.*       Build Charts dialog: bulk-bake an ENC root to *.pmtiles
-src/gl.h                 GL headers (GLEW) + GLSL version prologue
-third_party/earcut.hpp   polygon tessellation (Mapbox earcut, ISC)
-opencpn-libs/            OpenCPN plugin API (git submodule; api-18 -> ocpn::api)
+src/gl.h                 GL headers (GLEW) and the GLSL version prologue
+opencpn-libs/            OpenCPN plugin API (git submodule; api-19 -> ocpn::api)
 ```
 
 ## Quick build
