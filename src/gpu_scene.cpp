@@ -44,8 +44,8 @@ GpuScene::GpuScene(const SceneData& data)
     ranges_ = data.ranges;
 }
 
-void GpuScene::batch(const std::vector<tile57_gpu_range>& ranges,
-                     const tile57_gpu_batch_opts& opts, std::vector<tile57_gpu_draw>& out) const {
+void GpuScene::batch(const std::vector<tile57_gpu_range>& ranges, const tile57_gpu_batch_opts& opts,
+                     std::vector<tile57_gpu_draw>& out) const {
     out.clear();
     if (ranges.empty())
         return;

@@ -55,10 +55,9 @@ int ss_factor() {
 // The header this plugin compiled against must describe the library it links.
 bool abi_layout_matches() {
     static const bool ok = [] {
-        const uint32_t expect = (uint32_t)sizeof(tile57_gpu_vertex) |
-                                (uint32_t)sizeof(tile57_gpu_quad) << 8 |
-                                (uint32_t)sizeof(tile57_gpu_range) << 16 |
-                                (uint32_t)sizeof(tile57_gpu_uniforms) << 24;
+        const uint32_t expect =
+            (uint32_t)sizeof(tile57_gpu_vertex) | (uint32_t)sizeof(tile57_gpu_quad) << 8 |
+            (uint32_t)sizeof(tile57_gpu_range) << 16 | (uint32_t)sizeof(tile57_gpu_uniforms) << 24;
         const uint32_t have = tile57_abi_gpu_layout();
         if (have != expect)
             wxLogMessage("tile57: GPU ABI layout mismatch (header %08x, library %08x)", expect,
@@ -143,10 +142,8 @@ bool ChartRenderer::ensure_supersample(int w, int h) {
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, sw, sh);
     glBindRenderbuffer(GL_RENDERBUFFER, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, ss_.fbo.id());
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ss_.color.id(),
-                           0);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER,
-                              ss_.depth.id());
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ss_.color.id(), 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, ss_.depth.id());
     ss_.ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     ss_.w = sw;
@@ -169,8 +166,8 @@ bool ChartRenderer::covers(const SceneCoverage& c, double wx, double wy, double 
 }
 
 SceneRequest ChartRenderer::make_request(const Camera& cam, double build_zoom, uint32_t w,
-                                         uint32_t h, double device_scale,
-                                         const tile57_mariner& m, uint64_t mhash) {
+                                         uint32_t h, double device_scale, const tile57_mariner& m,
+                                         uint64_t mhash) {
     SceneRequest r;
     r.chart = chart_;
     r.chart_mutex = &portray_mu_;

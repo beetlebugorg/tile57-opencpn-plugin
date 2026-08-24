@@ -84,8 +84,7 @@ class ChartRenderer {
                     const tile57_mariner& m, uint64_t mhash, bool gesture);
     SceneRequest make_request(const Camera& cam, double build_zoom, uint32_t w, uint32_t h,
                               double device_scale, const tile57_mariner& m, uint64_t mhash);
-    static bool covers(const SceneCoverage& c, double wx, double wy, double zoom,
-                       double zoom_band);
+    static bool covers(const SceneCoverage& c, double wx, double wy, double zoom, double zoom_band);
     bool ensure_supersample(int w, int h);
 
     tile57_chart* chart_ = nullptr;

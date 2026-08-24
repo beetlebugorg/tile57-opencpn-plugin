@@ -52,16 +52,16 @@ enum Attr : uint32_t {
 // The visibility gate moves a vertex outside the clip volume when its display
 // category is off, or its SCAMIN is finer than the live display scale. The base
 // category is never SCAMIN-culled.
-#define T57_COMMON                                                                                  \
+#define T57_COMMON                                                                                 \
     "uniform float uScale; uniform vec2 uOrigin; uniform vec2 uVp; uniform vec2 uRot;\n"           \
     "uniform float uScaminDenom; uniform vec3 uCat;\n"                                             \
-    "vec2 t57rot(vec2 p){ return vec2(p.x*uRot.x - p.y*uRot.y, p.x*uRot.y + p.y*uRot.x); }\n"       \
-    "bool t57cull(float dispCat, float scamin){\n"                                                  \
-    "  float catv = dispCat < 0.5 ? uCat.x : (dispCat < 1.5 ? uCat.y : uCat.z);\n"                  \
-    "  return (catv < 0.5) || (scamin > 0.0 && dispCat > 0.5 && uScaminDenom > scamin);\n"          \
-    "}\n"                                                                                           \
-    "vec4 t57clip(vec2 s, float depth){\n"                                                          \
-    "  return vec4(s.x/uVp.x*2.0-1.0, 1.0 - s.y/uVp.y*2.0, depth*2.0-1.0, 1.0);\n"                  \
+    "vec2 t57rot(vec2 p){ return vec2(p.x*uRot.x - p.y*uRot.y, p.x*uRot.y + p.y*uRot.x); }\n"      \
+    "bool t57cull(float dispCat, float scamin){\n"                                                 \
+    "  float catv = dispCat < 0.5 ? uCat.x : (dispCat < 1.5 ? uCat.y : uCat.z);\n"                 \
+    "  return (catv < 0.5) || (scamin > 0.0 && dispCat > 0.5 && uScaminDenom > scamin);\n"         \
+    "}\n"                                                                                          \
+    "vec4 t57clip(vec2 s, float depth){\n"                                                         \
+    "  return vec4(s.x/uVp.x*2.0-1.0, 1.0 - s.y/uVp.y*2.0, depth*2.0-1.0, 1.0);\n"                 \
     "}\n"
 
 const char* kFlatVS = T57_COMMON
@@ -103,7 +103,7 @@ const char* kPatternFS = "uniform sampler2D uTex; uniform vec2 uPeriod;\n"
 
 // Quads: a symbol sprite or an SDF glyph. The anchor rides the chart; the corner offset
 // keeps a fixed screen size. A run flagged `flip` (a depth-contour value laid along its
-// contour) turns 180° about its anchor whenever its tangent, after the view rotation,
+// contour) turns 180 degrees about its anchor whenever its tangent, after the view rotation,
 // would read into the screen's left half-plane, so the number is never upside down.
 const char* kQuadVS = T57_COMMON
     "attribute vec2 aWorld; attribute vec2 aPost; attribute vec2 aUV; attribute vec4 aColor;\n"
@@ -132,7 +132,7 @@ const char* kSpriteFS = "uniform sampler2D uTex;\n"
                         "}\n";
 // SDF text: antialias the distance field with its screen-space derivative. vWeight is
 // the halo width in field units (0 = none); the halo is drawn in the palette's
-// background colour (uHalo) so it lifts a name off busy soundings without glaring at
+// background color (uHalo) so it lifts a name off busy soundings without glaring at
 // night.
 const char* kSdfFS = "uniform sampler2D uTex; uniform vec4 uHalo;\n"
                      "varying vec2 vUV; varying vec4 vCol; varying float vWeight;\n"

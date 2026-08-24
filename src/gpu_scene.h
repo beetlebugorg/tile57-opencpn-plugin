@@ -20,11 +20,11 @@ class GpuScene {
     explicit GpuScene(const SceneData& data);
 
     struct DrawOptions {
-        bool geometry = true;  // draw everything but text
-        bool text = true;      // draw text
-        bool text_on = true;   // the mariner's text switch
-        bool sound_on = true;  // the mariner's soundings switch
-        bool depth = false;    // a cleared depth buffer is attached; use it
+        bool geometry = true; // draw everything but text
+        bool text = true;     // draw text
+        bool text_on = true;  // the mariner's text switch
+        bool sound_on = true; // the mariner's soundings switch
+        bool depth = false;   // a cleared depth buffer is attached; use it
         double pixel_ratio = 1;
         tile57_scheme scheme = TILE57_SCHEME_DAY;
     };

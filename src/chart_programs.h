@@ -18,12 +18,12 @@ namespace t57 {
 
 // The per-frame camera and gate state every pipeline reads.
 struct FrameUniforms {
-    float scale = 1;        // framebuffer px per world unit (camera-relative world)
-    float origin[2] = {0, 0}; // framebuffer px of the scene's build centre
+    float scale = 1;            // framebuffer px per world unit (camera-relative world)
+    float origin[2] = {0, 0};   // framebuffer px of the scene's build center
     float viewport[2] = {1, 1}; // framebuffer size in px (NDC mapping)
-    float rot[2] = {1, 0};    // view rotation as (cos, sin)
-    float scamin_denom = 0;   // live 1:N display scale; 0 disables the SCAMIN cull
-    float cat[3] = {1, 1, 1}; // display-category visibility (base, standard, other)
+    float rot[2] = {1, 0};      // view rotation as (cos, sin)
+    float scamin_denom = 0;     // live 1:N display scale; 0 disables the SCAMIN cull
+    float cat[3] = {1, 1, 1};   // display-category visibility (base, standard, other)
 };
 
 class ChartPrograms {
@@ -40,8 +40,8 @@ class ChartPrograms {
     void use(Pipe pipe, const FrameUniforms& frame);
     // Pipeline-specific state, valid after use() of the matching pipeline.
     void set_pattern_cell(uint32_t tex, float period_w, float period_h); // kPattern
-    void set_atlas(uint32_t tex);                                          // kSprite / kSdf
-    void set_halo(const float rgba[4]);                                    // kSdf
+    void set_atlas(uint32_t tex);                                        // kSprite / kSdf
+    void set_halo(const float rgba[4]);                                  // kSdf
 
     // Bind the triangle stream (tile57_gpu_vertex + uint32 indices) or the quad
     // stream (tile57_gpu_quad) to the shared attribute locations.

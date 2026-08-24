@@ -119,8 +119,8 @@ uint8_t ChartAtlases::available(double pixel_ratio, tile57_scheme scheme) {
     uint8_t have = 0;
     if (sprite(pixel_ratio, scheme))
         have |= 1u << TILE57_GPU_ATLAS_SPRITE;
-    for (uint8_t a : {TILE57_GPU_ATLAS_GLYPH, TILE57_GPU_ATLAS_GLYPH_BOLD,
-                      TILE57_GPU_ATLAS_GLYPH_ITALIC})
+    for (uint8_t a :
+         {TILE57_GPU_ATLAS_GLYPH, TILE57_GPU_ATLAS_GLYPH_BOLD, TILE57_GPU_ATLAS_GLYPH_ITALIC})
         if (glyph(a))
             have |= 1u << a;
     return have;

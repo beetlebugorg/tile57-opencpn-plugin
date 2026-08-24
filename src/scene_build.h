@@ -19,9 +19,9 @@ namespace t57 {
 
 // The world box a scene was portrayed for. World is web-mercator [0,1], y down.
 struct SceneCoverage {
-    double cx = 0, cy = 0;      // build view center
-    double zoom = 0;            // the view zoom the scene was requested for
-    double build_zoom = 0;      // that zoom clamped to the chart's baked band
+    double cx = 0, cy = 0;           // build view center
+    double zoom = 0;                 // the view zoom the scene was requested for
+    double build_zoom = 0;           // that zoom clamped to the chart's baked band
     double half_wx = 0, half_wy = 0; // half extents of the overscanned box
 };
 
